@@ -130,19 +130,86 @@ class OrderManager:
         # Used to detect and cancel unfilled LIMIT orders after timeout
         self._pending_orders: dict[str, dict] = {}
 
+    def _get_available_margin(self) -> float:
+        """
+        Query Angel One for available intraday margin.
+
+        Returns the usable intraday buying power in Rs.
+        Returns 0.0 if the API call fails — callers treat 0 as "skip the check"
+        (we never block a trade just because we couldn't verify margin).
+
+        Angel One RMS fields:
+        - availableintradaypayin: cash × leverage — this is what we can spend
+        - availablecash: raw cash balance (lower number, without leverage)
+        We prefer intraday because it's the real limit for MIS orders.
+        """
+        try:
+            funds = self.broker.get_funds()
+            if not funds:
+                return 0.0
+            # availableintradaypayin already includes the 5× intraday leverage
+            intraday = float(funds.get("availableintradaypayin", 0) or 0)
+            cash = float(funds.get("availablecash", 0) or 0)
+            return intraday if intraday > 0 else cash
+        except Exception as e:
+            logger.debug(f"Margin check unavailable: {e}")
+            return 0.0  # 0 = skip check, don't block the trade
+
     def execute(self, signal: Signal) -> Optional[Position]:
         """
         Place an order based on a signal.
-        Detects partial fills and adjusts position size accordingly.
-        Tracks slippage (difference between expected and actual fill price).
+
+        Before placing:
+        1. Checks available intraday margin — reduces quantity if needed.
+        2. If even 1 share doesn't fit, skips the trade entirely.
+
+        After placing:
+        3. Detects partial fills and adjusts position size accordingly.
+        4. Tracks slippage (difference between expected and actual fill price).
         """
-        order_id = self.broker.place_order(
-            stock=signal.stock,
-            token=signal.token,
-            direction=signal.direction,
-            quantity=signal.quantity,
-            price=signal.entry_price,
-        )
+        # ── Margin check before placing order ────────────────────────────
+        try:
+            required_margin = signal.entry_price * signal.quantity
+            available_margin = self._get_available_margin()
+
+            if available_margin > 0:  # 0 means API was unavailable — skip check
+                if required_margin > available_margin:
+                    max_qty = int(available_margin / signal.entry_price)
+
+                    if max_qty < 1:
+                        logger.warning(
+                            f"MARGIN INSUFFICIENT: {signal.stock} — "
+                            f"need Rs.{required_margin:.0f} (1 share @ Rs.{signal.entry_price:.0f}), "
+                            f"only Rs.{available_margin:.0f} available. Skipping trade."
+                        )
+                        return None
+
+                    logger.warning(
+                        f"MARGIN LIMITED: {signal.stock} — "
+                        f"reducing qty from {signal.quantity} to {max_qty} "
+                        f"(available Rs.{available_margin:.0f}, "
+                        f"need Rs.{required_margin:.0f})"
+                    )
+                    signal.quantity = max_qty
+        except Exception as e:
+            # Margin check must NEVER crash the bot — just log and proceed
+            logger.warning(f"Margin check error for {signal.stock}: {e}. Proceeding anyway.")
+
+        # ── Place the order ───────────────────────────────────────────────
+        try:
+            order_id = self.broker.place_order(
+                stock=signal.stock,
+                token=signal.token,
+                direction=signal.direction,
+                quantity=signal.quantity,
+                price=signal.entry_price,
+            )
+        except Exception as e:
+            logger.error(
+                f"Order placement exception for {signal.stock}: {e}. "
+                "Position not opened."
+            )
+            return None
 
         if not order_id:
             logger.error(f"Order placement failed: {signal.stock}")

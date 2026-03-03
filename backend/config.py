@@ -120,9 +120,11 @@ class TradingConfig:
     min_trade_value: float = 100           # Skip if expected profit < Rs.100
 
     # ── Brokerage (Angel One intraday MIS) ───────────────────────────
-    # Rs.20 per order OR 0.03% of trade value, whichever is LESS. × 2 legs.
-    brokerage_flat_per_order: float = 20.0     # Rs.20 flat
-    brokerage_pct_per_order: float = 0.03      # 0.03% of trade value
+    # Actual formula: max(Rs.5, min(Rs.20, 0.1% of trade value)) per order × 2 legs
+    # e.g., Rs.1000 trade → Rs.5/leg, Rs.15000 trade → Rs.15/leg, Rs.25000+ → Rs.20/leg
+    brokerage_flat_per_order: float = 20.0     # Rs.20 cap per order
+    brokerage_min_per_order: float = 5.0       # Rs.5 floor per order
+    brokerage_pct_per_order: float = 0.1       # 0.1% of trade value
     brokerage_per_order: float = 0             # Legacy field — kept for compat
 
     # NSE intraday charges (both legs combined):
@@ -132,8 +134,9 @@ class TradingConfig:
     sebi_charges_pct: float = 0.0001  # SEBI: 0.0001% of turnover
     stamp_duty_pct: float = 0.003   # Stamp duty: 0.003% on buy-side value
 
-    # Skip trades where expected net profit (after all charges) < this
-    min_expected_net_profit: float = 5.0
+    # Skip trades where expected net profit (after all charges) < this.
+    # Set to Rs.15 because minimum round-trip cost is Rs.12-15 (Angel One floor).
+    min_expected_net_profit: float = 15.0
 
     # ── Mode — controlled from .env ──────────────────────────────────
     paper_trading: bool = os.getenv("PAPER_TRADING", "True").strip() == "True"

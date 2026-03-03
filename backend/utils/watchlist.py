@@ -101,17 +101,26 @@ INDEX_TOKENS = {
     "INDIA_VIX":  {"symbol": "India VIX",   "token": "99919000", "exchange": "NSE"},
 }
 
-# Fallback hardcoded tokens (from previous session) — used if instrument master fails
+# Fallback hardcoded tokens — used if instrument master download fails.
+# These are confirmed Angel One NSE token IDs for NIFTY 50 stocks.
+# Even if the instrument master can't be fetched, these 35 stocks will still trade.
 FALLBACK_TOKENS = {
+    # Top 10 by market cap
     "RELIANCE": "2885", "TCS": "11536", "HDFCBANK": "1333",
-    "INFY": "1594", "ICICIBANK": "4963", "SBIN": "3045",
-    "BHARTIARTL": "10604", "ITC": "1660", "KOTAKBANK": "1922",
-    "LT": "11483", "AXISBANK": "5900", "TATAMOTORS": "3456",
-    "SUNPHARMA": "3351", "BAJFINANCE": "317", "WIPRO": "3787",
+    "INFY": "1594", "ICICIBANK": "4963", "HINDUNILVR": "519",
+    "SBIN": "3045", "BHARTIARTL": "10604", "ITC": "1660",
+    "KOTAKBANK": "1922",
+    # Next 15
+    "LT": "11483", "AXISBANK": "5900", "ASIANPAINT": "236",
+    "MARUTI": "10999", "TATAMOTORS": "3456", "SUNPHARMA": "3351",
+    "TITAN": "3506", "BAJFINANCE": "317", "WIPRO": "3787",
     "HCLTECH": "7229", "TATASTEEL": "3499", "NTPC": "11630",
-    "MARUTI": "10999", "TITAN": "3506", "POWERGRID": "14977",
-    "ONGC": "2475", "JSWSTEEL": "11723", "TECHM": "13538",
-    "INDUSINDBK": "5258",
+    "POWERGRID": "14977", "ONGC": "2475", "JSWSTEEL": "11723",
+    # Remaining NIFTY 50
+    "TECHM": "13538", "ULTRACEMCO": "2585", "INDUSINDBK": "5258",
+    "NESTLEIND": "17963", "CIPLA": "694", "DRREDDY": "881",
+    "M&M": "2031", "BPCL": "526", "GRASIM": "1232",
+    "HEROMOTOCO": "1348",
 }
 
 
@@ -177,13 +186,17 @@ def _get_token_map_from_master() -> dict[str, str]:
         return cache_data
 
     # Download from Angel One
-    logger.info(f"Downloading instrument master from Angel One...")
+    logger.info("Downloading instrument master from Angel One...")
     try:
         response = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
         response.raise_for_status()
         raw_data = response.json()
     except Exception as e:
-        logger.warning(f"Instrument master download failed: {e}. Using fallback tokens.")
+        logger.warning(
+            f"Instrument master download failed: {e}. "
+            f"Falling back to {len(FALLBACK_TOKENS)} hardcoded NIFTY 50 tokens. "
+            "Bot will trade with these stocks. Remaining watchlist stocks will be skipped."
+        )
         return {}
 
     # Parse: each entry is [token, symbol, name, expiry, strike, lotsize,

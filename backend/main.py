@@ -22,12 +22,14 @@ Kill switch: Dashboard red button sets /kill_switch in Firebase -> bot exits.
 Trading toggle: Dashboard ON/OFF toggle sets /trading_enabled -> pauses scanning.
 """
 
+import json
 import sys
 import time
 import signal
 import logging
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from config import config
@@ -123,6 +125,102 @@ class TradingBot:
         self._pending_confirmations: dict[str, tuple] = {}
 
     # ----------------------------------------------------------------
+    # Startup Validation (runs before everything else)
+    # ----------------------------------------------------------------
+
+    def _validate_startup(self) -> bool:
+        """
+        Pre-flight check before the bot does anything.
+
+        Checks (in order):
+        1. All required .env fields are present and not placeholder values
+        2. firebase-credentials.json exists and is valid JSON (warning, not fatal)
+        3. Angel One authentication succeeds
+        4. At least 10 stocks loaded in watchlist
+
+        Prints a clear ALL SYSTEMS GO or STARTUP FAILED message.
+        Returns True if safe to start, False if the bot should abort.
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        logger.info("=" * 60)
+        logger.info("  STARTUP VALIDATION")
+        logger.info("=" * 60)
+
+        # ── Check 1: Required .env fields ────────────────────────────────
+        required_fields = {
+            "ANGEL_API_KEY":     config.broker.api_key,
+            "ANGEL_CLIENT_ID":   config.broker.client_id,
+            "ANGEL_PASSWORD":    config.broker.password,
+            "ANGEL_TOTP_SECRET": config.broker.totp_secret,
+        }
+        placeholder_prefixes = ("your_", "YOUR_", "<", "")
+        for field_name, value in required_fields.items():
+            if not value or any(value.startswith(p) for p in placeholder_prefixes if p):
+                errors.append(f"Missing or not set: {field_name}")
+
+        if not config.firebase.database_url:
+            warnings.append("FIREBASE_DATABASE_URL not set — dashboard will be offline")
+
+        # ── Check 2: Firebase credentials file ───────────────────────────
+        creds_path = Path(config.firebase.credentials_path)
+        if not creds_path.exists():
+            warnings.append(
+                f"Firebase credentials file not found: {config.firebase.credentials_path} "
+                "— dashboard sync disabled"
+            )
+        else:
+            try:
+                with open(creds_path) as f:
+                    json.load(f)
+            except Exception as e:
+                warnings.append(
+                    f"Firebase credentials file is invalid JSON ({e}) "
+                    "— dashboard sync disabled"
+                )
+
+        # ── Check 3: Angel One authentication ────────────────────────────
+        # Only attempt if credentials are present (avoid confusing error on missing creds)
+        if not errors:
+            logger.info("  Checking Angel One authentication...")
+            auth_ok = self.broker.retry_connect(max_attempts=3)
+            if not auth_ok:
+                errors.append(
+                    "Angel One authentication failed. "
+                    "Check ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET."
+                )
+            else:
+                logger.info("  Angel One: connected")
+
+        # ── Check 4: Watchlist ────────────────────────────────────────────
+        watchlist_count = len(self.watchlist)
+        if watchlist_count < 10:
+            errors.append(
+                f"Watchlist has only {watchlist_count} stocks (minimum 10). "
+                "Instrument master may have failed to download and fallback tokens are insufficient."
+            )
+        else:
+            logger.info(f"  Watchlist: {watchlist_count} stocks loaded")
+
+        # ── Print warnings (non-fatal) ────────────────────────────────────
+        for w in warnings:
+            logger.warning(f"  WARNING: {w}")
+
+        # ── Final verdict ─────────────────────────────────────────────────
+        logger.info("=" * 60)
+        if errors:
+            logger.error("  STARTUP FAILED — fix these issues before running:")
+            for i, err in enumerate(errors, 1):
+                logger.error(f"    {i}. {err}")
+            logger.error("=" * 60)
+            return False
+
+        logger.info("  ALL SYSTEMS GO — starting bot")
+        logger.info("=" * 60)
+        return True
+
+    # ----------------------------------------------------------------
     # Startup Sequence
     # ----------------------------------------------------------------
 
@@ -133,10 +231,10 @@ class TradingBot:
         # Step 1: Load watchlist (200 stocks + index tokens)
         self._load_watchlist()
 
-        # Step 2: Authenticate with Angel One (retry up to 3x)
-        if not self._authenticate():
-            logger.error("Authentication failed. Check credentials in .env. Exiting.")
-            return
+        # Step 2: Run startup validation — checks env, firebase, auth, watchlist.
+        # _validate_startup() also authenticates with Angel One internally.
+        if not self._validate_startup():
+            return  # Reason already logged as STARTUP FAILED
 
         # Step 3: Run pre-market checks (holiday, margin, news, prev-day data)
         if not self._run_premarket_checks():
@@ -213,7 +311,7 @@ class TradingBot:
             "is_trading_day": True,
             "margin_available": 0.0,
             "margin_ok": False,
-            "broker_connected": self.broker.is_connected(),
+            "broker_connected": self.broker.is_connected,
             "watchlist_loaded": len(self.watchlist) > 0,
             "news_loaded": False,
             "prev_day_loaded": False,
@@ -353,24 +451,30 @@ class TradingBot:
         # ── INDEX TICKS: update market context and regime detector ──────
         is_index_tick = token in (self.nifty_token, self.banknifty_token, self.vix_token)
         if is_index_tick:
-            # VIX tick -> update regime detector's VIX reading
-            if token == self.vix_token:
-                vix = tick.get("ltp", 0)
-                self.regime_detector.update_vix(vix)
-                self.scanner.market_context["vix"] = vix
+            try:
+                if token == self.vix_token:
+                    vix = tick.get("ltp", 0)
+                    self.regime_detector.update_vix(vix)
+                    self.scanner.market_context["vix"] = vix
+                else:
+                    self.scanner.update_market_context(tick)
+                    self.regime_detector.update_nifty(tick)
 
-            # NIFTY / BANKNIFTY -> update NIFTY direction + regime
-            else:
-                self.scanner.update_market_context(tick)
-                self.regime_detector.update_nifty(tick)
-
-            # Push market context to Firebase (throttled by Firebase SDK)
-            self.firebase.push_market_context(self.scanner.market_context)
+                # Push market context to Firebase — non-critical, wrap separately
+                try:
+                    self.firebase.push_market_context(self.scanner.market_context)
+                except Exception as fe:
+                    logger.debug(f"Firebase market context push failed: {fe}")
+            except Exception as e:
+                logger.warning(f"Index tick processing error: {e}")
             return
 
         # ── ORB OBSERVATION PERIOD (9:15 AM - 9:30 AM) ─────────────────
         if now < config.trading.orb_end:
-            self.scanner.update_orb_range(tick)
+            try:
+                self.scanner.update_orb_range(tick)
+            except Exception as e:
+                logger.warning(f"ORB update error for token {token}: {e}")
             return
 
         # ── GLOBAL TRADING TOGGLE CHECK ─────────────────────────────────
@@ -379,38 +483,54 @@ class TradingBot:
 
         # ── REGIME DETERMINATION AT 10:30 AM ────────────────────────────
         if not self.regime_determined and now >= config.trading.regime_determination_time:
-            self._determine_and_apply_regime()
+            try:
+                self._determine_and_apply_regime()
+            except Exception as e:
+                logger.error(f"Regime determination error: {e}")
+                self.regime_determined = True  # Prevent re-running on every tick
 
         # ── NO NEW TRADES AFTER 2:30 PM ─────────────────────────────────
         if now > config.trading.no_new_trades_after:
             return
 
         # ── ACTIVE TRADING (9:30 AM - 2:30 PM) ─────────────────────────
-        signals = self.scanner.scan(tick)
+        try:
+            signals = self.scanner.scan(tick)
+        except Exception as e:
+            logger.warning(f"Scanner error on token {token}: {e}")
+            return
 
         for signal in signals:
-            if not self.risk_manager.can_trade(signal):
-                logger.info(f"Blocked by risk: {signal.stock} -- {signal.reason}")
-                continue
+            try:
+                if not self.risk_manager.can_trade(signal):
+                    logger.info(f"Blocked by risk: {signal.stock} -- {signal.reason}")
+                    continue
 
-            # Push signal to dashboard (all modes)
-            self.firebase.push_signal(signal)
+                # Push signal to dashboard — non-critical, wrap separately
+                try:
+                    self.firebase.push_signal(signal)
+                except Exception as fe:
+                    logger.warning(f"Firebase signal push failed for {signal.stock}: {fe}")
 
-            if config.trading.suggest_only:
-                logger.info(f"SIGNAL (suggest only): {signal.stock} {signal.direction} @ Rs.{signal.entry_price:.2f}")
-            elif config.trading.use_confirmation_window:
-                # Live mode with 30-second confirmation window:
-                # Push signal with awaiting_confirmation flag.
-                # The bot waits 30s; if not rejected from dashboard, it auto-executes.
-                self._schedule_confirmation(signal)
-            else:
-                # Fully automatic: execute immediately
-                self._execute_signal(signal)
+                if config.trading.suggest_only:
+                    logger.info(
+                        f"SIGNAL (suggest only): {signal.stock} {signal.direction} "
+                        f"@ Rs.{signal.entry_price:.2f}"
+                    )
+                elif config.trading.use_confirmation_window:
+                    self._schedule_confirmation(signal)
+                else:
+                    self._execute_signal(signal)
+            except Exception as e:
+                logger.error(f"Signal handling error for {signal.stock}: {e}")
 
-        # ── PORTFOLIO UPDATE TO FIREBASE (throttled) ────────────────────
+        # ── PORTFOLIO UPDATE TO FIREBASE (throttled, non-critical) ───────
         now_ts = time.time()
         if now_ts - self._last_portfolio_push >= PORTFOLIO_UPDATE_INTERVAL:
-            self.firebase.push_portfolio(self.portfolio.get_state())
+            try:
+                self.firebase.push_portfolio(self.portfolio.get_state())
+            except Exception as fe:
+                logger.debug(f"Firebase portfolio push failed: {fe}")
             self._last_portfolio_push = now_ts
 
     def _determine_and_apply_regime(self):
@@ -450,9 +570,20 @@ class TradingBot:
 
     def _execute_signal(self, signal):
         """Execute a signal: place order, update Firebase, log to CSV."""
-        position = self.order_manager.execute(signal)
+        try:
+            position = self.order_manager.execute(signal)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error executing {signal.stock}: {e}. "
+                "Trade skipped. Check broker connection."
+            )
+            return
+
         if position:
-            self.firebase.push_open_position(position.to_dict())
+            try:
+                self.firebase.push_open_position(position.to_dict())
+            except Exception as fe:
+                logger.warning(f"Firebase position push failed for {signal.stock}: {fe}")
             logger.info(
                 f"Trade executed: {signal.stock} {signal.direction} "
                 f"@ Rs.{signal.entry_price:.2f} | Qty: {signal.quantity}"
@@ -502,17 +633,22 @@ class TradingBot:
         trade_data["regime"] = self.regime_detector.get_regime() if self.regime_determined else "UNKNOWN"
         trade_data["vix"] = self.scanner.market_context.get("vix", 0)
 
-        # Log to CSV (persistent across bot restarts)
-        self.analytics.log_trade(trade_data)
+        # Log to CSV — local file write, keep trading even if this fails
+        try:
+            self.analytics.log_trade(trade_data)
+        except Exception as e:
+            logger.warning(f"CSV log failed for {position.signal.stock}: {e}")
 
-        # Push to Firebase trade history
-        self.firebase.push_trade(trade_data)
-
-        # Remove from Firebase open positions panel
-        self.firebase.remove_position(position.signal.stock)
-
-        # Update portfolio display
-        self.firebase.push_portfolio(self.portfolio.get_state())
+        # Firebase updates — dashboard is nice-to-have, never block on it
+        try:
+            self.firebase.push_trade(trade_data)
+            self.firebase.remove_position(position.signal.stock)
+            self.firebase.push_portfolio(self.portfolio.get_state())
+        except Exception as fe:
+            logger.warning(
+                f"Firebase trade sync failed for {position.signal.stock}: {fe}. "
+                "Dashboard may be out of date but trading continues."
+            )
 
         logger.info(
             f"Position closed: {position.signal.stock} "

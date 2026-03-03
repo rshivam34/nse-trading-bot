@@ -232,13 +232,25 @@ class DataStream:
 
         IMPORTANT: Angel One sends prices in PAISE (1 rupee = 100 paise).
         We must divide by 100 to get rupees.
+
+        This handler is fully wrapped in try/except — a bad tick MUST NOT
+        crash the WebSocket thread. We log and skip bad ticks silently.
         """
         try:
             tick = self._parse_tick(message)
             if tick and self.callback:
                 self.callback(tick)
         except Exception as e:
-            logger.debug(f"Tick parsing error: {e}")
+            # Log bad tick at WARNING so it's visible but doesn't stop trading.
+            # Include token if available so we can identify the problematic instrument.
+            token = ""
+            try:
+                token = str(message.get("token", "")) if isinstance(message, dict) else ""
+            except Exception:
+                pass
+            logger.warning(
+                f"Bad tick skipped (token={token or '?'}): {type(e).__name__}: {e}"
+            )
 
     def _on_error(self, wsapp, error):
         """Called when a WebSocket error occurs."""

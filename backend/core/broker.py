@@ -440,6 +440,29 @@ class BrokerConnection:
             logger.error(f"Error fetching prev day OHLC for {trading_symbol}: {e}")
             return {}
 
+    def get_funds(self) -> dict:
+        """
+        Get available cash and intraday margin from Angel One RMS system.
+
+        Returns dict with keys like:
+        - availablecash: plain cash balance (Rs.)
+        - availableintradaypayin: cash × leverage (what we can actually trade)
+        - utilisedpayout: margin already used for open positions
+
+        Returns empty dict on failure — callers must handle gracefully.
+        Used in two places:
+        1. Pre-market check: verify enough capital to trade
+        2. Per-order: verify margin before placing each order
+        """
+        if not self._check_connected():
+            return {}
+
+        response = self._api_with_retry(self.session.rmsLimit)
+        if response and response.get("status"):
+            return response.get("data", {}) or {}
+        logger.warning("Could not fetch funds/margin from Angel One")
+        return {}
+
     def get_profile(self) -> dict:
         """Get user profile — useful to verify connection."""
         try:

@@ -4,7 +4,8 @@ Brokerage Calculator — All NSE Intraday Trading Charges
 This is CRITICAL for accurate P&L. Never skip charges.
 
 NSE Intraday (MIS) charges breakdown:
-- Brokerage: Rs.20 per order OR 0.03% of trade value, whichever is LESS × 2 orders
+- Brokerage: max(Rs.5, min(Rs.20, 0.1% of trade value)) per order × 2 orders
+  (Angel One actual formula: 0.1% of trade value, minimum Rs.5, maximum Rs.20)
 - STT (Securities Transaction Tax): 0.025% on sell-side value only
 - Exchange transaction charges: 0.00345% of total turnover (buy + sell)
 - GST (Goods & Services Tax): 18% on (brokerage + exchange charges)
@@ -12,8 +13,9 @@ NSE Intraday (MIS) charges breakdown:
 - Stamp duty: 0.003% on buy-side value only
 
 Why this matters at Rs.1000 capital:
-- Each trade costs roughly Rs.2-4 in charges on a Rs.1000 position
-- That's 0.2-0.4% per trade — significant at small capital
+- Minimum brokerage is Rs.5/order → Rs.10 per round trip (both legs)
+- Add STT, exchange, GST: total charges ≈ Rs.12-15 per round trip
+- That's 1.2-1.5% on a Rs.1000 position — significant at small capital
 - We must verify expected profit > all charges before entering any trade
 """
 
@@ -28,7 +30,8 @@ def calculate_charges(
     quantity: int,
     direction: str,  # "LONG" or "SHORT"
     brokerage_flat: float = 20.0,
-    brokerage_pct: float = 0.03,
+    brokerage_pct: float = 0.1,
+    brokerage_min: float = 5.0,
 ) -> dict:
     """
     Calculate ALL charges for a round-trip intraday NSE trade.
@@ -38,8 +41,9 @@ def calculate_charges(
         exit_price: Price at which we exited the trade
         quantity: Number of shares
         direction: "LONG" (buy first, sell later) or "SHORT" (sell first, buy later)
-        brokerage_flat: Flat brokerage per order (default Rs.20 — Angel One)
-        brokerage_pct: Percentage brokerage per order (default 0.03%)
+        brokerage_flat: Maximum brokerage per order (default Rs.20 — Angel One cap)
+        brokerage_pct: Percentage brokerage per order (default 0.1% = Angel One rate)
+        brokerage_min: Minimum brokerage per order (default Rs.5 — Angel One floor)
 
     Returns:
         dict with keys:
@@ -55,20 +59,20 @@ def calculate_charges(
         - effective_cost_pct: Total charges as % of trade value
 
     Example (LONG trade):
-        Entry: Rs.1000, Exit: Rs.1015, Qty: 10
-        Trade value: Rs.10,000 (buy side)
-        Exit value: Rs.10,150 (sell side)
-        Turnover: Rs.20,150
+        Entry: Rs.500, Exit: Rs.510, Qty: 10
+        Trade value: Rs.5,000 (buy side)
+        Exit value: Rs.5,100 (sell side)
+        Turnover: Rs.10,100
 
-        Brokerage: min(Rs.20, 0.03% × 10000=Rs.3) = Rs.3 per leg → Rs.6 total
-        STT: 0.025% × 10,150 = Rs.2.54
-        Exchange: 0.00345% × 20,150 = Rs.0.70
-        GST: 18% × (6 + 0.70) = Rs.1.21
-        SEBI: 0.0001% × 20,150 = Rs.0.02
-        Stamp: 0.003% × 10,000 = Rs.0.30
-        Total: Rs.10.77
-        Gross P&L: Rs.150
-        Net P&L: Rs.139.23
+        Brokerage: max(Rs.5, min(Rs.20, 0.1% × 5000=Rs.5)) = Rs.5 per leg → Rs.10 total
+        STT: 0.025% × 5,100 = Rs.1.28
+        Exchange: 0.00345% × 10,100 = Rs.0.35
+        GST: 18% × (10 + 0.35) = Rs.1.86
+        SEBI: 0.0001% × 10,100 = Rs.0.01
+        Stamp: 0.003% × 5,000 = Rs.0.15
+        Total: Rs.13.65
+        Gross P&L: Rs.100
+        Net P&L: Rs.86.35
     """
     if quantity <= 0 or entry_price <= 0:
         return _empty_charges()
@@ -79,9 +83,13 @@ def calculate_charges(
     turnover = buy_value + sell_value    # Total round-trip
 
     # ── Brokerage ──────────────────────────────────────────────────────
-    # Angel One: min(Rs.20, 0.03% of trade value) per leg
+    # Angel One intraday: max(Rs.5, min(Rs.20, 0.1% of trade value)) per order
+    # Examples: Rs.1000 trade → 0.1%=Rs.1 → max(5, 1) = Rs.5/leg
+    #           Rs.5000 trade → 0.1%=Rs.5 → max(5, 5) = Rs.5/leg
+    #           Rs.15000 trade → 0.1%=Rs.15 → max(5, min(20,15)) = Rs.15/leg
+    #           Rs.25000 trade → 0.1%=Rs.25 → max(5, min(20,25)) = Rs.20/leg (capped)
     brokerage_by_pct = buy_value * (brokerage_pct / 100)
-    brokerage_per_leg = min(brokerage_flat, brokerage_by_pct)
+    brokerage_per_leg = max(brokerage_min, min(brokerage_flat, brokerage_by_pct))
     brokerage_total = brokerage_per_leg * 2  # Buy leg + Sell leg
 
     # ── STT (Securities Transaction Tax) ──────────────────────────────
@@ -164,10 +172,15 @@ def is_trade_viable(
     target_price: float,
     quantity: int,
     direction: str,
-    min_profit: float = 5.0,
+    min_profit: float = 15.0,
 ) -> tuple[bool, float]:
     """
     Check if a trade is worth executing after charges.
+
+    min_profit default raised to Rs.15 because with Angel One's actual formula
+    (min Rs.5/order), the minimum round-trip charge is Rs.10 brokerage + Rs.2-3
+    STT/exchange/GST = Rs.12-15 total. Any trade that nets < Rs.15 at target
+    is not worth the risk.
 
     Returns:
         (is_viable, expected_net_profit)

@@ -90,7 +90,11 @@ class NewsSentimentFetcher:
             return self._cache
 
         if not self.config.enabled or not self.config.api_key:
-            logger.info("News sentiment disabled (no NEWS_API_KEY in .env)")
+            logger.warning(
+                "NEWS_API_KEY not set in .env — news sentiment disabled. "
+                "All stocks will use neutral sentiment (score +0 instead of +10). "
+                "Bot will continue normally. Get a free key at https://www.marketaux.com/"
+            )
             self._cache = {s: _neutral_sentiment() for s in symbols}
             self._fetched_today = True
             return self._cache
