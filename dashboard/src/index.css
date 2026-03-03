@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark theme base */
+body {
+  @apply bg-gray-950 text-gray-100 antialiased;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-gray-900;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-600 rounded-full;
+}
+
+/* Subtle card glow on hover */
+.card-hover {
+  transition: box-shadow 0.2s ease;
+}
+.card-hover:hover {
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3);
+}
+
+/* Pulse animation for live indicator */
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.live-dot {
+  animation: pulse-green 2s ease-in-out infinite;
+}

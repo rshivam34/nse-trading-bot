@@ -1,4 +1,4 @@
-# Core
+# Core data processing
 pandas>=2.0.0
 numpy>=1.24.0
 
@@ -8,21 +8,23 @@ smartapi-python>=1.3.0
 # Technical Indicators
 pandas-ta>=0.3.14
 
-# Real-time Data
+# Real-time Data (WebSocket)
 websocket-client>=1.6.0
 
 # Firebase (data bridge to dashboard)
 firebase-admin>=6.2.0
 
-# Configuration
+# Configuration (reads .env file)
 python-dotenv>=1.0.0
 
-# Scheduling
+# Scheduling (end-of-day tasks)
 schedule>=1.2.0
 
-# TOTP for Angel One login
+# TOTP for Angel One 2FA login
 pyotp>=2.9.0
 
-# Utilities
+# HTTP requests (Marketaux news API, Angel One instrument master)
 requests>=2.31.0
+
+# Utilities
 tabulate>=0.9.0
