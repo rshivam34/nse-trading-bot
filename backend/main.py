@@ -55,18 +55,21 @@ PORTFOLIO_UPDATE_INTERVAL = 5
 # NSE holidays 2026 (update annually; bot skips these dates)
 NSE_HOLIDAYS_2026 = {
     "2026-01-26",  # Republic Day
-    "2026-03-31",  # Id-Ul-Fitr (Eid)
-    "2026-04-02",  # Ram Navami
+    "2026-02-17",  # Shivaji Maharaj Jayanti (Chhatrapati Shivaji Maharaj Jayanti)
+    "2026-03-03",  # Holi
+    "2026-03-26",  # Ram Navami
+    "2026-03-31",  # Id-Ul-Fitr (Eid) / Mahavir Jayanti
+    "2026-04-03",  # Good Friday
     "2026-04-14",  # Dr. Ambedkar Jayanti
-    "2026-04-15",  # Good Friday
     "2026-05-01",  # Maharashtra Day
+    "2026-06-26",  # Muharram
     "2026-08-15",  # Independence Day
-    "2026-08-27",  # Ganesh Chaturthi
+    "2026-08-19",  # Parsi New Year (Nowroz)
     "2026-10-02",  # Gandhi Jayanti
-    "2026-10-23",  # Dussehra
-    "2026-11-04",  # Diwali Laxmi Puja
+    "2026-10-22",  # Dussehra
+    "2026-11-04",  # Diwali Laxmi Pujan
     "2026-11-05",  # Diwali Balipratipada
-    "2026-11-25",  # Guru Nanak Jayanti
+    "2026-11-27",  # Guru Nanak Jayanti
     "2026-12-25",  # Christmas
 }
 
@@ -1031,7 +1034,7 @@ class TradingBot:
                      f"{config.trading.lunch_block_start.strftime('%H:%M')}-"
                      f"{config.trading.lunch_block_end.strftime('%H:%M')} "
                      f"(no new trades)")
-        logger.info(f"  |- Pre-flight checklist: 17 checks before every trade")
+        logger.info(f"  |- Pre-flight checklist: 17 checks (14 active + 3 pre-verified)")
         logger.info("=" * 60)
 
 

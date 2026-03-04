@@ -539,7 +539,7 @@ class OrderManager:
                 fail_reason = f"Check #{i} — {name} ({detail})"
 
         if all_passed:
-            logger.info(f"PREFLIGHT PASSED: All 17 checks OK for {signal.stock}")
+            logger.info(f"PREFLIGHT PASSED: All 17 checks OK for {signal.stock} (14 active + 3 pre-verified in scanner)")
         else:
             logger.warning(f"PREFLIGHT FAILED: {fail_reason}")
 
@@ -728,12 +728,12 @@ class OrderManager:
             # ── Calculate unrealized P&L ──────────────────────────────────
             if direction == "LONG":
                 pos.unrealized_pnl = (
-                    (ltp - pos.signal.entry_price) * pos.remaining_quantity
+                    (ltp - pos.actual_entry) * pos.remaining_quantity
                     + pos.realized_pnl
                 )
             else:
                 pos.unrealized_pnl = (
-                    (pos.signal.entry_price - ltp) * pos.remaining_quantity
+                    (pos.actual_entry - ltp) * pos.remaining_quantity
                     + pos.realized_pnl
                 )
 
@@ -742,7 +742,7 @@ class OrderManager:
                 if ltp > pos.peak_price:
                     pos.peak_price = ltp
             else:
-                if ltp < pos.peak_price or pos.peak_price == pos.signal.entry_price:
+                if ltp < pos.peak_price:
                     pos.peak_price = ltp
 
             # ── Update win zone peak ──────────────────────────────────────
@@ -822,7 +822,12 @@ class OrderManager:
             # ── TIME-BASED SL TIGHTENING (FIX 3c) ────────────────────────
             if is_late_session and not is_profit_exit_time:
                 # After 2:30 PM: tighten SL to 1% from current price
-                late_sl_distance = ltp * (self.config.late_session_sl_pct / 100)
+                # Use ATR if available, else fall back to fixed 1%
+                atr = getattr(pos.signal, "atr_value", 0)
+                if atr > 0:
+                    late_sl_distance = atr * self.config.trailing_sl_atr_multiplier  # 1× ATR
+                else:
+                    late_sl_distance = ltp * (self.config.late_session_sl_pct / 100)  # 1% fallback
                 if direction == "LONG":
                     late_sl = round(ltp - late_sl_distance, 2)
                     if late_sl > pos.effective_sl:
@@ -982,15 +987,15 @@ class OrderManager:
 
         # P&L for the exited half
         if pos.signal.direction == "LONG":
-            pnl_partial = (exit_price - pos.signal.entry_price) * half_qty
+            pnl_partial = (exit_price - pos.actual_entry) * half_qty
         else:
-            pnl_partial = (pos.signal.entry_price - exit_price) * half_qty
+            pnl_partial = (pos.actual_entry - exit_price) * half_qty
 
         charges = calculate_charges(
-            pos.signal.entry_price, exit_price, half_qty, pos.signal.direction
+            pos.actual_entry, exit_price, half_qty, pos.signal.direction
         )
 
-        pos.realized_pnl += pnl_partial
+        pos.realized_pnl += (pnl_partial - charges["total_charges"])
         pos.remaining_quantity -= half_qty
         pos.partial_exit_done = True
         pos.effective_sl = pos.signal.entry_price  # Move SL to breakeven
@@ -1042,13 +1047,13 @@ class OrderManager:
 
         # P&L for remaining shares
         if pos.signal.direction == "LONG":
-            pnl_remaining = (exit_price - pos.signal.entry_price) * pos.remaining_quantity
+            pnl_remaining = (exit_price - pos.actual_entry) * pos.remaining_quantity
         else:
-            pnl_remaining = (pos.signal.entry_price - exit_price) * pos.remaining_quantity
+            pnl_remaining = (pos.actual_entry - exit_price) * pos.remaining_quantity
 
         # Full charges calculation for the complete trade
         charges = calculate_charges(
-            pos.actual_entry, exit_price, pos.signal.quantity, pos.signal.direction
+            pos.actual_entry, exit_price, pos.remaining_quantity, pos.signal.direction
         )
 
         total_gross = pos.realized_pnl + pnl_remaining
@@ -1078,10 +1083,10 @@ class OrderManager:
             "exit": exit_price,
             "quantity": pos.signal.quantity,
             "gross_pnl": round(total_gross, 2),
-            "pnl": round(total_net, 2),
+            "net_pnl": round(total_net, 2),
             "charges": charges,
             "reason": reason,
-            "strategy": pos.signal.strategy_name,
+            "strategy_name": pos.signal.strategy_name,
             "score": getattr(pos.signal, "score", 0),
             "slippage": pos.slippage,
             "hold_time_min": round(pos.hold_time_minutes, 1),
@@ -1141,10 +1146,53 @@ class OrderManager:
                     f"we have {len(self.open_positions)} -- marking all closed"
                 )
                 for pos in self.open_positions[:]:
+                    # Estimate exit at effective SL (best guess for offline close)
+                    est_exit = pos.effective_sl if pos.effective_sl > 0 else pos.actual_entry
+                    if pos.signal.direction == "LONG":
+                        est_pnl = (est_exit - pos.actual_entry) * pos.remaining_quantity
+                    else:
+                        est_pnl = (pos.actual_entry - est_exit) * pos.remaining_quantity
+                    est_pnl += pos.realized_pnl
+                    charges = calculate_charges(
+                        pos.actual_entry, est_exit, pos.remaining_quantity, pos.signal.direction
+                    )
+                    est_net = est_pnl - charges["total_charges"]
+
+                    # Record estimated P&L
+                    initial_risk = abs(pos.actual_entry - pos.signal.stop_loss)
+                    r_multiple = round(est_pnl / pos.signal.quantity / initial_risk, 2) if initial_risk > 0 and pos.signal.quantity > 0 else 0.0
+                    self.risk_manager.record_trade_result(est_net, pos.signal.stock)
+                    self.portfolio.record_trade({
+                        "stock": pos.signal.stock,
+                        "direction": pos.signal.direction,
+                        "entry": pos.actual_entry,
+                        "exit": est_exit,
+                        "quantity": pos.signal.quantity,
+                        "gross_pnl": round(est_pnl, 2),
+                        "net_pnl": round(est_net, 2),
+                        "charges": charges,
+                        "reason": "CLOSED_WHILE_OFFLINE",
+                        "strategy_name": pos.signal.strategy_name,
+                        "score": getattr(pos.signal, "score", 0),
+                        "slippage": pos.slippage,
+                        "hold_time_min": round(pos.hold_time_minutes, 1),
+                        "r_multiple": r_multiple,
+                        "planned_r_target": self.config.risk_reward_ratio,
+                        "confluence_count": getattr(pos.signal, "confluence_count", 0),
+                        "confluence_strategies": getattr(pos.signal, "confluence_strategies", []),
+                        "atr_value": getattr(pos.signal, "atr_value", 0),
+                    })
+
                     pos.status = "CLOSED"
                     pos.exit_reason = "CLOSED_WHILE_OFFLINE"
+                    pos.exit_price = est_exit
+                    pos.realized_pnl = est_pnl
                     self.open_positions.remove(pos)
                     self.closed_positions.append(pos)
+                    logger.warning(
+                        f"Reconciled {pos.signal.stock}: estimated exit @ Rs.{est_exit:.2f} | "
+                        f"Gross: Rs.{est_pnl:+.2f} | Net: Rs.{est_net:+.2f} (ESTIMATED)"
+                    )
             return
 
         broker_symbols = {
@@ -1159,10 +1207,53 @@ class OrderManager:
                     f"Reconciliation: {pos.signal.stock} not in broker positions -- "
                     "likely closed while WebSocket was down"
                 )
+                # Estimate exit at effective SL (best guess for offline close)
+                est_exit = pos.effective_sl if pos.effective_sl > 0 else pos.actual_entry
+                if pos.signal.direction == "LONG":
+                    est_pnl = (est_exit - pos.actual_entry) * pos.remaining_quantity
+                else:
+                    est_pnl = (pos.actual_entry - est_exit) * pos.remaining_quantity
+                est_pnl += pos.realized_pnl
+                charges = calculate_charges(
+                    pos.actual_entry, est_exit, pos.remaining_quantity, pos.signal.direction
+                )
+                est_net = est_pnl - charges["total_charges"]
+
+                # Record estimated P&L
+                initial_risk = abs(pos.actual_entry - pos.signal.stop_loss)
+                r_multiple = round(est_pnl / pos.signal.quantity / initial_risk, 2) if initial_risk > 0 and pos.signal.quantity > 0 else 0.0
+                self.risk_manager.record_trade_result(est_net, pos.signal.stock)
+                self.portfolio.record_trade({
+                    "stock": pos.signal.stock,
+                    "direction": pos.signal.direction,
+                    "entry": pos.actual_entry,
+                    "exit": est_exit,
+                    "quantity": pos.signal.quantity,
+                    "gross_pnl": round(est_pnl, 2),
+                    "net_pnl": round(est_net, 2),
+                    "charges": charges,
+                    "reason": "RECONCILED_WHILE_OFFLINE",
+                    "strategy_name": pos.signal.strategy_name,
+                    "score": getattr(pos.signal, "score", 0),
+                    "slippage": pos.slippage,
+                    "hold_time_min": round(pos.hold_time_minutes, 1),
+                    "r_multiple": r_multiple,
+                    "planned_r_target": self.config.risk_reward_ratio,
+                    "confluence_count": getattr(pos.signal, "confluence_count", 0),
+                    "confluence_strategies": getattr(pos.signal, "confluence_strategies", []),
+                    "atr_value": getattr(pos.signal, "atr_value", 0),
+                })
+
                 pos.status = "CLOSED"
                 pos.exit_reason = "RECONCILED_WHILE_OFFLINE"
+                pos.exit_price = est_exit
+                pos.realized_pnl = est_pnl
                 self.open_positions.remove(pos)
                 self.closed_positions.append(pos)
+                logger.warning(
+                    f"Reconciled {pos.signal.stock}: estimated exit @ Rs.{est_exit:.2f} | "
+                    f"Gross: Rs.{est_pnl:+.2f} | Net: Rs.{est_net:+.2f} (ESTIMATED)"
+                )
 
     def _check_pending_timeouts(self):
         """

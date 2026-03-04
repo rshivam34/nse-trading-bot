@@ -276,7 +276,7 @@ class DataStream:
         """Called when a WebSocket error occurs."""
         logger.error(f"WebSocket error: {error}")
 
-    def _on_close(self, wsapp):
+    def _on_close(self, wsapp, *args, **kwargs):
         """Called when the WebSocket connection closes."""
         logger.warning("WebSocket connection closed")
 

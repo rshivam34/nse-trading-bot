@@ -119,12 +119,13 @@ class SignalScorer:
         # ── EMA ALIGNMENT ───────────────────────────────────────────────
         # True if EMA9 > EMA21 for longs, EMA9 < EMA21 for shorts
         ema_aligned = market_context.get("ema_aligned", None)
-        if ema_aligned is True:
-            breakdown["ema_aligned"] = 10
-        elif ema_aligned is None:
+        if ema_aligned is None:
             breakdown["ema_aligned"] = 5   # No data — partial credit
+        elif (direction == "LONG" and ema_aligned is True) or \
+             (direction == "SHORT" and ema_aligned is False):
+            breakdown["ema_aligned"] = 10  # EMAs confirm trade direction
         else:
-            breakdown["ema_aligned"] = 0   # EMA against trade direction
+            breakdown["ema_aligned"] = 0   # EMAs against trade direction
 
         # ── PRICE vs PREV DAY CLOSE ──────────────────────────────────────
         prev_day = market_context.get("prev_day", {})

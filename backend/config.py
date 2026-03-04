@@ -124,7 +124,7 @@ class TradingConfig:
     chop_period: int = 14                   # Choppiness Index lookback period
 
     # ── 15-minute trend filter (sniper mode) ──────────────────────────
-    trend_15m_enabled: bool = True          # Check 15-min EMA trend before trading
+    trend_15m_enabled: bool = False          # Disabled: tick-level data doesn't produce real 15-min candles. Re-enable after implementing time-based resampling.
     trend_15m_flat_threshold_pct: float = 0.05  # EMAs within 0.05% = flat/neutral = skip
 
     # ── ATR expansion check (sniper mode) ─────────────────────────────

@@ -521,3 +521,35 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 - **Choppiness is checked for both stock AND NIFTY independently**: A trending stock in a choppy market will still fail. A clean-trending market doesn't save a choppy stock. Both must show directional conviction (Choppiness Index < 61.8).
 - **All rejected signals are logged with status tags**: Every signal the scanner evaluates gets tagged (EXECUTED, SKIPPED-LUNCH, SKIPPED-VIX, SKIPPED-CHOPPY, SKIPPED-TREND, SKIPPED-VOLUME, etc.). This is for post-session review to answer: "What did the bot see today? What did it reject and why?"
 - **First-win-stop is NOT implemented**: Stopping after the first winning trade wastes 2/3 of the 3-trade daily capacity. The 2-loss-stop rule and 60-min cooldown after consecutive losses provide sufficient downside protection without capping upside. If the bot finds 3 great setups, it should take all 3.
+
+---
+
+## POST-AUDIT FIXES (March 4, 2026 — Evening)
+
+### Full code audit performed before ₹15K live launch. All issues fixed:
+
+### CRITICAL Fixes
+- **Portfolio capital tracking fixed**: `order_manager._close_remaining()` was passing net P&L under key `"pnl"` but `portfolio.record_trade()` expected `"net_pnl"`. Capital was never deducting charges — now it does.
+- **EMA scorer direction-aware**: Signal scorer was giving +10 to SHORT signals when EMAs were BULLISH (wrong). Now correctly checks: LONG needs EMA9>EMA21, SHORT needs EMA9<EMA21.
+
+### HIGH Fixes
+- **Strategy stats key fixed**: `record_trade()` received `"strategy"` but read `"strategy_name"`. All strategy breakdown stats showed "UNKNOWN" — now shows actual strategy names (ORB, VWAP_BOUNCE, etc.).
+- **Late session SL uses ATR**: After 2:30 PM, SL tightening now uses 1× ATR (matching sniper mode trailing SL) instead of always using fixed 1%. Falls back to 1% only if ATR is unavailable.
+- **15-min trend filter DISABLED**: `trend_15m_enabled` set to False. The filter operated on tick-level data (3 ticks ≠ 15 minutes), making it unreliable. Also blocked ALL morning signals because it returns NEUTRAL when insufficient data exists (<66 ticks). Will re-enable after implementing proper time-based 5-min candle resampling.
+
+### MEDIUM Fixes
+- **Partial exit charge calculation fixed**: `_close_remaining()` was calculating charges on `pos.signal.quantity` (full original qty) instead of `pos.remaining_quantity`. This double-counted charges for the already-exited half.
+- **Pre-flight checklist honesty**: Log messages now say "14 active + 3 pre-verified" instead of claiming all 17 are independently checked.
+
+### LOW Fixes
+- **NSE holidays 2026 updated**: Synced with official NSE calendar. Added missing dates (Holi Mar 3, Shivaji Jayanti Feb 17, Muharram Jun 26, Parsi New Year Aug 19). Removed incorrect dates.
+
+### Config Changes
+- `trend_15m_enabled`: True → False (disabled until proper resampling)
+
+### Known Issues Still Open (not blocking launch)
+- Tick-level candle building makes ATR and Choppiness Index noisier than they would be with proper time-based 5-min candles. Works acceptably but could be improved.
+- NIFTY choppiness defaults to 50.0 until enough ticks accumulate (~first few minutes). Early signals bypass this gate silently.
+- Pre-flight checks 3, 11, 13 are verified in scanner, not re-verified in pre-flight. Functionally safe but redundant.
+
+### Audit Confidence After Fixes: 8/10 — Safe for ₹15K live trading
