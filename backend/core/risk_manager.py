@@ -4,12 +4,21 @@ Risk Manager — The Guardian of Your Capital
 This module enforces ALL safety rules. It has VETO power over every trade.
 If the risk manager says no, the trade does not happen. Period.
 
-Production upgrades:
+Capital-based trade limiting (FIX 2 — replaces hard max-3 rule):
+- Safety ceiling: 15 trades/day (but capital is the real limiter)
+- Primary limiter: deployed capital < 80% of broker margin
+- 3% daily loss limit stops the bot for the day
+- 2 consecutive losses = 60-minute cooldown
+- 3 total losses in a day = stop for the day
+
+Re-entry prevention (FIX 3d):
+- After exiting a stock, cannot re-enter same stock for 30 minutes
+
+Other protections:
 - Time-based position sizing (100% / 50% / 75% based on time of day)
 - Market regime size multiplier (0.7x for volatile, 1.1x for trending)
 - Duplicate order prevention (never trade same stock twice until closed)
-- 60-minute cooldown after consecutive loss limit is hit
-- Expected net P&L check (skip if profit after charges < Rs.5)
+- Expected net P&L check (skip if profit after charges too low)
 """
 
 import logging
@@ -25,10 +34,12 @@ logger = logging.getLogger(__name__)
 class RiskManager:
     """Enforces position sizing and risk limits."""
 
-    def __init__(self, trading_config, portfolio):
+    def __init__(self, trading_config, portfolio, broker=None):
         self.config = trading_config
         self.portfolio = portfolio
+        self._broker = broker  # For margin queries via getRMS API
         self.trades_today = 0
+        self.losses_today = 0  # Total losing trades today (not just consecutive)
         self.daily_pnl = 0.0
         self._start_of_day_capital = trading_config.initial_capital
 
@@ -39,6 +50,15 @@ class RiskManager:
         # Duplicate prevention: set of stock symbols currently in a trade
         self._active_stocks: set[str] = set()
 
+        # Re-entry prevention (FIX 3d): stock -> earliest allowed re-entry time
+        self._reentry_blocked_until: dict[str, datetime] = {}
+
+        # Capital deployment tracking (local — no API call needed per signal)
+        # Tracks sum of (entry_price × quantity) for all open positions
+        self._deployed_capital: float = 0.0
+        self._deployed_by_stock: dict[str, float] = {}  # stock -> deployed Rs.
+        self._cached_margin: float = 0.0  # Last known margin from broker RMS API
+
         # Market regime size multiplier (updated by main.py from regime detector)
         self.regime_size_multiplier: float = 1.0
         self.regime_sl_multiplier: float = 1.0
@@ -46,11 +66,16 @@ class RiskManager:
     def reset_daily(self):
         """Call this at start of each trading day."""
         self.trades_today = 0
+        self.losses_today = 0
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self._cooldown_until = None
         self._active_stocks.clear()
+        self._reentry_blocked_until.clear()
+        self._deployed_capital = 0.0
+        self._deployed_by_stock.clear()
         self._start_of_day_capital = self.portfolio.current_capital
+        self.refresh_margin()  # Get fresh margin at start of day
 
     def set_regime_multipliers(self, size_mult: float, sl_mult: float):
         """Update regime-based multipliers (called from main.py on regime update)."""
@@ -65,28 +90,91 @@ class RiskManager:
         """Record that the position in this stock was closed."""
         self._active_stocks.discard(stock)
 
+    # ──────────────────────────────────────────────────────────
+    # Margin / Deployed Capital
+    # ──────────────────────────────────────────────────────────
+
+    def refresh_margin(self):
+        """Fetch available margin from Angel One RMS API and cache it.
+
+        Called after each trade open/close so the cached value stays current.
+        Not called on every tick — that would be too many API calls.
+        """
+        if not self._broker:
+            return
+
+        try:
+            funds = self._broker.get_funds()
+            if funds:
+                # availableintradaypayin = cash × intraday leverage (~5×)
+                intraday = float(funds.get("availableintradaypayin", 0) or 0)
+                cash = float(funds.get("availablecash", 0) or 0)
+                self._cached_margin = intraday if intraday > 0 else cash
+                logger.debug(f"Margin refreshed: Rs.{self._cached_margin:,.0f}")
+        except Exception as e:
+            logger.debug(f"Margin refresh failed: {e}")
+
+    def _get_max_deployable(self) -> float:
+        """Get the maximum capital we're allowed to have deployed at once.
+
+        Returns 80% (configurable) of broker margin.
+        Falls back to initial_capital if broker margin is unavailable.
+        """
+        pct = self.config.max_capital_deployed_pct / 100
+        if self._cached_margin > 0:
+            return self._cached_margin * pct
+        # Fallback: use initial capital (no leverage assumed — conservative)
+        return self.config.initial_capital * pct
+
+    def get_deployment_stats(self) -> dict:
+        """Return current capital deployment stats (for logging/dashboard)."""
+        max_deploy = self._get_max_deployable()
+        return {
+            "deployed": round(self._deployed_capital, 2),
+            "max_deployable": round(max_deploy, 2),
+            "utilization_pct": round(
+                (self._deployed_capital / max_deploy * 100) if max_deploy > 0 else 0, 1
+            ),
+            "cached_margin": round(self._cached_margin, 2),
+            "open_positions": len(self._active_stocks),
+            "trades_today": self.trades_today,
+            "losses_today": self.losses_today,
+        }
+
+    # ──────────────────────────────────────────────────────────
+    # Core Gate: can_trade()
+    # ──────────────────────────────────────────────────────────
+
     def can_trade(self, signal: Signal) -> bool:
         """
         Gate every potential trade through all safety rules.
         Sets signal.reason if blocked. Returns True only if ALL checks pass.
         """
-        # Rule 1: Max trades per day
+        # Rule 1: Safety cap on total trades (high ceiling — capital is the real limit)
         if self.trades_today >= self.config.max_trades_per_day:
             signal.reason = f"Max trades ({self.config.max_trades_per_day}) reached today"
             return False
 
-        # Rule 2: Daily loss limit
+        # Rule 2: 3 total losses today = done for the day
+        if self.losses_today >= self.config.max_losses_per_day:
+            signal.reason = (
+                f"Max losses ({self.config.max_losses_per_day}) reached today — "
+                "stopping to protect capital"
+            )
+            return False
+
+        # Rule 3: Daily loss limit (3% of starting capital)
         if self.daily_loss_limit_hit():
             signal.reason = "Daily loss limit hit (3% of capital)"
             return False
 
-        # Rule 3: No trading after cutoff time
+        # Rule 4: No trading after cutoff time
         now = datetime.now().time()
         if now > self.config.no_new_trades_after:
             signal.reason = "Past trading cutoff (2:30 PM)"
             return False
 
-        # Rule 4: Must be in an active trading window
+        # Rule 5: Must be in an active trading window
         if not self._in_trading_window(now):
             signal.reason = (
                 f"Outside trading windows "
@@ -97,7 +185,7 @@ class RiskManager:
             )
             return False
 
-        # Rule 5: Consecutive loss circuit breaker + cooldown
+        # Rule 6: Consecutive loss circuit breaker + cooldown
         if self._is_in_cooldown():
             remaining = (self._cooldown_until - datetime.now()).seconds // 60
             signal.reason = (
@@ -105,58 +193,197 @@ class RiskManager:
             )
             return False
 
-        # Rule 6: Duplicate order prevention
+        # Rule 7: Duplicate order prevention
         if signal.stock in self._active_stocks:
             signal.reason = f"Already have an open position in {signal.stock}"
             return False
 
-        # Rule 7: Must have stop-loss
+        # Rule 7b: Re-entry cooldown (FIX 3d — 30-min block after exiting a stock)
+        if signal.stock in self._reentry_blocked_until:
+            block_until = self._reentry_blocked_until[signal.stock]
+            if datetime.now() < block_until:
+                remaining = (block_until - datetime.now()).seconds // 60
+                signal.reason = (
+                    f"Re-entry blocked for {signal.stock} "
+                    f"({remaining} min remaining of {self.config.reentry_cooldown_minutes}-min cooldown)"
+                )
+                return False
+            else:
+                # Cooldown expired — remove the block
+                del self._reentry_blocked_until[signal.stock]
+
+        # Rule 8: Must have stop-loss
         if signal.stop_loss == 0:
             signal.reason = "No stop-loss defined"
             return False
 
-        # Rule 8: Risk-reward must be acceptable
+        # Rule 9: Risk-reward must be acceptable
         if signal.risk_reward_ratio < 1.0:
             signal.reason = f"Risk-reward too low ({signal.risk_reward_ratio:.2f})"
             return False
 
-        # Rule 9: Calculate position size (with time-based + regime scaling)
+        # Rule 10: Calculate position size (with time-based + regime scaling)
         quantity = self._calc_quantity(signal, now)
         if quantity <= 0:
             signal.reason = "Insufficient capital for minimum position"
             return False
 
-        # Rule 10: Expected net profit must exceed charges
+        # Rule 11: Capital deployment check — is there room for this trade?
+        estimated_deployment = signal.entry_price * quantity
+        max_deployable = self._get_max_deployable()
+        if max_deployable > 0:
+            remaining_capacity = max_deployable - self._deployed_capital
+            if estimated_deployment > remaining_capacity:
+                # Try reducing quantity to fit within remaining capacity
+                reduced_qty = int(remaining_capacity / signal.entry_price)
+                if reduced_qty <= 0:
+                    signal.reason = (
+                        f"Capital fully deployed: Rs.{self._deployed_capital:,.0f} used "
+                        f"of Rs.{max_deployable:,.0f} max "
+                        f"({self._deployed_capital / max_deployable * 100:.0f}%)"
+                    )
+                    return False
+                logger.info(
+                    f"Reducing {signal.stock} qty from {quantity} to {reduced_qty} "
+                    f"(Rs.{remaining_capacity:,.0f} margin remaining)"
+                )
+                quantity = reduced_qty
+
+        # Rule 12: Expected net profit must exceed charges (capital-scaled)
+        capital = self.portfolio.current_capital
+        if capital < 2000:
+            min_profit = 8.0
+        elif capital < 5000:
+            min_profit = 12.0
+        else:
+            min_profit = self.config.min_expected_net_profit
+
         viable, net_profit = is_trade_viable(
             entry_price=signal.entry_price,
             target_price=signal.target,
             quantity=quantity,
             direction=signal.direction,
-            min_profit=self.config.min_expected_net_profit,
+            min_profit=min_profit,
         )
         if not viable:
             signal.reason = (
                 f"Expected net profit (Rs.{net_profit:.2f}) < "
-                f"minimum (Rs.{self.config.min_expected_net_profit:.0f}) after charges"
+                f"minimum (Rs.{min_profit:.0f}) after charges"
             )
             return False
 
-        # All checks passed — assign quantity and count the trade
+        # All checks passed — assign quantity (trade count incremented later
+        # by confirm_trade_placed() only if the order actually succeeds)
         signal.quantity = quantity
-        self.trades_today += 1
-        self._active_stocks.add(signal.stock)
         return True
+
+    # ──────────────────────────────────────────────────────────
+    # Trade Lifecycle Callbacks
+    # ──────────────────────────────────────────────────────────
+
+    def confirm_trade_placed(self, stock: str, entry_price: float = 0.0, quantity: int = 0):
+        """
+        Called by order_manager ONLY after Angel One confirms the order.
+
+        Increments the daily trade count, marks the stock as active,
+        and tracks the deployed capital for this position.
+        """
+        self.trades_today += 1
+        self._active_stocks.add(stock)
+
+        # Track deployed capital for this stock
+        deployed = entry_price * quantity
+        if deployed > 0:
+            self._deployed_capital += deployed
+            self._deployed_by_stock[stock] = deployed
+
+        stats = self.get_deployment_stats()
+        logger.info(
+            f"Trade confirmed: {stock} | "
+            f"Trades today: {self.trades_today} | "
+            f"Deployed: Rs.{stats['deployed']:,.0f} / Rs.{stats['max_deployable']:,.0f} "
+            f"({stats['utilization_pct']:.0f}%)"
+        )
+
+        # Refresh margin from broker after trade placement
+        self.refresh_margin()
+
+    def record_trade_result(self, pnl: float, stock: str = ""):
+        """
+        Update daily P&L, loss counters, and deployed capital after a trade closes.
+        Activates 60-minute cooldown if consecutive losses limit is hit.
+        """
+        self.daily_pnl += pnl
+
+        # Free up the stock slot and release deployed capital
+        if stock:
+            self.mark_stock_closed(stock)
+            freed = self._deployed_by_stock.pop(stock, 0)
+            self._deployed_capital -= freed
+            self._deployed_capital = max(0.0, self._deployed_capital)  # safety floor
+
+            # Set re-entry cooldown (FIX 3d — block re-entry for 30 min)
+            cooldown_mins = self.config.reentry_cooldown_minutes
+            self._reentry_blocked_until[stock] = (
+                datetime.now() + timedelta(minutes=cooldown_mins)
+            )
+            logger.info(
+                f"Re-entry blocked for {stock} for {cooldown_mins} min "
+                f"(until {self._reentry_blocked_until[stock].strftime('%H:%M')})"
+            )
+
+        if pnl > 0:
+            # Win — reset the consecutive loss streak
+            if self.consecutive_losses > 0:
+                logger.info(
+                    f"Win after {self.consecutive_losses} consecutive losses — "
+                    "resetting streak"
+                )
+            self.consecutive_losses = 0
+            self._cooldown_until = None
+
+        else:
+            # Loss — increment both counters
+            self.losses_today += 1
+            self.consecutive_losses += 1
+            logger.warning(
+                f"Loss recorded. "
+                f"Consecutive: {self.consecutive_losses}/{self.config.consecutive_loss_limit} | "
+                f"Total today: {self.losses_today}/{self.config.max_losses_per_day}"
+            )
+
+            if self.consecutive_losses >= self.config.consecutive_loss_limit:
+                cooldown_mins = self.config.consecutive_loss_cooldown_minutes
+                self._cooldown_until = datetime.now() + timedelta(minutes=cooldown_mins)
+                logger.warning(
+                    f"Consecutive loss circuit breaker! Trading paused for "
+                    f"{cooldown_mins} minutes until "
+                    f"{self._cooldown_until.strftime('%H:%M')}"
+                )
+
+        # Refresh margin from broker after position closes (frees margin)
+        self.refresh_margin()
+
+        stats = self.get_deployment_stats()
+        logger.info(
+            f"Daily P&L: Rs.{self.daily_pnl:+,.2f} | "
+            f"Trades: {self.trades_today} | Losses: {self.losses_today} | "
+            f"Deployed: Rs.{stats['deployed']:,.0f} ({stats['utilization_pct']:.0f}%)"
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # Position Sizing
+    # ──────────────────────────────────────────────────────────
 
     def _calc_quantity(self, signal: Signal, now) -> int:
         """
         Position sizing with time-based and regime scaling.
 
-        Base formula: quantity = (capital × risk%) / risk_per_share
+        Base formula: quantity = (capital x risk%) / risk_per_share
 
         Then apply:
         1. Time-of-day scaling (100% / 50% / 75%)
         2. Regime scaling (0.7x volatile, 1.1x trending)
-        3. Cap at 5× margin (Angel One intraday MIS gives ~5× leverage)
         """
         capital = self.portfolio.current_capital
         risk_amount = capital * (self.config.max_risk_per_trade_pct / 100)
@@ -199,6 +426,10 @@ class RiskManager:
         else:
             return 100.0  # Default (outside normal windows but before cutoff)
 
+    # ──────────────────────────────────────────────────────────
+    # Helper Checks
+    # ──────────────────────────────────────────────────────────
+
     def _in_trading_window(self, now) -> bool:
         """Check if current time falls in an active trading window."""
         in_w1 = (
@@ -219,44 +450,3 @@ class RiskManager:
         """Check if we've lost 3% or more of start-of-day capital."""
         limit = self._start_of_day_capital * (self.config.daily_loss_limit_pct / 100)
         return self.daily_pnl <= -limit
-
-    def record_trade_result(self, pnl: float, stock: str = ""):
-        """
-        Update daily P&L and consecutive loss counter after a trade closes.
-        Activates 60-minute cooldown if consecutive losses limit is hit.
-        """
-        self.daily_pnl += pnl
-
-        # Free up the stock slot for future trades
-        if stock:
-            self.mark_stock_closed(stock)
-
-        if pnl > 0:
-            # Win — reset the consecutive loss streak
-            if self.consecutive_losses > 0:
-                logger.info(
-                    f"Win after {self.consecutive_losses} consecutive losses — "
-                    "resetting streak"
-                )
-            self.consecutive_losses = 0
-            self._cooldown_until = None
-
-        else:
-            # Loss — increment counter
-            self.consecutive_losses += 1
-            logger.warning(
-                f"Loss recorded. Consecutive losses: {self.consecutive_losses}"
-                f"/{self.config.consecutive_loss_limit}"
-            )
-
-            if self.consecutive_losses >= self.config.consecutive_loss_limit:
-                cooldown_mins = self.config.consecutive_loss_cooldown_minutes
-                self._cooldown_until = datetime.now() + timedelta(minutes=cooldown_mins)
-                logger.warning(
-                    f"Consecutive loss circuit breaker! Trading paused for "
-                    f"{cooldown_mins} minutes until "
-                    f"{self._cooldown_until.strftime('%H:%M')}"
-                )
-
-        logger.info(f"Daily P&L: Rs.{self.daily_pnl:+,.2f} | "
-                    f"Trades today: {self.trades_today}")

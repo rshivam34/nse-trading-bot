@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 
 import pyotp  # Generates Time-based One-Time Passwords (like Google Authenticator)
 from SmartApi import SmartConnect  # Angel One's official Python SDK
+from utils.watchlist import lookup_token_for_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -217,16 +218,39 @@ class BrokerConnection:
         - "BUY" for going long
         - "SELL" for going short (intraday sell)
 
+        Token refresh:
+        - Re-looks up the symbol token from the instrument master before placing.
+        - The cached token from startup may be stale (AB1019 mismatch error).
+        - If lookup fails, falls back to the token passed in.
+
         Returns the order_id (string) on success, None on failure.
         """
         if not self._check_connected():
             return None
 
+        # Re-lookup token from instrument master to avoid AB1019 stale token errors
+        fresh_token = lookup_token_for_symbol(stock)
+        if fresh_token:
+            if fresh_token != token:
+                logger.warning(
+                    f"Token mismatch for {stock}: cached={token}, "
+                    f"fresh={fresh_token}. Using fresh token."
+                )
+            token = fresh_token
+        else:
+            logger.warning(
+                f"Could not refresh token for {stock}. "
+                f"Using cached token: {token}"
+            )
+
         transaction_type = "BUY" if direction == "LONG" else "SELL"
+
+        # Angel One requires '-EQ' suffix for NSE equity stocks
+        trading_symbol = stock if stock.endswith("-EQ") else f"{stock}-EQ"
 
         order_params = {
             "variety": "NORMAL",
-            "tradingsymbol": stock,
+            "tradingsymbol": trading_symbol,
             "symboltoken": token,
             "transactiontype": transaction_type,
             "exchange": "NSE",
@@ -241,15 +265,22 @@ class BrokerConnection:
 
         response = self._api_with_retry(self.session.placeOrder, order_params)
 
-        if response and response.get("status"):
+        # SmartAPI may return a string (order ID) or a dict — handle both
+        if isinstance(response, str) and response:
+            logger.info(
+                f"Order placed: {transaction_type} {quantity}x {trading_symbol} "
+                f"@ Rs.{price:.2f} | Order ID: {response}"
+            )
+            return response
+        elif isinstance(response, dict) and response.get("status"):
             order_id = response.get("data", {}).get("orderid", "")
             logger.info(
-                f"Order placed: {transaction_type} {quantity}x {stock} "
+                f"Order placed: {transaction_type} {quantity}x {trading_symbol} "
                 f"@ Rs.{price:.2f} | Order ID: {order_id}"
             )
             return order_id
         else:
-            error = response.get("message", "Unknown") if response else "No response after retries"
+            error = response.get("message", "Unknown") if isinstance(response, dict) else str(response or "No response")
             logger.error(f"Order placement failed: {error}")
             return None
 
@@ -267,6 +298,159 @@ class BrokerConnection:
             logger.error(f"Cancel failed ({order_id}): {error}")
             return False
 
+    # ──────────────────────────────────────────────────────────
+    # Broker-side Stop-Loss Orders (exchange-level protection)
+    # ──────────────────────────────────────────────────────────
+
+    def place_sl_order(
+        self,
+        stock: str,
+        token: str,
+        direction: str,       # Direction of the POSITION (LONG/SHORT)
+        quantity: int,
+        trigger_price: float,
+        price_buffer: float = 0.50,
+    ) -> Optional[str]:
+        """
+        Place a STOPLOSS-LIMIT order with Angel One.
+
+        This is a safety net — even if the bot crashes, the exchange has
+        a real SL order that triggers automatically.
+
+        For a LONG position: places a SELL SL order (sells if price drops to trigger)
+        For a SHORT position: places a BUY SL order (buys if price rises to trigger)
+
+        Args:
+            stock: Stock symbol (e.g., "RELIANCE")
+            token: Instrument token
+            direction: Direction of the open position (LONG or SHORT)
+            quantity: Number of shares to exit
+            trigger_price: The price at which the SL order activates
+            price_buffer: Rs. buffer between trigger and limit price
+
+        Returns:
+            Order ID string on success, None on failure.
+        """
+        if not self._check_connected():
+            return None
+
+        # SL order exits the position: LONG → SELL, SHORT → BUY
+        exit_type = "SELL" if direction == "LONG" else "BUY"
+
+        # Limit price: slightly worse than trigger to ensure fill
+        # For SELL: limit below trigger. For BUY: limit above trigger.
+        if exit_type == "SELL":
+            limit_price = round(trigger_price - price_buffer, 2)
+        else:
+            limit_price = round(trigger_price + price_buffer, 2)
+
+        # Re-lookup token from instrument master
+        fresh_token = lookup_token_for_symbol(stock)
+        if fresh_token:
+            token = fresh_token
+
+        trading_symbol = stock if stock.endswith("-EQ") else f"{stock}-EQ"
+
+        order_params = {
+            "variety": "STOPLOSS",
+            "tradingsymbol": trading_symbol,
+            "symboltoken": token,
+            "transactiontype": exit_type,
+            "exchange": "NSE",
+            "ordertype": "STOPLOSS_LIMIT",
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": str(limit_price),
+            "triggerprice": str(round(trigger_price, 2)),
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(quantity),
+        }
+
+        response = self._api_with_retry(self.session.placeOrder, order_params)
+
+        if isinstance(response, str) and response:
+            logger.info(
+                f"SL order placed: {exit_type} {quantity}x {trading_symbol} "
+                f"trigger @ Rs.{trigger_price:.2f} | Order: {response}"
+            )
+            return response
+        elif isinstance(response, dict) and response.get("status"):
+            order_id = response.get("data", {}).get("orderid", "")
+            logger.info(
+                f"SL order placed: {exit_type} {quantity}x {trading_symbol} "
+                f"trigger @ Rs.{trigger_price:.2f} | Order: {order_id}"
+            )
+            return order_id
+        else:
+            error = response.get("message", "Unknown") if isinstance(response, dict) else str(response or "No response")
+            logger.error(f"SL order placement failed for {stock}: {error}")
+            return None
+
+    def modify_sl_order(
+        self,
+        order_id: str,
+        stock: str,
+        token: str,
+        direction: str,
+        quantity: int,
+        new_trigger_price: float,
+        price_buffer: float = 0.50,
+    ) -> bool:
+        """
+        Modify an existing SL order's trigger and limit price.
+
+        Called when trailing the stop-loss — updates the exchange-level SL
+        to match the bot's new trailing SL price.
+
+        Returns True on success, False on failure.
+        """
+        if not self._check_connected():
+            return False
+
+        exit_type = "SELL" if direction == "LONG" else "BUY"
+        if exit_type == "SELL":
+            new_limit = round(new_trigger_price - price_buffer, 2)
+        else:
+            new_limit = round(new_trigger_price + price_buffer, 2)
+
+        fresh_token = lookup_token_for_symbol(stock)
+        if fresh_token:
+            token = fresh_token
+
+        trading_symbol = stock if stock.endswith("-EQ") else f"{stock}-EQ"
+
+        modify_params = {
+            "variety": "STOPLOSS",
+            "orderid": order_id,
+            "ordertype": "STOPLOSS_LIMIT",
+            "producttype": "INTRADAY",
+            "duration": "DAY",
+            "price": str(new_limit),
+            "triggerprice": str(round(new_trigger_price, 2)),
+            "quantity": str(quantity),
+            "tradingsymbol": trading_symbol,
+            "symboltoken": token,
+            "exchange": "NSE",
+        }
+
+        response = self._api_with_retry(self.session.modifyOrder, modify_params)
+
+        if response and (isinstance(response, str) or response.get("status")):
+            logger.info(
+                f"SL order modified: {stock} new trigger @ Rs.{new_trigger_price:.2f} "
+                f"| Order: {order_id}"
+            )
+            return True
+        else:
+            error = response.get("message", "Unknown") if isinstance(response, dict) else str(response or "No response")
+            logger.error(f"SL order modify failed for {stock}: {error}")
+            return False
+
+    def cancel_sl_order(self, order_id: str) -> bool:
+        """Cancel a broker-side SL order (before placing a manual exit)."""
+        return self.cancel_order(order_id, variety="STOPLOSS")
+
     def place_exit_order(self, stock: str, token: str, direction: str, quantity: int) -> Optional[str]:
         """
         Place a MARKET order to exit a position.
@@ -280,9 +464,22 @@ class BrokerConnection:
         if not self._check_connected():
             return None
 
+        # Re-lookup token from instrument master to avoid AB1019 stale token errors
+        fresh_token = lookup_token_for_symbol(stock)
+        if fresh_token:
+            token = fresh_token
+        else:
+            logger.warning(
+                f"Could not refresh token for exit order {stock}. "
+                f"Using cached token: {token}"
+            )
+
+        # Angel One requires '-EQ' suffix for NSE equity stocks
+        trading_symbol = stock if stock.endswith("-EQ") else f"{stock}-EQ"
+
         order_params = {
             "variety": "NORMAL",
-            "tradingsymbol": stock,
+            "tradingsymbol": trading_symbol,
             "symboltoken": token,
             "transactiontype": exit_direction,
             "exchange": "NSE",
@@ -296,9 +493,14 @@ class BrokerConnection:
         }
 
         response = self._api_with_retry(self.session.placeOrder, order_params)
-        if response and response.get("status"):
+
+        # SmartAPI may return a string (order ID) or a dict — handle both
+        if isinstance(response, str) and response:
+            logger.info(f"Exit order placed: {exit_direction} {quantity}x {trading_symbol} | Order: {response}")
+            return response
+        elif isinstance(response, dict) and response.get("status"):
             order_id = response.get("data", {}).get("orderid", "")
-            logger.info(f"Exit order placed: {exit_direction} {quantity}x {stock} | Order: {order_id}")
+            logger.info(f"Exit order placed: {exit_direction} {quantity}x {trading_symbol} | Order: {order_id}")
             return order_id
 
         logger.error(f"Exit order failed for {stock} after retries")
@@ -396,6 +598,11 @@ class BrokerConnection:
         - (We fetch 2 days so "yesterday" is always candles[-2], not candles[-1]
            which would be today's incomplete candle)
 
+        Rate limit handling:
+        - Angel One returns AB1004 (TooManyRequests) when API is hammered
+        - On rate limit, retries up to 3 times with exponential backoff (5s, 10s, 15s)
+        - This is separate from _api_with_retry() which handles transient errors
+
         Returns dict with keys: prev_open, prev_high, prev_low, prev_close
         Returns empty dict on failure (caller must handle gracefully).
         """
@@ -414,31 +621,229 @@ class BrokerConnection:
             "todate": to_date.strftime("%Y-%m-%d %H:%M"),
         }
 
-        try:
-            response = self._api_with_retry(self.session.getCandleData, params)
-            if not response or not response.get("status"):
-                logger.warning(f"Could not fetch prev day OHLC for {trading_symbol}")
+        # Exponential backoff delays for rate limit retries (5s, 10s, 15s)
+        rate_limit_max_retries = 3
+        rate_limit_delays = [5, 10, 15]
+
+        for rate_attempt in range(rate_limit_max_retries + 1):
+            try:
+                response = self._api_with_retry(self.session.getCandleData, params)
+
+                # Check for rate limit error in the response
+                if response and self._is_rate_limit_error(response):
+                    if rate_attempt < rate_limit_max_retries:
+                        delay = rate_limit_delays[rate_attempt]
+                        logger.warning(
+                            f"Rate limited (AB1004) fetching {trading_symbol}. "
+                            f"Backing off {delay}s "
+                            f"(retry {rate_attempt + 1}/{rate_limit_max_retries})..."
+                        )
+                        time_module.sleep(delay)
+                        continue  # Retry the request
+                    else:
+                        logger.error(
+                            f"Rate limit persists for {trading_symbol} "
+                            f"after {rate_limit_max_retries} retries. Skipping."
+                        )
+                        return {}
+
+                if not response or not response.get("status"):
+                    logger.warning(f"Could not fetch prev day OHLC for {trading_symbol}")
+                    return {}
+
+                candles = response.get("data") or []
+                # Each candle = [timestamp, open, high, low, close, volume]
+                # We need at least 2 candles: yesterday (index -2) and today (index -1)
+                if len(candles) < 2:
+                    logger.warning(f"Not enough candle history for {trading_symbol}")
+                    return {}
+
+                # Second-to-last candle is the last COMPLETE trading day
+                prev = candles[-2]
+                return {
+                    "prev_open":  float(prev[1]),
+                    "prev_high":  float(prev[2]),
+                    "prev_low":   float(prev[3]),
+                    "prev_close": float(prev[4]),
+                }
+
+            except Exception as e:
+                logger.error(f"Error fetching prev day OHLC for {trading_symbol}: {e}")
                 return {}
 
-            candles = response.get("data") or []
-            # Each candle = [timestamp, open, high, low, close, volume]
-            # We need at least 2 candles: yesterday (index -2) and today (index -1)
-            if len(candles) < 2:
-                logger.warning(f"Not enough candle history for {trading_symbol}")
-                return {}
+        return {}
 
-            # Second-to-last candle is the last COMPLETE trading day
-            prev = candles[-2]
-            return {
-                "prev_open":  float(prev[1]),
-                "prev_high":  float(prev[2]),
-                "prev_low":   float(prev[3]),
-                "prev_close": float(prev[4]),
-            }
+    # ──────────────────────────────────────────────────────────
+    # Batch OHLC Fetch with Rate Limiting + Capital Filter
+    # ──────────────────────────────────────────────────────────
 
-        except Exception as e:
-            logger.error(f"Error fetching prev day OHLC for {trading_symbol}: {e}")
-            return {}
+    def fetch_prev_day_ohlc(self, stock: dict, from_date: str, to_date: str) -> dict | None:
+        """Fetch previous day OHLC for a single stock with rate limiting and smart backoff.
+
+        Uses the token bucket rate limiter instead of sleep(2).
+        On AB1004 errors, backs off with escalating delays (5s, 15s).
+
+        Returns:
+            dict with prev_open/high/low/close, or None if failed after retries
+        """
+        from utils.rate_limiter import HISTORICAL_LIMITER
+
+        symbol = stock.get("symbol", "UNKNOWN")
+        token = stock.get("token", "")
+        max_retries = 2
+        backoff_delays = [5, 15]  # seconds — escalating
+
+        for attempt in range(max_retries + 1):
+            try:
+                HISTORICAL_LIMITER.wait()  # Token bucket rate limiter
+
+                data = self.session.getCandleData({
+                    "exchange": "NSE",
+                    "symboltoken": str(token),
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date,
+                })
+
+                if data and data.get("status") and data.get("data"):
+                    candles = data["data"]
+                    if len(candles) >= 2:
+                        prev = candles[-2]
+                        return {
+                            "prev_open": float(prev[1]),
+                            "prev_high": float(prev[2]),
+                            "prev_low": float(prev[3]),
+                            "prev_close": float(prev[4]),
+                        }
+                    logger.debug(f"Not enough candle history for {symbol}")
+                    return None
+
+                # Check for rate limit error
+                error_code = str(data.get("errorcode", "")) if data else ""
+                error_msg = str(data.get("message", "")) if data else ""
+
+                if error_code == "AB1004" or "TooManyRequests" in error_msg:
+                    if attempt < max_retries:
+                        delay = backoff_delays[attempt]
+                        logger.warning(
+                            f"Rate limited ({error_code}) fetching {symbol}. "
+                            f"Backoff {delay}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        time_module.sleep(delay)
+                        continue
+                    else:
+                        logger.warning(
+                            f"Giving up on {symbol} after {max_retries + 1} attempts (rate limited)"
+                        )
+                        return None
+
+                # Non-rate-limit error — don't retry
+                logger.debug(f"No data for {symbol}: {error_msg}")
+                return None
+
+            except Exception as e:
+                if attempt < max_retries:
+                    delay = backoff_delays[attempt]
+                    logger.warning(f"Error fetching {symbol}: {e}. Retrying in {delay}s...")
+                    time_module.sleep(delay)
+                else:
+                    logger.error(
+                        f"Failed to fetch OHLC for {symbol} after {max_retries + 1} attempts: {e}"
+                    )
+                    return None
+
+        return None
+
+    def fetch_all_prev_day_ohlc(
+        self,
+        watchlist: list[dict],
+        capital: float,
+        from_date: str,
+        to_date: str,
+    ) -> tuple[dict, list[dict], dict]:
+        """Master function: cache -> capital filter -> batch fetch -> cache results.
+
+        This is the main entry point for pre-market OHLC loading.
+
+        Args:
+            watchlist: Full watchlist (all 193 stocks)
+            capital: Available trading capital
+            from_date: Start date string for historical data
+            to_date: End date string for historical data
+
+        Returns:
+            tuple: (ohlc_results dict, affordable_stocks list, ltp_cache dict)
+        """
+        from utils.rate_limiter import LTP_LIMITER
+        from utils.ohlc_cache import load_cached_ohlc, save_ohlc_cache
+        from utils.capital_filter import filter_stocks_by_capital
+
+        # STEP 1: Check local cache first (instant on mid-day restart)
+        cached = load_cached_ohlc()
+        if cached:
+            logger.info(
+                f"Using cached OHLC data ({len(cached)} stocks). Zero API calls needed!"
+            )
+            # Still need to filter by capital for the trading phase
+            affordable, skipped, ltp_cache = filter_stocks_by_capital(
+                self.session, watchlist, capital, LTP_LIMITER
+            )
+            return cached, affordable, ltp_cache
+
+        # STEP 2: Capital-aware filter (uses fast LTP API: 5 req/sec)
+        affordable, skipped, ltp_cache = filter_stocks_by_capital(
+            self.session, watchlist, capital, LTP_LIMITER
+        )
+
+        if not affordable:
+            logger.warning("No affordable stocks found! Consider increasing capital.")
+            return {}, [], ltp_cache
+
+        # STEP 3: Fetch OHLC only for affordable stocks (uses slow Historical API: 1 req/sec)
+        logger.info(
+            f"Fetching previous day OHLC for {len(affordable)} affordable stocks "
+            f"(filtered from {len(watchlist)} total)..."
+        )
+
+        ohlc_results: dict = {}
+        ok_count = 0
+        fail_count = 0
+        batch_size = 5
+        batch_gap = 2.0  # extra seconds between batches
+
+        for i in range(0, len(affordable), batch_size):
+            batch = affordable[i:i + batch_size]
+
+            for stock_item in batch:
+                symbol = stock_item.get("symbol", "UNKNOWN")
+                data = self.fetch_prev_day_ohlc(stock_item, from_date, to_date)
+
+                if data:
+                    ohlc_results[symbol] = data
+                    ok_count += 1
+                else:
+                    fail_count += 1
+
+            # Progress log after each batch
+            done = min(i + batch_size, len(affordable))
+            logger.info(
+                f"OHLC fetch progress: {done}/{len(affordable)} "
+                f"({ok_count} OK, {fail_count} failed)"
+            )
+
+            # Extra pause between batches (not after last batch)
+            if i + batch_size < len(affordable):
+                time_module.sleep(batch_gap)
+
+        # STEP 4: Cache results for mid-day restarts
+        save_ohlc_cache(ohlc_results)
+
+        logger.info(
+            f"OHLC fetch complete: {ok_count} OK, {fail_count} failed "
+            f"out of {len(affordable)} affordable stocks"
+        )
+
+        return ohlc_results, affordable, ltp_cache
 
     def get_funds(self) -> dict:
         """
@@ -476,6 +881,24 @@ class BrokerConnection:
     # ──────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────
+
+    def _is_rate_limit_error(self, response: Any) -> bool:
+        """
+        Check if an API response indicates a rate limit error.
+
+        Angel One returns AB1004 when you send too many requests.
+        This checks the response message for known rate-limit indicators.
+        """
+        if not isinstance(response, dict):
+            return False
+        message = str(response.get("message", "")).upper()
+        error_code = str(response.get("errorcode", "")).upper()
+        return (
+            "AB1004" in message
+            or "AB1004" in error_code
+            or "TOO MANY" in message
+            or "RATE LIMIT" in message
+        )
 
     def _check_connected(self) -> bool:
         """Check if connected before making API calls."""

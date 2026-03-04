@@ -3,8 +3,12 @@ Order Manager — Places, Monitors, and Exits Trades.
 ====================================================
 
 Production features:
+- Adopt existing positions on startup (crash recovery)
+- Broker-side SL orders (exchange-level protection even if bot crashes)
+- Improved trailing SL: breakeven at 1% profit, trail at 2% profit
+- Win zone exit: if 70% of target reached and price reverses 0.5%, exit
+- Time-based exits: tighten SL after 2:30 PM, exit profits after 3:00 PM
 - Smart partial exit: 50% at 1x RR, SL moves to breakeven
-- Trailing stop-loss: after partial exit, trail SL by max(0.3%, 0.5×ATR)
 - Slippage tracking: log actual fill price vs expected entry price
 - Partial fill detection: adjust position size if < requested quantity filled
 - Duplicate order prevention: won't re-order for same stock
@@ -33,13 +37,17 @@ class Position:
     Key fields for production tracking:
     - remaining_quantity: shares still open (decreases after partial exit)
     - partial_exit_done: True after 50% is exited at 1x RR
-    - effective_sl: current active stop-loss (moves to entry after partial exit)
-    - trailing_sl: trailing stop-loss price (updates as price moves favorably)
-    - trailing_active: True after partial exit triggers the trailing SL
+    - effective_sl: current active stop-loss (moves to breakeven at 1% profit)
+    - trailing_sl: trailing stop-loss price (activates at 2% profit)
+    - trailing_active: True when trailing SL is engaged
     - peak_price: highest price reached for LONG (or lowest for SHORT)
     - realized_pnl: P&L from already-closed portions
     - actual_entry: actual fill price (may differ from signal.entry_price due to slippage)
     - slippage: actual_entry - expected_entry (positive = we paid more for LONG)
+    - sl_order_id: Angel One SL order ID (exchange-level protection)
+    - breakeven_moved: True after SL was moved to breakeven at 1% profit
+    - in_win_zone: True after price reached 70% of target
+    - peak_since_win_zone: best price since entering win zone (for reversal detection)
     """
     signal: Signal
     order_id: str
@@ -56,14 +64,25 @@ class Position:
     effective_sl: float = 0.0        # Active SL — starts at signal.stop_loss
     realized_pnl: float = 0.0
 
-    # Trailing SL fields
+    # Trailing SL fields (improved: breakeven at 1%, trail at 2%)
     trailing_sl: float = 0.0         # Current trailing SL price
-    trailing_active: bool = False     # True once partial exit fires
+    trailing_active: bool = False     # True once 2% profit threshold reached
     peak_price: float = 0.0          # Best price seen (for trailing calc)
+    breakeven_moved: bool = False     # True after SL moved to breakeven at 1% profit
+
+    # Win zone fields (exit if 70% of target reached and price reverses 0.5%)
+    in_win_zone: bool = False
+    peak_since_win_zone: float = 0.0  # Best price since entering 70% target zone
 
     # Slippage tracking
     actual_entry: float = 0.0        # Actual fill price from broker
     slippage: float = 0.0            # actual_entry - signal.entry_price
+
+    # Broker-side SL order (exchange-level protection)
+    sl_order_id: str = ""            # Angel One SL order ID
+
+    # Adopted position flag
+    is_adopted: bool = False         # True if adopted from broker on startup
 
     def __post_init__(self):
         if self.remaining_quantity == 0:
@@ -77,7 +96,7 @@ class Position:
 
     @property
     def target1(self) -> float:
-        """First partial exit level: entry + 1× risk."""
+        """First partial exit level: entry + 1x risk."""
         risk = abs(self.signal.entry_price - self.signal.stop_loss)
         if self.signal.direction == "LONG":
             return round(self.signal.entry_price + risk, 2)
@@ -88,6 +107,27 @@ class Position:
     def hold_time_minutes(self) -> float:
         """How long this position has been open (minutes)."""
         return (time_module.time() - self.placed_at) / 60
+
+    @property
+    def profit_pct(self) -> float:
+        """Current unrealized profit as a percentage of entry price."""
+        if self.actual_entry == 0:
+            return 0.0
+        if self.signal.direction == "LONG":
+            return ((self.current_price - self.actual_entry) / self.actual_entry) * 100
+        else:
+            return ((self.actual_entry - self.current_price) / self.actual_entry) * 100
+
+    @property
+    def win_zone_price(self) -> float:
+        """Price at 70% of target (win zone threshold)."""
+        entry = self.signal.entry_price
+        target = self.signal.target
+        distance = abs(target - entry)
+        if self.signal.direction == "LONG":
+            return round(entry + distance * 0.70, 2)
+        else:
+            return round(entry - distance * 0.70, 2)
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +145,8 @@ class Position:
             "quantity": self.signal.quantity,
             "remaining_quantity": self.remaining_quantity,
             "partial_exit_done": self.partial_exit_done,
+            "breakeven_moved": self.breakeven_moved,
+            "in_win_zone": self.in_win_zone,
             "current_price": self.current_price,
             "unrealized_pnl": round(self.unrealized_pnl, 2),
             "realized_pnl": round(self.realized_pnl, 2),
@@ -112,11 +154,13 @@ class Position:
             "hold_time_min": round(self.hold_time_minutes, 1),
             "score": getattr(self.signal, "score", 0),
             "strategy": self.signal.strategy_name,
+            "has_broker_sl": bool(self.sl_order_id),
+            "is_adopted": self.is_adopted,
         }
 
 
 class OrderManager:
-    """Manages order lifecycle: place → monitor → exit."""
+    """Manages order lifecycle: place -> monitor -> exit."""
 
     def __init__(self, broker, risk_manager, portfolio, config):
         self.broker = broker
@@ -130,6 +174,222 @@ class OrderManager:
         # Used to detect and cancel unfilled LIMIT orders after timeout
         self._pending_orders: dict[str, dict] = {}
 
+    # ──────────────────────────────────────────────────────────
+    # FIX 1: Adopt existing positions from broker on startup
+    # ──────────────────────────────────────────────────────────
+
+    def adopt_positions(self, broker_positions: list[dict]) -> list[Position]:
+        """
+        Adopt existing open intraday positions from Angel One on startup.
+
+        Called during startup to recover positions from a previous run
+        or crash. Each position gets:
+        - A synthetic Signal object based on broker data
+        - Stop-loss at 2.5% from average entry price
+        - Target at 2:1 reward-to-risk ratio
+        - Trailing SL monitoring starts immediately
+        - Broker-side SL order placed for exchange-level protection
+        - Counted toward today's trade count
+
+        Args:
+            broker_positions: List of position dicts from broker.get_positions()
+                Each dict has: tradingsymbol, symboltoken, netqty, avgnetprice,
+                ltp, pnl, producttype, exchange, etc.
+
+        Returns:
+            List of adopted Position objects.
+        """
+        if not broker_positions:
+            logger.info("No existing positions found at broker. Starting fresh.")
+            return []
+
+        adopted = []
+        for bp in broker_positions:
+            try:
+                net_qty = int(bp.get("netqty", 0))
+                if net_qty == 0:
+                    continue  # Skip fully closed positions
+
+                # Parse position details from Angel One
+                raw_symbol = bp.get("tradingsymbol", "UNKNOWN")
+                symbol = raw_symbol.replace("-EQ", "")
+                token = str(bp.get("symboltoken", ""))
+                avg_price = float(bp.get("avgnetprice", 0) or bp.get("buyavgprice", 0) or 0)
+                ltp = float(bp.get("ltp", avg_price) or avg_price)
+                quantity = abs(net_qty)
+                direction = "LONG" if net_qty > 0 else "SHORT"
+                current_pnl = float(bp.get("pnl", 0) or 0)
+
+                if avg_price <= 0:
+                    logger.warning(f"Skipping {symbol}: invalid avg price {avg_price}")
+                    continue
+
+                # Calculate SL at 2.5% from entry
+                sl_distance = avg_price * 0.025
+                if direction == "LONG":
+                    stop_loss = round(avg_price - sl_distance, 2)
+                    target = round(avg_price + sl_distance * 2, 2)  # 2:1 RR
+                else:
+                    stop_loss = round(avg_price + sl_distance, 2)
+                    target = round(avg_price - sl_distance * 2, 2)
+
+                # Create a synthetic Signal for this adopted position
+                signal = Signal(
+                    stock=symbol,
+                    token=token,
+                    direction=direction,
+                    entry_price=avg_price,
+                    stop_loss=stop_loss,
+                    target=target,
+                    strategy_name="ADOPTED",
+                    confidence=0.5,
+                    reason=f"Adopted from broker on startup (avg Rs.{avg_price:.2f})",
+                    quantity=quantity,
+                )
+
+                # Create Position object
+                pos = Position(
+                    signal=signal,
+                    order_id=f"adopted_{symbol}_{int(time_module.time())}",
+                    status="OPEN",
+                    current_price=ltp,
+                    remaining_quantity=quantity,
+                    actual_entry=avg_price,
+                    effective_sl=stop_loss,
+                    peak_price=max(ltp, avg_price) if direction == "LONG" else min(ltp, avg_price),
+                    is_adopted=True,
+                )
+
+                # Place broker-side SL order for exchange-level protection
+                sl_order_id = self._place_broker_sl_order(pos)
+                if sl_order_id:
+                    pos.sl_order_id = sl_order_id
+
+                self.open_positions.append(pos)
+
+                # Count toward today's trade count and capital deployment
+                self.risk_manager.confirm_trade_placed(
+                    stock=symbol,
+                    entry_price=avg_price,
+                    quantity=quantity,
+                )
+
+                adopted.append(pos)
+                logger.info(
+                    f"Adopted: {direction} {quantity}x {symbol} "
+                    f"@ Rs.{avg_price:.2f} | LTP: Rs.{ltp:.2f} | "
+                    f"P&L: Rs.{current_pnl:+.2f} | "
+                    f"SL: Rs.{stop_loss:.2f} | Target: Rs.{target:.2f} | "
+                    f"Broker SL: {'YES' if sl_order_id else 'NO (software only)'}"
+                )
+
+            except Exception as e:
+                symbol = bp.get("tradingsymbol", "?")
+                logger.error(f"Failed to adopt position {symbol}: {e}")
+
+        logger.info(
+            f"Adopted {len(adopted)} existing positions from Angel One. "
+            f"All are now monitored with SL/target/trailing."
+        )
+        return adopted
+
+    # ──────────────────────────────────────────────────────────
+    # Broker-side SL Order Management (FIX 4)
+    # ──────────────────────────────────────────────────────────
+
+    def _place_broker_sl_order(self, pos: Position) -> str:
+        """
+        Place a STOPLOSS-LIMIT order with Angel One for a position.
+
+        This is the safety net — even if the bot crashes, the exchange
+        has a real SL order that triggers automatically.
+
+        Returns the SL order ID, or empty string on failure.
+        """
+        try:
+            buffer = self.config.sl_order_price_buffer
+            sl_order_id = self.broker.place_sl_order(
+                stock=pos.signal.stock,
+                token=pos.signal.token,
+                direction=pos.signal.direction,
+                quantity=pos.remaining_quantity,
+                trigger_price=pos.effective_sl,
+                price_buffer=buffer,
+            )
+            if sl_order_id:
+                return sl_order_id
+            else:
+                logger.error(
+                    f"Broker SL order failed for {pos.signal.stock}. "
+                    "Falling back to software-only SL monitoring."
+                )
+                return ""
+        except Exception as e:
+            logger.error(
+                f"Broker SL order exception for {pos.signal.stock}: {e}. "
+                "Falling back to software-only SL monitoring."
+            )
+            return ""
+
+    def _modify_broker_sl_order(self, pos: Position, new_sl_price: float) -> bool:
+        """
+        Update the broker-side SL order to match the new trailing/breakeven SL.
+
+        Returns True on success, False on failure (position keeps software SL).
+        """
+        if not pos.sl_order_id:
+            return False
+
+        try:
+            buffer = self.config.sl_order_price_buffer
+            success = self.broker.modify_sl_order(
+                order_id=pos.sl_order_id,
+                stock=pos.signal.stock,
+                token=pos.signal.token,
+                direction=pos.signal.direction,
+                quantity=pos.remaining_quantity,
+                new_trigger_price=new_sl_price,
+                price_buffer=buffer,
+            )
+            if not success:
+                logger.warning(
+                    f"Could not modify broker SL for {pos.signal.stock}. "
+                    "Software SL still active."
+                )
+            return success
+        except Exception as e:
+            logger.warning(f"Broker SL modify exception for {pos.signal.stock}: {e}")
+            return False
+
+    def _cancel_broker_sl_order(self, pos: Position) -> bool:
+        """
+        Cancel the broker-side SL order before placing a manual exit.
+
+        Must be called before place_exit_order() to avoid double-exit
+        (our exit + exchange SL both triggering).
+        """
+        if not pos.sl_order_id:
+            return True  # No SL order to cancel
+
+        try:
+            success = self.broker.cancel_sl_order(pos.sl_order_id)
+            if success:
+                logger.info(f"Cancelled broker SL order for {pos.signal.stock}")
+                pos.sl_order_id = ""
+            else:
+                logger.warning(
+                    f"Could not cancel broker SL for {pos.signal.stock} "
+                    f"(order {pos.sl_order_id}). May have already triggered."
+                )
+            return success
+        except Exception as e:
+            logger.warning(f"Broker SL cancel exception for {pos.signal.stock}: {e}")
+            return False
+
+    # ──────────────────────────────────────────────────────────
+    # Order Execution
+    # ──────────────────────────────────────────────────────────
+
     def _get_available_margin(self) -> float:
         """
         Query Angel One for available intraday margin.
@@ -137,65 +397,52 @@ class OrderManager:
         Returns the usable intraday buying power in Rs.
         Returns 0.0 if the API call fails — callers treat 0 as "skip the check"
         (we never block a trade just because we couldn't verify margin).
-
-        Angel One RMS fields:
-        - availableintradaypayin: cash × leverage — this is what we can spend
-        - availablecash: raw cash balance (lower number, without leverage)
-        We prefer intraday because it's the real limit for MIS orders.
         """
         try:
             funds = self.broker.get_funds()
             if not funds:
                 return 0.0
-            # availableintradaypayin already includes the 5× intraday leverage
             intraday = float(funds.get("availableintradaypayin", 0) or 0)
             cash = float(funds.get("availablecash", 0) or 0)
             return intraday if intraday > 0 else cash
         except Exception as e:
             logger.debug(f"Margin check unavailable: {e}")
-            return 0.0  # 0 = skip check, don't block the trade
+            return 0.0
 
     def execute(self, signal: Signal) -> Optional[Position]:
         """
         Place an order based on a signal.
 
-        Before placing:
-        1. Checks available intraday margin — reduces quantity if needed.
-        2. If even 1 share doesn't fit, skips the trade entirely.
-
-        After placing:
-        3. Detects partial fills and adjusts position size accordingly.
-        4. Tracks slippage (difference between expected and actual fill price).
+        After placing and confirming fill:
+        - Places a broker-side SL order with Angel One (exchange-level protection)
+        - Falls back to software-only SL if broker SL fails
         """
         # ── Margin check before placing order ────────────────────────────
         try:
             required_margin = signal.entry_price * signal.quantity
             available_margin = self._get_available_margin()
 
-            if available_margin > 0:  # 0 means API was unavailable — skip check
+            if available_margin > 0:
                 if required_margin > available_margin:
                     max_qty = int(available_margin / signal.entry_price)
 
                     if max_qty < 1:
                         logger.warning(
                             f"MARGIN INSUFFICIENT: {signal.stock} — "
-                            f"need Rs.{required_margin:.0f} (1 share @ Rs.{signal.entry_price:.0f}), "
-                            f"only Rs.{available_margin:.0f} available. Skipping trade."
+                            f"need Rs.{required_margin:.0f}, "
+                            f"only Rs.{available_margin:.0f} available. Skipping."
                         )
                         return None
 
                     logger.warning(
                         f"MARGIN LIMITED: {signal.stock} — "
-                        f"reducing qty from {signal.quantity} to {max_qty} "
-                        f"(available Rs.{available_margin:.0f}, "
-                        f"need Rs.{required_margin:.0f})"
+                        f"reducing qty from {signal.quantity} to {max_qty}"
                     )
                     signal.quantity = max_qty
         except Exception as e:
-            # Margin check must NEVER crash the bot — just log and proceed
             logger.warning(f"Margin check error for {signal.stock}: {e}. Proceeding anyway.")
 
-        # ── Place the order ───────────────────────────────────────────────
+        # ── Place the entry order ──────────────────────────────────────────
         try:
             order_id = self.broker.place_order(
                 stock=signal.stock,
@@ -225,13 +472,12 @@ class OrderManager:
         # Verify actual fill
         filled_qty = self.broker.get_filled_quantity(order_id)
         if filled_qty <= 0:
-            # Not yet filled — assume full fill optimistically
             filled_qty = signal.quantity
         elif filled_qty < signal.quantity:
             logger.warning(
                 f"Partial fill: {signal.stock} — got {filled_qty} of {signal.quantity} shares"
             )
-            signal.quantity = filled_qty  # Adjust to actual
+            signal.quantity = filled_qty
 
         # Get actual fill price for slippage calculation
         actual_entry = self.broker.get_ltp(signal.token) or signal.entry_price
@@ -239,9 +485,9 @@ class OrderManager:
         if abs(slippage) > 0.01:
             slippage_pct = abs(slippage / signal.entry_price) * 100
             logger.warning(
-                f"Slippage detected: {signal.stock} | "
+                f"Slippage: {signal.stock} | "
                 f"Expected Rs.{signal.entry_price:.2f}, Got Rs.{actual_entry:.2f} | "
-                f"Slippage: {slippage:+.2f} ({slippage_pct:.3f}%)"
+                f"{slippage:+.2f} ({slippage_pct:.3f}%)"
             )
 
         pos = Position(
@@ -252,27 +498,45 @@ class OrderManager:
             slippage=slippage,
         )
 
+        # ── Place broker-side SL order (FIX 4) ────────────────────────────
+        sl_order_id = self._place_broker_sl_order(pos)
+        if sl_order_id:
+            pos.sl_order_id = sl_order_id
+
         self.open_positions.append(pos)
 
-        # Notify risk manager that this stock is now active
-        self.risk_manager.mark_stock_active(signal.stock)
+        # Confirm with risk manager
+        self.risk_manager.confirm_trade_placed(
+            stock=signal.stock,
+            entry_price=actual_entry,
+            quantity=filled_qty,
+        )
 
         logger.info(
             f"Position opened: {signal.direction} {filled_qty}x {signal.stock} "
             f"@ Rs.{actual_entry:.2f} | SL: Rs.{signal.stop_loss:.2f} | "
-            f"Target: Rs.{signal.target:.2f}"
+            f"Target: Rs.{signal.target:.2f} | "
+            f"Broker SL: {'YES' if sl_order_id else 'NO (software only)'}"
         )
         return pos
 
+    # ──────────────────────────────────────────────────────────
+    # Position Monitoring (FIX 3: improved profit management)
+    # ──────────────────────────────────────────────────────────
+
     def monitor_positions(self) -> tuple[list[Position], list[Position]]:
         """
-        Check all open positions for SL/target/trailing SL hit.
+        Check all open positions for SL/target/trailing SL/win zone/time exits.
 
-        Order of checks:
-        1. Effective SL (original or breakeven after partial exit)
-        2. If trailing SL is active → update trail and check if hit
-        3. Check partial exit at target1 (1x RR)
-        4. Check full exit at target2 (signal.target)
+        Order of checks (priority from highest to lowest):
+        1. Effective SL hit (original, breakeven, or tightened)
+        2. Trailing SL hit (if active)
+        3. Time-based exit: after 3:00 PM exit in-profit positions
+        4. Win zone reversal: 70% of target reached, then 0.5% reversal
+        5. Partial exit at target1 (1x RR)
+        6. Full exit at target2 (signal.target)
+        7. Profit management: breakeven at 1%, trailing at 2%
+        8. Time-based SL tightening: after 2:30 PM, SL = 1%
 
         Returns:
             (newly_closed, partially_updated) — main.py uses these for Firebase
@@ -282,6 +546,10 @@ class OrderManager:
 
         # Also check for pending order timeouts
         self._check_pending_timeouts()
+
+        now = datetime.now().time()
+        is_late_session = now >= self.config.late_session_start
+        is_profit_exit_time = now >= self.config.profit_exit_time
 
         for pos in self.open_positions[:]:
             if pos.status not in ("OPEN", "PARTIAL"):
@@ -294,77 +562,192 @@ class OrderManager:
             pos.current_price = ltp
             direction = pos.signal.direction
 
+            # ── Calculate unrealized P&L ──────────────────────────────────
             if direction == "LONG":
                 pos.unrealized_pnl = (
                     (ltp - pos.signal.entry_price) * pos.remaining_quantity
                     + pos.realized_pnl
                 )
-
-                # Update peak price for trailing SL
-                if ltp > pos.peak_price:
-                    pos.peak_price = ltp
-                    if pos.trailing_active:
-                        new_trail = self._calc_trailing_sl(pos, ltp)
-                        if new_trail > pos.trailing_sl:
-                            pos.trailing_sl = new_trail
-
-                # Check stops — effective_sl first (highest priority)
-                if ltp <= pos.effective_sl:
-                    self._close_remaining(pos, pos.effective_sl, "STOP_LOSS")
-                    newly_closed.append(pos)
-
-                # Trailing SL
-                elif pos.trailing_active and pos.trailing_sl > 0 and ltp <= pos.trailing_sl:
-                    self._close_remaining(pos, pos.trailing_sl, "TRAILING_STOP")
-                    newly_closed.append(pos)
-
-                # Partial exit at target1 (1x RR)
-                elif (
-                    self.config.partial_exit_enabled
-                    and not pos.partial_exit_done
-                    and ltp >= pos.target1
-                ):
-                    self._partial_exit(pos, ltp)
-                    partially_updated.append(pos)
-
-                # Full exit at target2 (signal.target)
-                elif ltp >= pos.signal.target:
-                    self._close_remaining(pos, pos.signal.target, "TARGET")
-                    newly_closed.append(pos)
-
-            elif direction == "SHORT":
+            else:
                 pos.unrealized_pnl = (
                     (pos.signal.entry_price - ltp) * pos.remaining_quantity
                     + pos.realized_pnl
                 )
 
-                # Update trough for trailing SL (for shorts, we trail down)
+            # ── Update peak price ─────────────────────────────────────────
+            if direction == "LONG":
+                if ltp > pos.peak_price:
+                    pos.peak_price = ltp
+            else:
                 if ltp < pos.peak_price or pos.peak_price == pos.signal.entry_price:
                     pos.peak_price = ltp
-                    if pos.trailing_active:
-                        new_trail = self._calc_trailing_sl(pos, ltp)
-                        if new_trail < pos.trailing_sl or pos.trailing_sl == 0:
-                            pos.trailing_sl = new_trail
 
-                if ltp >= pos.effective_sl:
-                    self._close_remaining(pos, pos.effective_sl, "STOP_LOSS")
-                    newly_closed.append(pos)
+            # ── Update win zone peak ──────────────────────────────────────
+            if pos.in_win_zone:
+                if direction == "LONG" and ltp > pos.peak_since_win_zone:
+                    pos.peak_since_win_zone = ltp
+                elif direction == "SHORT" and (ltp < pos.peak_since_win_zone or pos.peak_since_win_zone == 0):
+                    pos.peak_since_win_zone = ltp
 
-                elif pos.trailing_active and pos.trailing_sl > 0 and ltp >= pos.trailing_sl:
+            # ── PROFIT MANAGEMENT: breakeven and trailing (FIX 3a) ────────
+            profit_pct = pos.profit_pct
+            sl_changed = False
+
+            # Step 1: At 1% profit -> move SL to breakeven (entry + approx charges)
+            if (
+                not pos.breakeven_moved
+                and self.config.trailing_sl_enabled
+                and profit_pct >= self.config.breakeven_profit_pct
+            ):
+                # Breakeven = entry price (charges are small relative to 1% move)
+                new_sl = pos.actual_entry
+                if direction == "LONG" and new_sl > pos.effective_sl:
+                    pos.effective_sl = new_sl
+                    pos.breakeven_moved = True
+                    sl_changed = True
+                    logger.info(
+                        f"Breakeven SL: {pos.signal.stock} at {profit_pct:.1f}% profit. "
+                        f"SL moved to Rs.{new_sl:.2f}"
+                    )
+                elif direction == "SHORT" and new_sl < pos.effective_sl:
+                    pos.effective_sl = new_sl
+                    pos.breakeven_moved = True
+                    sl_changed = True
+                    logger.info(
+                        f"Breakeven SL: {pos.signal.stock} at {profit_pct:.1f}% profit. "
+                        f"SL moved to Rs.{new_sl:.2f}"
+                    )
+
+            # Step 2: At 2% profit -> activate trailing SL at 1% from peak
+            if (
+                not pos.trailing_active
+                and self.config.trailing_sl_enabled
+                and profit_pct >= self.config.trailing_activation_pct
+            ):
+                pos.trailing_active = True
+                pos.trailing_sl = self._calc_trailing_sl(pos, ltp)
+                sl_changed = True
+                logger.info(
+                    f"Trailing SL activated: {pos.signal.stock} at {profit_pct:.1f}% profit. "
+                    f"Trail @ Rs.{pos.trailing_sl:.2f}"
+                )
+
+            # Step 3: Update trailing SL as price moves favorably
+            if pos.trailing_active:
+                new_trail = self._calc_trailing_sl(pos, ltp)
+                if direction == "LONG" and new_trail > pos.trailing_sl:
+                    pos.trailing_sl = new_trail
+                    sl_changed = True
+                elif direction == "SHORT" and (new_trail < pos.trailing_sl or pos.trailing_sl == 0):
+                    pos.trailing_sl = new_trail
+                    sl_changed = True
+
+            # ── TIME-BASED SL TIGHTENING (FIX 3c) ────────────────────────
+            if is_late_session and not is_profit_exit_time:
+                # After 2:30 PM: tighten SL to 1% from current price
+                late_sl_distance = ltp * (self.config.late_session_sl_pct / 100)
+                if direction == "LONG":
+                    late_sl = round(ltp - late_sl_distance, 2)
+                    if late_sl > pos.effective_sl:
+                        pos.effective_sl = late_sl
+                        sl_changed = True
+                else:
+                    late_sl = round(ltp + late_sl_distance, 2)
+                    if late_sl < pos.effective_sl:
+                        pos.effective_sl = late_sl
+                        sl_changed = True
+
+            # ── Sync broker SL order if SL changed ────────────────────────
+            if sl_changed and pos.sl_order_id:
+                # Use the tightest SL (whichever is closest to current price)
+                active_sl = pos.effective_sl
+                if pos.trailing_active and pos.trailing_sl > 0:
+                    if direction == "LONG":
+                        active_sl = max(pos.effective_sl, pos.trailing_sl)
+                    else:
+                        active_sl = min(pos.effective_sl, pos.trailing_sl)
+                self._modify_broker_sl_order(pos, active_sl)
+
+            # ── CHECK EXITS (priority order) ──────────────────────────────
+
+            # Check 1: Stop-loss hit
+            if direction == "LONG" and ltp <= pos.effective_sl:
+                self._close_remaining(pos, pos.effective_sl, "STOP_LOSS")
+                newly_closed.append(pos)
+                continue
+            elif direction == "SHORT" and ltp >= pos.effective_sl:
+                self._close_remaining(pos, pos.effective_sl, "STOP_LOSS")
+                newly_closed.append(pos)
+                continue
+
+            # Check 2: Trailing SL hit
+            if pos.trailing_active and pos.trailing_sl > 0:
+                if direction == "LONG" and ltp <= pos.trailing_sl:
                     self._close_remaining(pos, pos.trailing_sl, "TRAILING_STOP")
                     newly_closed.append(pos)
+                    continue
+                elif direction == "SHORT" and ltp >= pos.trailing_sl:
+                    self._close_remaining(pos, pos.trailing_sl, "TRAILING_STOP")
+                    newly_closed.append(pos)
+                    continue
 
-                elif (
-                    self.config.partial_exit_enabled
-                    and not pos.partial_exit_done
-                    and ltp <= pos.target1
-                ):
+            # Check 3: Time-based profit exit (after 3:00 PM, exit if in profit)
+            if is_profit_exit_time and profit_pct > 0:
+                self._close_remaining(pos, ltp, "TIME_PROFIT_EXIT")
+                newly_closed.append(pos)
+                continue
+
+            # Check 4: Win zone reversal (70% of target reached, then 0.5% reversal)
+            win_zone_price = pos.win_zone_price
+            if direction == "LONG":
+                if not pos.in_win_zone and ltp >= win_zone_price:
+                    pos.in_win_zone = True
+                    pos.peak_since_win_zone = ltp
+                    logger.info(
+                        f"Win zone entered: {pos.signal.stock} at Rs.{ltp:.2f} "
+                        f"(70% of target Rs.{pos.signal.target:.2f})"
+                    )
+                if pos.in_win_zone and pos.peak_since_win_zone > 0:
+                    reversal_pct = ((pos.peak_since_win_zone - ltp) / pos.peak_since_win_zone) * 100
+                    if reversal_pct >= self.config.win_zone_reversal_pct:
+                        self._close_remaining(pos, ltp, "WIN_ZONE_REVERSAL")
+                        newly_closed.append(pos)
+                        continue
+            else:  # SHORT
+                if not pos.in_win_zone and ltp <= win_zone_price:
+                    pos.in_win_zone = True
+                    pos.peak_since_win_zone = ltp
+                    logger.info(
+                        f"Win zone entered: {pos.signal.stock} at Rs.{ltp:.2f} "
+                        f"(70% of target Rs.{pos.signal.target:.2f})"
+                    )
+                if pos.in_win_zone and pos.peak_since_win_zone > 0:
+                    reversal_pct = ((ltp - pos.peak_since_win_zone) / pos.peak_since_win_zone) * 100
+                    if reversal_pct >= self.config.win_zone_reversal_pct:
+                        self._close_remaining(pos, ltp, "WIN_ZONE_REVERSAL")
+                        newly_closed.append(pos)
+                        continue
+
+            # Check 5: Partial exit at target1 (1x RR)
+            if self.config.partial_exit_enabled and not pos.partial_exit_done:
+                if direction == "LONG" and ltp >= pos.target1:
                     self._partial_exit(pos, ltp)
                     partially_updated.append(pos)
+                    continue
+                elif direction == "SHORT" and ltp <= pos.target1:
+                    self._partial_exit(pos, ltp)
+                    partially_updated.append(pos)
+                    continue
 
-                elif ltp <= pos.signal.target:
-                    self._close_remaining(pos, pos.signal.target, "TARGET")
-                    newly_closed.append(pos)
+            # Check 6: Full target hit
+            if direction == "LONG" and ltp >= pos.signal.target:
+                self._close_remaining(pos, pos.signal.target, "TARGET")
+                newly_closed.append(pos)
+                continue
+            elif direction == "SHORT" and ltp <= pos.signal.target:
+                self._close_remaining(pos, pos.signal.target, "TARGET")
+                newly_closed.append(pos)
+                continue
 
         return newly_closed, partially_updated
 
@@ -372,15 +755,13 @@ class OrderManager:
         """
         Calculate trailing stop-loss price.
 
-        Trail by the larger of:
-        - config.trailing_sl_pct % of current price (e.g., 0.3%)
-        - 0.5 × ATR (if ATR is available via signal metadata — otherwise use % only)
+        Trail at trailing_distance_pct (1%) from peak/trough.
 
-        For LONG: trailing SL = peak_price - trail_distance
-        For SHORT: trailing SL = trough_price + trail_distance
+        For LONG: trailing SL = peak_price - (peak_price * 1%)
+        For SHORT: trailing SL = trough_price + (trough_price * 1%)
         """
-        trail_pct = self.config.trailing_sl_pct / 100
-        trail_amount = current_price * trail_pct
+        trail_pct = self.config.trailing_distance_pct / 100
+        trail_amount = pos.peak_price * trail_pct
 
         if pos.signal.direction == "LONG":
             return round(pos.peak_price - trail_amount, 2)
@@ -390,12 +771,14 @@ class OrderManager:
     def _partial_exit(self, pos: Position, exit_price: float):
         """
         Exit 50% of position at 1x RR and move SL to breakeven.
-        Activates trailing SL on the remaining 50%.
         """
         half_qty = pos.remaining_quantity // 2
         if half_qty <= 0:
             self._close_remaining(pos, exit_price, "TARGET1_FULL")
             return
+
+        # Cancel broker SL first, then place partial exit, then place new SL
+        self._cancel_broker_sl_order(pos)
 
         exit_order_id = self.broker.place_exit_order(
             stock=pos.signal.stock,
@@ -406,6 +789,10 @@ class OrderManager:
 
         if not exit_order_id:
             logger.error(f"Partial exit order failed for {pos.signal.stock}")
+            # Re-place broker SL order since we cancelled it
+            sl_id = self._place_broker_sl_order(pos)
+            if sl_id:
+                pos.sl_order_id = sl_id
             return
 
         # P&L for the exited half
@@ -414,7 +801,6 @@ class OrderManager:
         else:
             pnl_partial = (pos.signal.entry_price - exit_price) * half_qty
 
-        # Compute charges on the partial exit
         charges = calculate_charges(
             pos.signal.entry_price, exit_price, half_qty, pos.signal.direction
         )
@@ -423,17 +809,24 @@ class OrderManager:
         pos.remaining_quantity -= half_qty
         pos.partial_exit_done = True
         pos.effective_sl = pos.signal.entry_price  # Move SL to breakeven
+        pos.breakeven_moved = True
 
-        # Activate trailing SL on remaining position
-        if self.config.trailing_sl_enabled:
+        # Activate trailing SL on remaining position if not already active
+        if self.config.trailing_sl_enabled and not pos.trailing_active:
             pos.trailing_active = True
             pos.trailing_sl = self._calc_trailing_sl(pos, exit_price)
             pos.peak_price = exit_price
 
         pos.status = "PARTIAL"
 
+        # Place new broker SL order for remaining quantity
+        new_sl_price = max(pos.effective_sl, pos.trailing_sl) if pos.signal.direction == "LONG" else min(pos.effective_sl, pos.trailing_sl) if pos.trailing_sl > 0 else pos.effective_sl
+        sl_id = self._place_broker_sl_order(pos)
+        if sl_id:
+            pos.sl_order_id = sl_id
+
         logger.info(
-            f"Partial exit: {pos.signal.stock} — sold {half_qty} @ Rs.{exit_price:.2f} | "
+            f"Partial exit: {pos.signal.stock} -- sold {half_qty} @ Rs.{exit_price:.2f} | "
             f"Gross P&L: Rs.{pnl_partial:+.2f} | Net: Rs.{charges['net_pnl']:+.2f} | "
             f"SL moved to breakeven Rs.{pos.signal.entry_price:.2f} | "
             f"Trailing SL: Rs.{pos.trailing_sl:.2f} | "
@@ -441,7 +834,10 @@ class OrderManager:
         )
 
     def _close_remaining(self, pos: Position, exit_price: float, reason: str):
-        """Close all remaining shares. Record final P&L (gross and net)."""
+        """Close all remaining shares. Cancel broker SL first. Record final P&L."""
+        # Cancel broker-side SL order before placing exit order
+        self._cancel_broker_sl_order(pos)
+
         if pos.remaining_quantity > 0:
             exit_order_id = self.broker.place_exit_order(
                 stock=pos.signal.stock,
@@ -451,7 +847,7 @@ class OrderManager:
             )
             if not exit_order_id:
                 logger.error(
-                    f"Exit order failed for {pos.signal.stock} ({reason}) — "
+                    f"Exit order failed for {pos.signal.stock} ({reason}) -- "
                     "position may still be open at broker!"
                 )
 
@@ -474,10 +870,10 @@ class OrderManager:
         total_net = total_gross - charges["total_charges"]
         pos.realized_pnl = total_gross
 
-        # Update risk manager
+        # Update risk manager (includes re-entry cooldown)
         self.risk_manager.record_trade_result(total_net, pos.signal.stock)
 
-        # Update portfolio (this keeps current_capital accurate)
+        # Update portfolio
         self.portfolio.record_trade({
             "stock": pos.signal.stock,
             "direction": pos.signal.direction,
@@ -485,7 +881,7 @@ class OrderManager:
             "exit": exit_price,
             "quantity": pos.signal.quantity,
             "gross_pnl": round(total_gross, 2),
-            "pnl": round(total_net, 2),          # net P&L = what portfolio tracks
+            "pnl": round(total_net, 2),
             "charges": charges,
             "reason": reason,
             "strategy": pos.signal.strategy_name,
@@ -498,7 +894,7 @@ class OrderManager:
             self.open_positions.remove(pos)
         self.closed_positions.append(pos)
 
-        icon = "Target" if "TARGET" in reason else "Trailing" if "TRAILING" in reason else "Stop"
+        icon = "Target" if "TARGET" in reason else "Trailing" if "TRAILING" in reason else "Stop" if "STOP" in reason else "Exit"
         logger.info(
             f"{icon}: {pos.signal.stock} | {reason} | "
             f"Gross: Rs.{total_gross:+.2f} | Net: Rs.{total_net:+.2f} | "
@@ -506,11 +902,29 @@ class OrderManager:
         )
 
     def exit_all_positions(self, reason: str = "FORCE_EXIT"):
-        """Emergency exit for all open positions (kill switch / force exit at 3:15)."""
+        """
+        Emergency exit for all open positions (kill switch / force exit at 3:15).
+
+        Safe to call multiple times — skips if no open positions remain.
+        Tracks exited symbols to prevent double-exit orders for the same stock.
+        """
+        if not self.open_positions:
+            logger.info(f"exit_all_positions({reason}): no open positions to close.")
+            return
+
+        exited_symbols: set[str] = set()
         for pos in self.open_positions[:]:
+            # Skip if we already placed an exit for this symbol in this batch
+            if pos.signal.stock in exited_symbols:
+                logger.warning(
+                    f"Skipping duplicate exit for {pos.signal.stock} "
+                    f"(already exited in this batch)"
+                )
+                continue
+            exited_symbols.add(pos.signal.stock)
             ltp = self.broker.get_ltp(pos.signal.token) or pos.signal.entry_price
             self._close_remaining(pos, ltp, reason)
-        logger.info(f"All positions closed ({reason})")
+        logger.info(f"All positions closed ({reason}) — {len(exited_symbols)} exits placed")
 
     def reconcile_positions(self, broker_positions: list[dict]):
         """
@@ -522,7 +936,7 @@ class OrderManager:
             if self.open_positions:
                 logger.warning(
                     f"Reconciliation: broker has 0 open positions, "
-                    f"we have {len(self.open_positions)} — marking all closed"
+                    f"we have {len(self.open_positions)} -- marking all closed"
                 )
                 for pos in self.open_positions[:]:
                     pos.status = "CLOSED"
@@ -540,7 +954,7 @@ class OrderManager:
         for pos in self.open_positions[:]:
             if pos.signal.stock not in broker_symbols:
                 logger.warning(
-                    f"Reconciliation: {pos.signal.stock} not in broker positions — "
+                    f"Reconciliation: {pos.signal.stock} not in broker positions -- "
                     "likely closed while WebSocket was down"
                 )
                 pos.status = "CLOSED"
@@ -551,7 +965,6 @@ class OrderManager:
     def _check_pending_timeouts(self):
         """
         Cancel LIMIT orders that haven't filled within config.pending_order_timeout_secs.
-        This prevents stale orders from lingering in the system.
         """
         timeout = self.config.pending_order_timeout_secs
         now = time_module.time()
@@ -567,6 +980,6 @@ class OrderManager:
             if status in ("open", "pending", "trigger pending"):
                 logger.warning(
                     f"Pending order timeout: {info.get('stock', '?')} "
-                    f"(order {order_id}) not filled in {timeout:.0f}s — cancelling"
+                    f"(order {order_id}) not filled in {timeout:.0f}s -- cancelling"
                 )
                 self.broker.cancel_order(order_id)

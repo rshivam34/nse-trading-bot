@@ -47,8 +47,10 @@ class TradingConfig:
 
     # ── Risk management (SAFETY — do not loosen these) ───────────────
     max_risk_per_trade_pct: float = 2.0      # Max 2% of capital at risk per trade
-    max_trades_per_day: int = 3              # Quality over quantity
-    daily_loss_limit_pct: float = 3.0        # Bot stops for the day if hit
+    max_trades_per_day: int = 15             # Safety ceiling (capital deployment is the real limit)
+    max_losses_per_day: int = 3              # 3 total losing trades = stop for the day
+    daily_loss_limit_pct: float = 3.0        # Bot stops for the day if hit (Rs. amount)
+    max_capital_deployed_pct: float = 80.0   # Max 80% of broker margin deployed at once
     risk_reward_ratio: float = 1.5           # Used by VWAP / EMA strategies
 
     # ── Market hours ─────────────────────────────────────────────────
@@ -104,12 +106,30 @@ class TradingConfig:
     partial_exit_rr: float = 1.0            # First exit at 1x RR
     final_exit_rr: float = 2.0             # Final exit at 2x RR (ORB only)
 
-    # ── Trailing stop-loss ────────────────────────────────────────────
-    # Activated after partial exit (1x RR hit). Protects remaining profit.
-    # Trail by max(trailing_sl_pct% of price, trailing_sl_atr_mult × ATR).
+    # ── Trailing stop-loss (improved profit management) ───────────────
+    # Step 1: At 1% profit → move SL to breakeven (entry + charges)
+    # Step 2: At 2% profit → trail SL at 1% below peak (longs) / above trough (shorts)
     trailing_sl_enabled: bool = True
-    trailing_sl_pct: float = 0.3           # 0.3% trailing distance
+    breakeven_profit_pct: float = 1.0       # Move SL to breakeven at 1% profit
+    trailing_activation_pct: float = 2.0    # Start trailing at 2% unrealized profit
+    trailing_distance_pct: float = 1.0      # Trail at 1% from peak/trough
+    trailing_sl_pct: float = 0.3           # Legacy — used as fallback
     trailing_sl_atr_multiplier: float = 0.5
+
+    # ── Win zone exit (70% of target reversal protection) ──────────────
+    win_zone_target_pct: float = 0.70       # 70% of target = "win zone"
+    win_zone_reversal_pct: float = 0.5      # Exit if reverses 0.5% from peak in win zone
+
+    # ── Time-based exit rules ──────────────────────────────────────────
+    late_session_sl_pct: float = 1.0        # Tighten SL to 1% after 2:30 PM
+    profit_exit_time: time = time(15, 0)    # Exit any in-profit position after 3:00 PM
+    late_session_start: time = time(14, 30) # When to start tightening SLs
+
+    # ── Re-entry prevention ────────────────────────────────────────────
+    reentry_cooldown_minutes: int = 30      # Block re-entry for 30 min after exiting a stock
+
+    # ── Broker-side SL orders ──────────────────────────────────────────
+    sl_order_price_buffer: float = 0.50     # Rs. buffer between trigger and limit price
 
     # ── Consecutive loss circuit breaker ─────────────────────────────
     consecutive_loss_limit: int = 2
@@ -179,6 +199,21 @@ class TradingConfig:
     premarket_time: time = time(9, 0)            # Run pre-market checks at 9 AM
     check_trading_holiday: bool = True           # Skip if today is NSE holiday
     min_margin_pct_required: float = 0.5         # Must have 50% of capital available
+
+    # ── Rate limiting (conservative: 50-60% of Angel One official limits) ──
+    historical_rate_per_sec: float = float(os.getenv("HISTORICAL_RATE_PER_SEC", "1.0"))
+    historical_rate_per_min: int = int(os.getenv("HISTORICAL_RATE_PER_MIN", "55"))
+    ltp_rate_per_sec: float = float(os.getenv("LTP_RATE_PER_SEC", "5.0"))
+    ltp_rate_per_min: int = int(os.getenv("LTP_RATE_PER_MIN", "200"))
+
+    # ── Capital filter ─────────────────────────────────────────────────────
+    min_net_profit: float = float(os.getenv("MIN_NET_PROFIT", "10.0"))
+    max_required_move_pct: float = float(os.getenv("MAX_REQUIRED_MOVE_PCT", "3.0"))
+
+    # ── OHLC fetch ─────────────────────────────────────────────────────────
+    ohlc_batch_size: int = int(os.getenv("OHLC_BATCH_SIZE", "5"))
+    ohlc_batch_gap: float = float(os.getenv("OHLC_BATCH_GAP", "2.0"))
+    ohlc_max_retries: int = int(os.getenv("OHLC_MAX_RETRIES", "2"))
 
 
 @dataclass

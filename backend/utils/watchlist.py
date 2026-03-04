@@ -228,7 +228,12 @@ def _get_token_map_from_master() -> dict[str, str]:
 
 
 def _load_cache() -> Optional[dict]:
-    """Load token map from local cache if it's fresh enough."""
+    """Load token map from local cache if it's fresh enough.
+
+    Cache is invalidated if:
+    1. It's older than INSTRUMENT_CACHE_MAX_AGE_HOURS (12h), OR
+    2. It's from a previous day (tokens can change when exchanges update)
+    """
     try:
         cache_path = Path(INSTRUMENT_CACHE_PATH)
         if not cache_path.exists():
@@ -237,7 +242,17 @@ def _load_cache() -> Optional[dict]:
         # Check age
         age_hours = (time.time() - cache_path.stat().st_mtime) / 3600
         if age_hours > INSTRUMENT_CACHE_MAX_AGE_HOURS:
-            logger.debug(f"Instrument cache is {age_hours:.1f}h old — will re-download")
+            logger.info(f"Instrument cache is {age_hours:.1f}h old — will re-download")
+            return None
+
+        # Check if cache is from a previous day (even if <12h old)
+        from datetime import date as date_type
+        cache_date = date_type.fromtimestamp(cache_path.stat().st_mtime)
+        if cache_date < date_type.today():
+            logger.info(
+                f"Instrument cache is from {cache_date} (previous day) — "
+                "will re-download for fresh tokens"
+            )
             return None
 
         with open(cache_path) as f:
@@ -269,6 +284,32 @@ def _save_cache(token_map: dict):
 def get_watchlist(use_dynamic: bool = True, max_size: int = 200) -> list[dict]:
     """Return the active watchlist. Called at bot startup."""
     return build_watchlist(use_dynamic=use_dynamic, max_size=max_size)
+
+
+def lookup_token_for_symbol(symbol: str) -> Optional[str]:
+    """
+    Look up the current token for a symbol from the instrument master.
+
+    Called by broker.py before placing orders to ensure the token
+    is fresh (not stale from a 12h-old cache). If the instrument
+    master can't be loaded, falls back to FALLBACK_TOKENS.
+
+    Returns the token string, or None if the symbol can't be found.
+    """
+    # Try instrument master first (cached or fresh download)
+    token_map = _get_token_map_from_master()
+    token = token_map.get(symbol)
+    if token:
+        return str(token)
+
+    # Fall back to hardcoded tokens
+    fallback = FALLBACK_TOKENS.get(symbol)
+    if fallback:
+        logger.debug(f"Using fallback token for {symbol}: {fallback}")
+        return str(fallback)
+
+    logger.warning(f"No token found for {symbol} in instrument master or fallbacks")
+    return None
 
 
 def get_nifty_token() -> dict:

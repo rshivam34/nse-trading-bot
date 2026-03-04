@@ -28,7 +28,7 @@ import time
 import signal
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -98,7 +98,7 @@ class TradingBot:
         # Core components
         self.broker = BrokerConnection(config.broker, config.trading)
         self.portfolio = Portfolio(config.trading.initial_capital)
-        self.risk_manager = RiskManager(config.trading, self.portfolio)
+        self.risk_manager = RiskManager(config.trading, self.portfolio, broker=self.broker)
         self.order_manager = OrderManager(
             broker=self.broker,
             risk_manager=self.risk_manager,
@@ -181,17 +181,20 @@ class TradingBot:
                 )
 
         # ── Check 3: Angel One authentication ────────────────────────────
-        # Only attempt if credentials are present (avoid confusing error on missing creds)
+        # Auth happens in start() before this method. Just verify connection.
         if not errors:
-            logger.info("  Checking Angel One authentication...")
-            auth_ok = self.broker.retry_connect(max_attempts=3)
-            if not auth_ok:
-                errors.append(
-                    "Angel One authentication failed. "
-                    "Check ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET."
-                )
+            if self.broker.is_connected:
+                logger.info("  Angel One: connected (authenticated earlier)")
             else:
-                logger.info("  Angel One: connected")
+                logger.info("  Checking Angel One authentication...")
+                auth_ok = self.broker.retry_connect(max_attempts=3)
+                if not auth_ok:
+                    errors.append(
+                        "Angel One authentication failed. "
+                        "Check ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET."
+                    )
+                else:
+                    logger.info("  Angel One: connected")
 
         # ── Check 4: Watchlist ────────────────────────────────────────────
         watchlist_count = len(self.watchlist)
@@ -225,26 +228,53 @@ class TradingBot:
     # ----------------------------------------------------------------
 
     def start(self):
-        """Start the bot. This is the entry point called from main()."""
+        """
+        Start the bot. This is the entry point called from main().
+
+        Startup sequence (FIX 5 — exact order matters):
+        1. Print banner
+        2. Authenticate with Angel One
+        3. Call getRMS() — get available margin
+        4. Call getPosition() — adopt any existing open positions
+        5. Place SL orders for adopted positions (done inside adopt)
+        6. Load watchlist
+        7. Capital filter + OHLC fetch (with cache)
+        8. Start WebSocket
+        9. Begin scanning
+        """
         self._print_banner()
 
-        # Step 1: Load watchlist (200 stocks + index tokens)
+        # Step 1: Authenticate with Angel One FIRST (needed for all API calls)
+        logger.info("Step 1: Authenticating with Angel One...")
+        if not self._authenticate():
+            logger.error("STARTUP FAILED: Could not authenticate with Angel One.")
+            return
+
+        # Step 2: Get available margin from getRMS()
+        logger.info("Step 2: Checking available margin (getRMS)...")
+        self._check_margin_on_startup()
+
+        # Step 3: Adopt existing positions from Angel One (CRITICAL for crash recovery)
+        logger.info("Step 3: Checking for existing open positions (getPosition)...")
+        adopted_count = self._adopt_existing_positions()
+
+        # Step 4: Load watchlist (200 stocks + index tokens)
+        logger.info("Step 4: Loading watchlist...")
         self._load_watchlist()
 
-        # Step 2: Run startup validation — checks env, firebase, auth, watchlist.
-        # _validate_startup() also authenticates with Angel One internally.
+        # Step 5: Validate startup (env, firebase, watchlist — auth already done)
         if not self._validate_startup():
-            return  # Reason already logged as STARTUP FAILED
+            return
 
-        # Step 3: Run pre-market checks (holiday, margin, news, prev-day data)
+        # Step 6: Run pre-market checks (holiday, margin, news, prev-day data)
         if not self._run_premarket_checks():
             logger.error("Pre-market checks failed. Bot will not start.")
             return
 
-        # Step 4: Wire scanner to watchlist
+        # Step 7: Wire scanner to watchlist
         self.scanner.set_watchlist(self.watchlist)
 
-        # Step 5: Set up Firebase listeners
+        # Step 8: Set up Firebase listeners
         if self.firebase.is_connected:
             self.firebase.clear_today_signals()
             self.firebase.reset_kill_switch()
@@ -253,14 +283,21 @@ class TradingBot:
             self.firebase.listen_for_kill_switch(callback=self._on_kill_switch)
             self.firebase.listen_for_trading_enabled(callback=self._on_trading_enabled_changed)
 
-        # Step 6: Wire WebSocket reconnect callback
+        # Step 9: Wire WebSocket reconnect callback
         self.data_stream.on_reconnect = self._on_websocket_reconnect
 
-        # Step 7: Start streaming live data
+        # Step 10: Start streaming live data
         self.is_running = True
         self._start_streaming()
 
-        # Step 8: Enter the main trading loop (blocks until 3:15 PM or kill switch)
+        # Log final ready message
+        existing = len(self.order_manager.open_positions)
+        logger.info(
+            f"Bot is live. Monitoring {existing} existing positions + "
+            f"ready for new trades."
+        )
+
+        # Step 11: Enter the main trading loop (blocks until 3:15 PM or kill switch)
         self._trading_loop()
 
     def _load_watchlist(self):
@@ -288,6 +325,81 @@ class TradingBot:
     def _authenticate(self) -> bool:
         """Connect to Angel One with retry."""
         return self.broker.retry_connect(max_attempts=3)
+
+    def _check_margin_on_startup(self):
+        """
+        Check available margin via getRMS() API on startup.
+        Caches it in risk_manager so capital-based limits work immediately.
+        """
+        try:
+            funds = self.broker.get_funds()
+            if funds:
+                available = float(funds.get("availablecash", 0))
+                intraday = float(funds.get("availableintradaypayin", 0) or 0)
+                margin = intraday if intraday > 0 else available
+                logger.info(
+                    f"Available margin: Rs.{margin:,.2f} "
+                    f"(cash: Rs.{available:,.2f}, intraday: Rs.{intraday:,.2f})"
+                )
+                # Cache in risk manager for capital-based trade limiting
+                self.risk_manager._cached_margin = margin
+            else:
+                logger.warning("Could not fetch margin. Will retry in pre-market checks.")
+        except Exception as e:
+            logger.warning(f"Margin check failed: {e}. Continuing anyway.")
+
+    def _adopt_existing_positions(self) -> int:
+        """
+        Adopt any existing open intraday positions from Angel One.
+
+        This is CRITICAL for crash recovery — if the bot crashes mid-day
+        and restarts, orphaned positions need SL monitoring immediately.
+
+        Returns the number of adopted positions.
+        """
+        try:
+            broker_positions = self.broker.get_positions()
+
+            if not broker_positions:
+                logger.info("No existing positions found at Angel One.")
+                return 0
+
+            # Filter for intraday positions only
+            intraday_positions = [
+                p for p in broker_positions
+                if p.get("producttype", "").upper() in ("INTRADAY", "MIS")
+                and int(p.get("netqty", 0)) != 0
+            ]
+
+            if not intraday_positions:
+                logger.info("No open intraday positions to adopt.")
+                return 0
+
+            logger.info(
+                f"Found {len(intraday_positions)} open intraday positions. "
+                f"Adopting all..."
+            )
+
+            adopted = self.order_manager.adopt_positions(intraday_positions)
+
+            # Push adopted positions to Firebase so dashboard shows them
+            for pos in adopted:
+                try:
+                    self.firebase.push_open_position(pos.to_dict())
+                except Exception as fe:
+                    logger.warning(
+                        f"Firebase push failed for adopted position {pos.signal.stock}: {fe}"
+                    )
+
+            logger.info(
+                f"Adopted {len(adopted)} existing positions from Angel One. "
+                f"All now have SL monitoring + broker-side SL orders."
+            )
+            return len(adopted)
+
+        except Exception as e:
+            logger.error(f"Position adoption failed: {e}. Starting without adopted positions.")
+            return 0
 
     # ----------------------------------------------------------------
     # Pre-Market Checks (9:00 AM)
@@ -368,9 +480,22 @@ class TradingBot:
             f"Global risk day: {self.news_fetcher.is_global_risk_day()}"
         )
 
-        # Check 5: Previous day OHLC
-        self._fetch_prev_day_levels()
+        # Check 5: Previous day OHLC (with capital-aware filter + caching)
+        ohlc_results, affordable, ltp_cache = self._fetch_prev_day_levels()
+        self._affordable_stocks = affordable
+        self._ltp_cache = ltp_cache
         status["prev_day_loaded"] = True
+
+        # Add capital filter stats so dashboard shows useful info
+        status["total_watchlist"] = len(self.watchlist)
+        status["affordable_stocks"] = len(affordable)
+        status["skipped_stocks"] = len(self.watchlist) - len(affordable)
+        status["ohlc_loaded"] = len(ohlc_results)
+        status["capital"] = config.trading.initial_capital
+        status["filter_summary"] = (
+            f"{len(affordable)} tradeable stocks at "
+            f"Rs.{config.trading.initial_capital:,.0f} capital"
+        )
 
         # All critical checks passed
         status["checks_passed"] = True
@@ -386,33 +511,46 @@ class TradingBot:
         logger.info("=" * 50)
         return True
 
-    def _fetch_prev_day_levels(self):
+    def _fetch_prev_day_levels(self) -> tuple[dict, list[dict], dict]:
         """
-        Fetch yesterday's OHLC for all watchlist stocks.
-        Used by scanner for gap filter and prev-day level proximity checks.
-        """
-        logger.info(f"Fetching previous day OHLC for {len(self.watchlist)} stocks...")
-        prev_day_by_token = {}
-        failed = 0
+        Fetch yesterday's OHLC with capital-aware filtering and caching.
 
-        for stock in self.watchlist:
-            token = stock["token"]
-            trading_symbol = f"{stock['symbol']}-EQ"
-            try:
-                ohlc = self.broker.get_prev_day_ohlc(token, trading_symbol)
-                if ohlc:
-                    prev_day_by_token[token] = ohlc
-                else:
-                    failed += 1
-            except Exception as e:
-                logger.warning(f"Could not fetch prev day OHLC for {stock['symbol']}: {e}")
-                failed += 1
+        New flow (replaces old 50-stock + sleep(2) approach):
+        1. Check local OHLC cache (instant on mid-day restart)
+        2. Use fast LTP API to filter by capital (5 req/sec)
+        3. Fetch OHLC only for affordable stocks (1 req/sec with rate limiter)
+        4. Cache results for next restart
+
+        Returns:
+            (ohlc_results, affordable_stocks, ltp_cache)
+        """
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=7)
+        from_date_str = from_date.strftime("%Y-%m-%d %H:%M")
+        to_date_str = to_date.strftime("%Y-%m-%d %H:%M")
+
+        ohlc_results, affordable, ltp_cache = self.broker.fetch_all_prev_day_ohlc(
+            watchlist=self.watchlist,
+            capital=config.trading.initial_capital,
+            from_date=from_date_str,
+            to_date=to_date_str,
+        )
+
+        # Convert symbol-keyed OHLC to token-keyed for scanner
+        symbol_to_token = {s["symbol"]: s["token"] for s in self.watchlist}
+        prev_day_by_token = {}
+        for symbol, ohlc in ohlc_results.items():
+            token = symbol_to_token.get(symbol)
+            if token:
+                prev_day_by_token[token] = ohlc
 
         self.scanner.set_prev_day_levels(prev_day_by_token)
         logger.info(
-            f"Prev day levels loaded: {len(prev_day_by_token)} stocks | "
-            f"{failed} failed (those stocks skip gap/proximity filters)"
+            f"Prev day levels loaded: {len(prev_day_by_token)} stocks "
+            f"(those without data skip gap/proximity filters)"
         )
+
+        return ohlc_results, affordable, ltp_cache
 
     # ----------------------------------------------------------------
     # WebSocket Streaming
@@ -517,8 +655,6 @@ class TradingBot:
                         f"SIGNAL (suggest only): {signal.stock} {signal.direction} "
                         f"@ Rs.{signal.entry_price:.2f}"
                     )
-                elif config.trading.use_confirmation_window:
-                    self._schedule_confirmation(signal)
                 else:
                     self._execute_signal(signal)
             except Exception as e:
@@ -696,9 +832,10 @@ class TradingBot:
         """
         Main loop -- runs from market open until 3:15 PM or kill switch.
         The actual trading logic runs in _on_price_update() (tick-driven).
-        This loop handles: position monitoring, force exit, daily loss check.
+        This loop handles: position monitoring, force exit, daily loss check,
+        and time-based exits (2:30 PM SL tightening, 3:00 PM profit exit).
         """
-        logger.info("Bot is live. Waiting for market data...")
+        logger.info("Entering trading loop. Waiting for market data...")
 
         try:
             while self.is_running:
@@ -807,7 +944,9 @@ class TradingBot:
         self.is_running = False
         self.data_stream.disconnect()
 
-        if not config.trading.suggest_only:
+        # Only exit positions if there are still open ones
+        # (_end_of_day or _on_kill_switch may have already closed them)
+        if not config.trading.suggest_only and self.order_manager.open_positions:
             self.order_manager.exit_all_positions()
 
         self.broker.disconnect()

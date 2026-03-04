@@ -65,8 +65,14 @@ class Portfolio:
         """
         gross_pnl = trade_data.get("gross_pnl", trade_data.get("pnl", 0))
         net_pnl = trade_data.get("net_pnl", gross_pnl)  # Fall back to gross if not provided
-        charges = trade_data.get("charges", 0)
+        raw_charges = trade_data.get("charges", 0)
         strategy = trade_data.get("strategy_name", "UNKNOWN")
+
+        # charges can be a dict (from calculate_charges()) or a float — handle both
+        if isinstance(raw_charges, dict):
+            charges_float = float(raw_charges.get("total_charges", 0))
+        else:
+            charges_float = float(raw_charges or 0)
 
         # Capital grows/shrinks by NET P&L (what we actually made)
         self.current_capital += net_pnl
@@ -74,10 +80,10 @@ class Portfolio:
         # Accumulate today's totals
         self.gross_pnl_today += gross_pnl
         self.net_pnl_today += net_pnl
-        self.brokerage_paid_today += charges
+        self.brokerage_paid_today += charges_float
 
         # Track per-strategy performance
-        self._update_strategy_stats(strategy, net_pnl, charges)
+        self._update_strategy_stats(strategy, net_pnl, charges_float)
 
         # Tag with capital after this trade (useful for debugging drawdowns)
         trade_data["capital_after"] = round(self.current_capital, 2)
@@ -90,7 +96,7 @@ class Portfolio:
             f"Trade recorded: {trade_data.get('stock', '?')} "
             f"{trade_data.get('direction', '?')} | "
             f"Gross: Rs.{gross_pnl:+,.2f} | "
-            f"Charges: Rs.{charges:.2f} | "
+            f"Charges: Rs.{charges_float:.2f} | "
             f"Net: Rs.{net_pnl:+,.2f} | "
             f"Capital: Rs.{self.current_capital:,.2f}"
         )
