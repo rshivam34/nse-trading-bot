@@ -48,6 +48,11 @@ TRADE_FIELDS = [
     "vix",
     "rsi_at_entry",
     "volume_ratio",
+    "r_multiple",
+    "planned_r_target",
+    "confluence_count",
+    "confluence_strategies",
+    "atr_value",
 ]
 
 

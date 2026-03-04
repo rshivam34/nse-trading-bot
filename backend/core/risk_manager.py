@@ -1,21 +1,23 @@
 """
-Risk Manager — The Guardian of Your Capital
-=============================================
+Risk Manager — The Guardian of Your Capital (Sniper Mode V2)
+==============================================================
 This module enforces ALL safety rules. It has VETO power over every trade.
 If the risk manager says no, the trade does not happen. Period.
 
-Capital-based trade limiting (FIX 2 — replaces hard max-3 rule):
-- Safety ceiling: 15 trades/day (but capital is the real limiter)
-- Primary limiter: deployed capital < 80% of broker margin
-- 3% daily loss limit stops the bot for the day
-- 2 consecutive losses = 60-minute cooldown
-- 3 total losses in a day = stop for the day
+Sniper Mode V2 changes:
+- Hard cap: 3 trades/day maximum (no exceptions)
+- Max 2 losing trades/day (sniper mode is about quality, not quantity)
+- VIX graduated response: NORMAL (<18) / CAUTION (18-20) / DANGER (>20)
+- ATR-based position sizing (risk amount / ATR-based SL distance)
+- Lunch block fully enforced (11:00-13:30 = no new trades)
+- 1.5% risk per trade (tightened from 2%)
+- 80% margin deployment limit still applies
 
-Re-entry prevention (FIX 3d):
+Re-entry prevention:
 - After exiting a stock, cannot re-enter same stock for 30 minutes
 
 Other protections:
-- Time-based position sizing (100% / 50% / 75% based on time of day)
+- Time-based position sizing (100% in active windows, 0% during lunch)
 - Market regime size multiplier (0.7x for volatile, 1.1x for trending)
 - Duplicate order prevention (never trade same stock twice until closed)
 - Expected net P&L check (skip if profit after charges too low)
@@ -81,6 +83,10 @@ class RiskManager:
         """Update regime-based multipliers (called from main.py on regime update)."""
         self.regime_size_multiplier = size_mult
         self.regime_sl_multiplier = sl_mult
+
+    def update_vix(self, vix: float):
+        """Update current VIX value for position sizing decisions."""
+        self._current_vix = vix
 
     def mark_stock_active(self, stock: str):
         """Record that we have an open position in this stock."""
@@ -150,15 +156,19 @@ class RiskManager:
         Gate every potential trade through all safety rules.
         Sets signal.reason if blocked. Returns True only if ALL checks pass.
         """
-        # Rule 1: Safety cap on total trades (high ceiling — capital is the real limit)
+        # Rule 1: HARD cap on total trades (sniper mode: 3/day max)
         if self.trades_today >= self.config.max_trades_per_day:
-            signal.reason = f"Max trades ({self.config.max_trades_per_day}) reached today"
+            signal.reason = (
+                f"Daily trade limit reached ({self.trades_today}/{self.config.max_trades_per_day}). "
+                "Monitor-only mode for rest of day."
+            )
+            signal.status = "SKIPPED-DAILY-LIMIT"
             return False
 
-        # Rule 2: 3 total losses today = done for the day
+        # Rule 2: 2 total losses today = done for the day (sniper mode)
         if self.losses_today >= self.config.max_losses_per_day:
             signal.reason = (
-                f"Max losses ({self.config.max_losses_per_day}) reached today — "
+                f"Max losses ({self.losses_today}/{self.config.max_losses_per_day}) reached today — "
                 "stopping to protect capital"
             )
             return False
@@ -377,16 +387,28 @@ class RiskManager:
 
     def _calc_quantity(self, signal: Signal, now) -> int:
         """
-        Position sizing with time-based and regime scaling.
+        Position sizing with VIX-based, time-based, and regime scaling.
+
+        Sniper Mode V2:
+        - VIX < 18 (NORMAL):  full risk (1.5% of capital)
+        - VIX 18-20 (CAUTION): half risk (0.75% of capital), wider ATR SL
+        - VIX > 20 (DANGER):  blocked before reaching this point
 
         Base formula: quantity = (capital x risk%) / risk_per_share
-
-        Then apply:
-        1. Time-of-day scaling (100% / 50% / 75%)
-        2. Regime scaling (0.7x volatile, 1.1x trending)
+        Then apply: time-of-day scaling + regime scaling
         """
         capital = self.portfolio.current_capital
-        risk_amount = capital * (self.config.max_risk_per_trade_pct / 100)
+        risk_pct = self.config.max_risk_per_trade_pct  # 1.5%
+
+        # VIX graduated response: reduce risk in caution mode
+        vix = getattr(self, '_current_vix', 0)
+        if vix >= self.config.vix_normal_threshold and vix < self.config.vix_caution_threshold:
+            risk_pct = self.config.vix_caution_risk_pct  # 0.75%
+            logger.info(
+                f"VIX={vix:.1f} -> CAUTION: risk reduced to {risk_pct}% per trade"
+            )
+
+        risk_amount = capital * (risk_pct / 100)
         risk_per_share = signal.risk_points
 
         if risk_per_share <= 0:
@@ -399,6 +421,11 @@ class RiskManager:
         time_pct = self._get_time_size_pct(now)
         scaled_qty = int(base_qty * time_pct / 100)
 
+        # Apply VIX caution size scaling
+        if vix >= self.config.vix_normal_threshold and vix < self.config.vix_caution_threshold:
+            vix_size_pct = self.config.vix_caution_size_pct / 100  # 50%
+            scaled_qty = int(scaled_qty * vix_size_pct)
+
         # Apply regime scaling
         regime_qty = int(scaled_qty * self.regime_size_multiplier)
 
@@ -408,9 +435,10 @@ class RiskManager:
         """
         Position size % based on time of day.
 
-        9:30-11:00: 100% — morning momentum, highest quality signals
-        11:00-13:30: 50% — lunch lull, low volume, choppy price action
-        13:30-14:30: 75% — afternoon momentum, good but not as strong as morning
+        Sniper mode:
+        9:30-11:00:  100% — morning momentum, highest quality signals
+        11:00-13:30: 0%   — BLOCKED (lunch block, no new trades)
+        13:30-14:30: 100% — afternoon momentum
         """
         w1_start = self.config.trading_window_1_start
         w1_end = self.config.trading_window_1_end
@@ -420,9 +448,9 @@ class RiskManager:
         if w1_start <= now <= w1_end:
             return self.config.position_size_window_1_pct   # 100%
         elif w2_start <= now <= w2_end:
-            return self.config.position_size_window_2_pct   # 75%
+            return self.config.position_size_window_2_pct   # 100%
         elif w1_end < now < w2_start:
-            return self.config.position_size_lunch_pct      # 50%
+            return self.config.position_size_lunch_pct      # 0% (lunch block)
         else:
             return 100.0  # Default (outside normal windows but before cutoff)
 

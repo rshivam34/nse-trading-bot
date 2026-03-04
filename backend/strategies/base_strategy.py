@@ -32,9 +32,24 @@ class Signal:
     timestamp: datetime = None    # When the signal was generated
     quantity: int = 0             # Shares to buy (filled by risk manager)
 
+    # ── Sniper mode fields ───────────────────────────────────────────
+    score: int = 0                # Signal score 0-100 (filled by scorer)
+    score_breakdown: dict = None  # Per-factor breakdown (filled by scorer)
+    confluence_count: int = 0     # How many strategies agree (sniper mode)
+    confluence_strategies: list = None  # List of agreeing strategy names
+    atr_value: float = 0.0       # ATR(14) on 5-min candles at signal time
+    choppiness: float = 0.0      # Choppiness Index at signal time
+    trend_15m: str = ""           # 15-min trend: "BULLISH"/"BEARISH"/"NEUTRAL"
+    skip_reason: str = ""         # Why signal was skipped (for logging)
+    status: str = "PENDING"       # EXECUTED/QUEUED/SKIPPED-* (signal queue)
+
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = datetime.now()
+        if self.score_breakdown is None:
+            self.score_breakdown = {}
+        if self.confluence_strategies is None:
+            self.confluence_strategies = []
 
     @property
     def risk_points(self) -> float:
@@ -67,6 +82,14 @@ class Signal:
             "risk_reward": self.risk_reward_ratio,
             "quantity": self.quantity,
             "timestamp": self.timestamp.isoformat(),
+            "score": self.score,
+            "confluence_count": self.confluence_count,
+            "confluence_strategies": self.confluence_strategies,
+            "atr_value": self.atr_value,
+            "choppiness": self.choppiness,
+            "trend_15m": self.trend_15m,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
         }
 
     def __str__(self) -> str:

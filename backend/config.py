@@ -43,15 +43,15 @@ class TradingConfig:
     """Core trading parameters."""
 
     # ── Capital ──────────────────────────────────────────────────────
-    initial_capital: float = float(os.getenv("INITIAL_CAPITAL", "1000"))
+    initial_capital: float = float(os.getenv("INITIAL_CAPITAL", "15000"))
 
     # ── Risk management (SAFETY — do not loosen these) ───────────────
-    max_risk_per_trade_pct: float = 2.0      # Max 2% of capital at risk per trade
-    max_trades_per_day: int = 15             # Safety ceiling (capital deployment is the real limit)
-    max_losses_per_day: int = 3              # 3 total losing trades = stop for the day
+    max_risk_per_trade_pct: float = 1.5      # Max 1.5% of capital at risk per trade (sniper mode)
+    max_trades_per_day: int = 3              # HARD ceiling — sniper mode: only 3 best trades/day
+    max_losses_per_day: int = 2              # 2 total losing trades = stop for the day (sniper mode)
     daily_loss_limit_pct: float = 3.0        # Bot stops for the day if hit (Rs. amount)
     max_capital_deployed_pct: float = 80.0   # Max 80% of broker margin deployed at once
-    risk_reward_ratio: float = 1.5           # Used by VWAP / EMA strategies
+    risk_reward_ratio: float = 2.5           # R-multiple target (2.5R reward-to-risk)
 
     # ── Market hours ─────────────────────────────────────────────────
     market_open: time = time(9, 15)
@@ -66,17 +66,20 @@ class TradingConfig:
     trading_window_2_start: time = time(13, 30)
     trading_window_2_end: time = time(14, 30)
 
+    # ── Lunch block — NO new trades during 11:00-13:30 (sniper mode) ──
+    lunch_block_start: time = time(11, 0)
+    lunch_block_end: time = time(13, 30)
+
     # ── Time-based position size scaling ─────────────────────────────
-    # Different times of day have different momentum characteristics.
-    # Window 1 (morning): full size. Lunch lull: 50%. Window 2 (afternoon): 75%.
+    # Sniper mode: 100% in both active windows, lunch is fully blocked.
     position_size_window_1_pct: float = 100.0   # 9:30-11:00 — morning momentum
-    position_size_lunch_pct: float = 50.0        # 11:00-13:30 — lunch lull
-    position_size_window_2_pct: float = 75.0     # 13:30-14:30 — afternoon
+    position_size_lunch_pct: float = 0.0         # 11:00-13:30 — BLOCKED (sniper mode)
+    position_size_window_2_pct: float = 100.0    # 13:30-14:30 — afternoon momentum
 
     # ── Signal scoring — only trade if score >= threshold ─────────────
-    # The scorer evaluates 11 conditions (see core/signal_scorer.py).
-    # 70+ = good setup. 80+ = excellent setup. 90+ = exceptional.
-    min_score_to_trade: int = 70
+    # Sniper mode: 85+ required. ~9 out of 11 scoring factors must confirm.
+    # 85+ = strong setup. 90+ = exceptional.
+    min_score_to_trade: int = 85
 
     # ── ORB-specific settings ─────────────────────────────────────────
     orb_min_range_pct: float = 0.3          # Skip if opening range < 0.3%
@@ -90,7 +93,7 @@ class TradingConfig:
     prev_day_proximity_pct: float = 0.3
 
     # ── Volume spike confirmation ─────────────────────────────────────
-    volume_spike_multiplier: float = 2.0
+    volume_spike_multiplier: float = 3.0         # Hard gate: 3× avg (sniper mode)
     volume_spike_high_multiplier: float = 5.0    # "High confidence" spike level
     volume_lookback: int = 20
 
@@ -104,17 +107,47 @@ class TradingConfig:
     # ── Smart partial exit ────────────────────────────────────────────
     partial_exit_enabled: bool = True
     partial_exit_rr: float = 1.0            # First exit at 1x RR
-    final_exit_rr: float = 2.0             # Final exit at 2x RR (ORB only)
+    final_exit_rr: float = 2.5             # Final exit at 2.5x RR (sniper mode)
+
+    # ── Multi-strategy confluence (sniper mode) ───────────────────────
+    min_confluence_count: int = 2           # At least 2 strategies must agree
+
+    # ── VIX graduated response (sniper mode) ──────────────────────────
+    vix_normal_threshold: float = 18.0      # VIX < 18 = normal
+    vix_caution_threshold: float = 20.0     # VIX 18-20 = caution (50% size, wider SL)
+    # VIX > 20 = DANGER: no new trades at all
+    vix_caution_size_pct: float = 50.0      # Position size in caution mode (50%)
+    vix_caution_risk_pct: float = 0.75      # Risk per trade in caution mode
+
+    # ── Choppiness Index filter (sniper mode) ─────────────────────────
+    chop_threshold: float = 61.8            # CHOP > 61.8 = choppy market, reject signal
+    chop_period: int = 14                   # Choppiness Index lookback period
+
+    # ── 15-minute trend filter (sniper mode) ──────────────────────────
+    trend_15m_enabled: bool = True          # Check 15-min EMA trend before trading
+    trend_15m_flat_threshold_pct: float = 0.05  # EMAs within 0.05% = flat/neutral = skip
+
+    # ── ATR expansion check (sniper mode) ─────────────────────────────
+    atr_expansion_lookback: int = 5         # Compare current ATR to N candles ago
+    atr_compression_penalty: int = 10       # Score penalty if ATR is compressing
 
     # ── Trailing stop-loss (improved profit management) ───────────────
     # Step 1: At 1% profit → move SL to breakeven (entry + charges)
-    # Step 2: At 2% profit → trail SL at 1% below peak (longs) / above trough (shorts)
+    # Step 2: At 1.5R profit → trail SL at 1× ATR below peak (longs) / above trough (shorts)
     trailing_sl_enabled: bool = True
     breakeven_profit_pct: float = 1.0       # Move SL to breakeven at 1% profit
-    trailing_activation_pct: float = 2.0    # Start trailing at 2% unrealized profit
-    trailing_distance_pct: float = 1.0      # Trail at 1% from peak/trough
+    trailing_activation_pct: float = 2.0    # Fallback pct (overridden by R-multiple in sniper mode)
+    trailing_activation_r: float = 1.5      # Start trailing at 1.5R profit (sniper mode)
+    trailing_distance_pct: float = 1.0      # Fallback trail distance (overridden by ATR in sniper mode)
     trailing_sl_pct: float = 0.3           # Legacy — used as fallback
-    trailing_sl_atr_multiplier: float = 0.5
+    trailing_sl_atr_multiplier: float = 1.0 # Trail at 1× ATR from peak/trough (sniper mode)
+
+    # ── ATR-based dynamic stop-loss (sniper mode) ─────────────────────
+    atr_sl_multiplier_normal: float = 1.5   # SL = 1.5× ATR from entry (VIX < 18)
+    atr_sl_multiplier_caution: float = 2.0  # SL = 2.0× ATR from entry (VIX 18-20)
+    atr_sl_floor_pct: float = 0.5           # SL never tighter than 0.5% from entry
+    atr_sl_ceiling_pct: float = 3.0         # SL never wider than 3% from entry
+    adopted_sl_fallback_pct: float = 2.5    # Fallback SL for adopted positions (if no ATR data)
 
     # ── Win zone exit (70% of target reversal protection) ──────────────
     win_zone_target_pct: float = 0.70       # 70% of target = "win zone"

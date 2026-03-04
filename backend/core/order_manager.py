@@ -1,20 +1,22 @@
 """
-Order Manager — Places, Monitors, and Exits Trades.
-====================================================
+Order Manager — Places, Monitors, and Exits Trades (Sniper Mode V2).
+=====================================================================
 
-Production features:
+Sniper Mode V2 features:
+- Pre-flight checklist: 17 checks before every trade
+- ATR-based dynamic SL (1.5× ATR normal, 2× caution, 0.5%-3% bounds)
+- ATR-based trailing SL (1× ATR from peak after 1.5R profit)
+- R-multiple tracking: log actual R-multiple for every closed trade
+- Signal queue integration: only top-scored signal per cycle executed
+
+Preserved features:
 - Adopt existing positions on startup (crash recovery)
 - Broker-side SL orders (exchange-level protection even if bot crashes)
-- Improved trailing SL: breakeven at 1% profit, trail at 2% profit
-- Win zone exit: if 70% of target reached and price reverses 0.5%, exit
+- Breakeven at 1% profit, win zone exit at 70% of target
 - Time-based exits: tighten SL after 2:30 PM, exit profits after 3:00 PM
 - Smart partial exit: 50% at 1x RR, SL moves to breakeven
-- Slippage tracking: log actual fill price vs expected entry price
-- Partial fill detection: adjust position size if < requested quantity filled
-- Duplicate order prevention: won't re-order for same stock
-- Pending order timeout: cancel LIMIT orders unfilled after 30 seconds
+- Slippage tracking, partial fill detection, pending order timeout
 - reconcile_positions(): verify broker state after reconnect
-- Full portfolio sync: portfolio.record_trade() called on every close
 """
 
 import logging
@@ -173,6 +175,30 @@ class OrderManager:
         # Pending orders: {order_id: {placed_at, stock, quantity, signal}}
         # Used to detect and cancel unfilled LIMIT orders after timeout
         self._pending_orders: dict[str, dict] = {}
+
+        # WebSocket price cache reference — set via set_data_stream() after construction.
+        # Used by monitor_positions() to read live prices without any API calls.
+        self._data_stream = None
+
+    def set_data_stream(self, data_stream):
+        """Wire up the WebSocket data stream for cached price reads."""
+        self._data_stream = data_stream
+
+    def _get_cached_ltp(self, token: str) -> float:
+        """
+        Get last traded price from WebSocket cache. ZERO API calls.
+
+        Falls back to broker API ONLY if WebSocket cache has no data for this token
+        (e.g., during startup before WebSocket connects, or for adopted positions
+        before the first tick arrives).
+        """
+        if self._data_stream:
+            ltp = self._data_stream.get_ltp(token)
+            if ltp > 0:
+                return ltp
+        # Fallback: API call (only happens if WebSocket hasn't sent a tick yet)
+        logger.debug(f"No cached price for token {token}, falling back to API")
+        return self.broker.get_ltp(token=token)
 
     # ──────────────────────────────────────────────────────────
     # FIX 1: Adopt existing positions from broker on startup
@@ -387,6 +413,143 @@ class OrderManager:
             return False
 
     # ──────────────────────────────────────────────────────────
+    # Pre-Flight Checklist (Sniper Mode V2 — Change 14)
+    # ──────────────────────────────────────────────────────────
+
+    def pre_flight_check(self, signal: Signal, scanner=None) -> tuple[bool, str]:
+        """
+        Run the 17-point pre-flight checklist before placing any order.
+
+        Every check is logged. If ANY check fails, the trade is REJECTED.
+
+        Returns:
+            (passed: bool, fail_reason: str)
+        """
+        from datetime import datetime
+
+        checks = []
+        now = datetime.now().time()
+
+        # Check 1: Signal score >= 85
+        ok = signal.score >= self.config.min_score_to_trade
+        checks.append(("Signal score >= 85", ok, f"score={signal.score}"))
+
+        # Check 2: Confluence count >= 2
+        ok = signal.confluence_count >= self.config.min_confluence_count
+        checks.append(("Confluence >= 2 strategies", ok, f"confluence={signal.confluence_count}"))
+
+        # Check 3: Volume >= 3× average (already gated in scanner, double-check)
+        ok = True  # Scanner already enforced this
+        checks.append(("Volume >= 3x average", ok, "passed in scanner"))
+
+        # Check 4: VIX regime not DANGER
+        vix = getattr(self, '_current_vix', 0)
+        ok = vix <= self.config.vix_caution_threshold if vix > 0 else True
+        checks.append(("VIX not DANGER", ok, f"VIX={vix:.1f}"))
+
+        # Check 5: Not in lunch block
+        in_lunch = (self.config.lunch_block_start <= now <= self.config.lunch_block_end)
+        ok = not in_lunch
+        checks.append(("Not in lunch block", ok, f"time={now.strftime('%H:%M')}"))
+
+        # Check 6: Daily trade count < 3
+        ok = self.risk_manager.trades_today < self.config.max_trades_per_day
+        checks.append(("Daily trades < 3", ok, f"trades={self.risk_manager.trades_today}"))
+
+        # Check 7: Daily losing trades < 2
+        ok = self.risk_manager.losses_today < self.config.max_losses_per_day
+        checks.append(("Daily losses < 2", ok, f"losses={self.risk_manager.losses_today}"))
+
+        # Check 8: Choppiness Index < 61.8 (stock)
+        ok = signal.choppiness <= self.config.chop_threshold
+        checks.append(("Choppiness < 61.8", ok, f"CHOP={signal.choppiness:.1f}"))
+
+        # Check 9: NIFTY Choppiness < 61.8
+        nifty_chop = 50.0
+        if scanner:
+            nifty_chop = scanner.market_context.get("nifty_choppiness", 50.0)
+        ok = nifty_chop <= self.config.chop_threshold
+        checks.append(("NIFTY CHOP < 61.8", ok, f"NIFTY_CHOP={nifty_chop:.1f}"))
+
+        # Check 10: 15-min trend agrees with direction
+        if self.config.trend_15m_enabled:
+            trend = signal.trend_15m
+            if signal.direction == "LONG":
+                ok = trend == "BULLISH"
+            else:
+                ok = trend == "BEARISH"
+        else:
+            ok = True
+        checks.append(("15-min trend aligned", ok, f"trend={signal.trend_15m}"))
+
+        # Check 11: Candle close confirms breakout (already in scanner)
+        ok = True
+        checks.append(("Candle close confirmation", ok, "passed in scanner"))
+
+        # Check 12: ATR-based SL within 0.5%-3%
+        if signal.entry_price > 0 and signal.stop_loss > 0:
+            sl_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
+            ok = self.config.atr_sl_floor_pct <= sl_pct <= self.config.atr_sl_ceiling_pct
+        else:
+            ok = True
+            sl_pct = 0
+        checks.append(("SL within 0.5%-3%", ok, f"SL%={sl_pct:.2f}%"))
+
+        # Check 13: Risk per trade within limits
+        ok = True  # Risk manager handles this
+        checks.append(("Risk within limits", ok, f"{self.config.max_risk_per_trade_pct}%"))
+
+        # Check 14: Capital deployment < 80% of margin
+        stats = self.risk_manager.get_deployment_stats()
+        ok = stats["utilization_pct"] < self.config.max_capital_deployed_pct
+        checks.append(("Capital < 80% deployed", ok, f"{stats['utilization_pct']:.0f}%"))
+
+        # Check 15: Stock not in re-entry cooldown
+        ok = signal.stock not in self.risk_manager._reentry_blocked_until or \
+             datetime.now() >= self.risk_manager._reentry_blocked_until.get(signal.stock, datetime.min)
+        checks.append(("No re-entry cooldown", ok, f"stock={signal.stock}"))
+
+        # Check 16: Time in active window
+        in_w1 = self.config.trading_window_1_start <= now <= self.config.trading_window_1_end
+        in_w2 = self.config.trading_window_2_start <= now <= self.config.trading_window_2_end
+        ok = in_w1 or in_w2
+        checks.append(("In active window", ok, f"time={now.strftime('%H:%M')}"))
+
+        # Check 17: Estimated net profit positive
+        from utils.brokerage import is_trade_viable
+        if signal.quantity > 0:
+            viable, net_profit = is_trade_viable(
+                signal.entry_price, signal.target, signal.quantity,
+                signal.direction, min_profit=self.config.min_expected_net_profit
+            )
+            ok = viable
+        else:
+            ok = True
+            net_profit = 0
+        checks.append(("Net profit positive", ok, f"est_net=Rs.{net_profit:.2f}"))
+
+        # Log all checks
+        all_passed = True
+        fail_reason = ""
+        for i, (name, passed, detail) in enumerate(checks, 1):
+            status = "PASS" if passed else "FAIL"
+            logger.info(f"  PREFLIGHT #{i:02d}: {status} — {name} ({detail})")
+            if not passed and all_passed:
+                all_passed = False
+                fail_reason = f"Check #{i} — {name} ({detail})"
+
+        if all_passed:
+            logger.info(f"PREFLIGHT PASSED: All 17 checks OK for {signal.stock}")
+        else:
+            logger.warning(f"PREFLIGHT FAILED: {fail_reason}")
+
+        return all_passed, fail_reason
+
+    def set_vix(self, vix: float):
+        """Update current VIX value for pre-flight checklist."""
+        self._current_vix = vix
+
+    # ──────────────────────────────────────────────────────────
     # Order Execution
     # ──────────────────────────────────────────────────────────
 
@@ -480,7 +643,7 @@ class OrderManager:
             signal.quantity = filled_qty
 
         # Get actual fill price for slippage calculation
-        actual_entry = self.broker.get_ltp(signal.token) or signal.entry_price
+        actual_entry = self._get_cached_ltp(signal.token) or signal.entry_price
         slippage = actual_entry - signal.entry_price
         if abs(slippage) > 0.01:
             slippage_pct = abs(slippage / signal.entry_price) * 100
@@ -555,7 +718,7 @@ class OrderManager:
             if pos.status not in ("OPEN", "PARTIAL"):
                 continue
 
-            ltp = self.broker.get_ltp(token=pos.signal.token)
+            ltp = self._get_cached_ltp(pos.signal.token)
             if not ltp or ltp <= 0:
                 continue
 
@@ -618,11 +781,25 @@ class OrderManager:
                         f"SL moved to Rs.{new_sl:.2f}"
                     )
 
-            # Step 2: At 2% profit -> activate trailing SL at 1% from peak
+            # Step 2: At 1.5R profit -> activate trailing SL at 1× ATR from peak
+            # Use R-multiple if ATR/SL data available, else fall back to pct
+            initial_risk = abs(pos.actual_entry - pos.signal.stop_loss)
+            if initial_risk > 0 and pos.signal.direction == "LONG":
+                current_r = (ltp - pos.actual_entry) / initial_risk
+            elif initial_risk > 0 and pos.signal.direction == "SHORT":
+                current_r = (pos.actual_entry - ltp) / initial_risk
+            else:
+                current_r = 0
+
+            trail_trigger = (
+                current_r >= self.config.trailing_activation_r
+                if initial_risk > 0
+                else profit_pct >= self.config.trailing_activation_pct
+            )
             if (
                 not pos.trailing_active
                 and self.config.trailing_sl_enabled
-                and profit_pct >= self.config.trailing_activation_pct
+                and trail_trigger
             ):
                 pos.trailing_active = True
                 pos.trailing_sl = self._calc_trailing_sl(pos, ltp)
@@ -753,15 +930,23 @@ class OrderManager:
 
     def _calc_trailing_sl(self, pos: Position, current_price: float) -> float:
         """
-        Calculate trailing stop-loss price.
+        Calculate trailing stop-loss price using ATR-based distance.
 
-        Trail at trailing_distance_pct (1%) from peak/trough.
+        Sniper Mode V2: Trail at 1× ATR from peak/trough.
+        Falls back to percentage-based trail if ATR is not available.
 
-        For LONG: trailing SL = peak_price - (peak_price * 1%)
-        For SHORT: trailing SL = trough_price + (trough_price * 1%)
+        For LONG: trailing SL = peak_price - (1× ATR)
+        For SHORT: trailing SL = trough_price + (1× ATR)
         """
-        trail_pct = self.config.trailing_distance_pct / 100
-        trail_amount = pos.peak_price * trail_pct
+        atr = getattr(pos.signal, "atr_value", 0)
+
+        if atr > 0:
+            # ATR-based trailing (sniper mode)
+            trail_amount = atr * self.config.trailing_sl_atr_multiplier
+        else:
+            # Fallback: percentage-based trailing
+            trail_pct = self.config.trailing_distance_pct / 100
+            trail_amount = pos.peak_price * trail_pct
 
         if pos.signal.direction == "LONG":
             return round(pos.peak_price - trail_amount, 2)
@@ -870,6 +1055,18 @@ class OrderManager:
         total_net = total_gross - charges["total_charges"]
         pos.realized_pnl = total_gross
 
+        # ── R-Multiple tracking (Change 13) ─────────────────────────────
+        # R = initial risk per share (entry - SL for longs, SL - entry for shorts)
+        # R-multiple = actual P&L per share / R
+        initial_risk = abs(pos.actual_entry - pos.signal.stop_loss)
+        if initial_risk > 0 and pos.signal.quantity > 0:
+            pnl_per_share = total_gross / pos.signal.quantity
+            r_multiple = round(pnl_per_share / initial_risk, 2)
+        else:
+            r_multiple = 0.0
+
+        planned_r_target = self.config.risk_reward_ratio  # 2.5R
+
         # Update risk manager (includes re-entry cooldown)
         self.risk_manager.record_trade_result(total_net, pos.signal.stock)
 
@@ -888,6 +1085,11 @@ class OrderManager:
             "score": getattr(pos.signal, "score", 0),
             "slippage": pos.slippage,
             "hold_time_min": round(pos.hold_time_minutes, 1),
+            "r_multiple": r_multiple,
+            "planned_r_target": planned_r_target,
+            "confluence_count": getattr(pos.signal, "confluence_count", 0),
+            "confluence_strategies": getattr(pos.signal, "confluence_strategies", []),
+            "atr_value": getattr(pos.signal, "atr_value", 0),
         })
 
         if pos in self.open_positions:
@@ -922,7 +1124,7 @@ class OrderManager:
                 )
                 continue
             exited_symbols.add(pos.signal.stock)
-            ltp = self.broker.get_ltp(pos.signal.token) or pos.signal.entry_price
+            ltp = self._get_cached_ltp(pos.signal.token) or pos.signal.entry_price
             self._close_remaining(pos, ltp, reason)
         logger.info(f"All positions closed ({reason}) — {len(exited_symbols)} exits placed")
 

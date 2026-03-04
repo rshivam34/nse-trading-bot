@@ -78,6 +78,11 @@ class DataStream:
         # Track if this is a reconnect (not the first connection)
         self._is_reconnect = False
 
+        # Price cache: latest tick data for every token, updated on every WebSocket tick.
+        # Used by order_manager to check SL/target without making API calls.
+        # Key = token string (e.g. "2885"), Value = tick dict with ltp, open, high, low, etc.
+        self.price_cache: dict[str, dict] = {}
+
     # ──────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────
@@ -109,6 +114,18 @@ class DataStream:
             daemon=True,  # Daemon = thread dies when main program exits
         )
         self._thread.start()
+
+    def get_ltp(self, token: str) -> float:
+        """
+        Get last traded price from WebSocket cache. Zero API calls.
+
+        Returns 0.0 if the token has no cached data yet (WebSocket
+        hasn't sent a tick for it). Callers should handle 0.0 gracefully.
+        """
+        tick = self.price_cache.get(token)
+        if tick:
+            return tick.get("ltp", 0.0)
+        return 0.0
 
     def disconnect(self):
         """Stop streaming and close the WebSocket."""
@@ -238,8 +255,11 @@ class DataStream:
         """
         try:
             tick = self._parse_tick(message)
-            if tick and self.callback:
-                self.callback(tick)
+            if tick:
+                # Update price cache (zero-cost — just a dict write)
+                self.price_cache[tick["token"]] = tick
+                if self.callback:
+                    self.callback(tick)
         except Exception as e:
             # Log bad tick at WARNING so it's visible but doesn't stop trading.
             # Include token if available so we can identify the problematic instrument.

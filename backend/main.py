@@ -107,6 +107,7 @@ class TradingBot:
         )
         self.scanner = PatternScanner(config.trading, config.indicators)
         self.data_stream = DataStream(self.broker)
+        self.order_manager.set_data_stream(self.data_stream)
         self.firebase = FirebaseSync(config.firebase)
 
         # New: news sentiment, regime detector, analytics
@@ -594,6 +595,9 @@ class TradingBot:
                     vix = tick.get("ltp", 0)
                     self.regime_detector.update_vix(vix)
                     self.scanner.market_context["vix"] = vix
+                    # Feed VIX to risk_manager and order_manager for sniper mode
+                    self.risk_manager.update_vix(vix)
+                    self.order_manager.set_vix(vix)
                 else:
                     self.scanner.update_market_context(tick)
                     self.regime_detector.update_nifty(tick)
@@ -640,11 +644,34 @@ class TradingBot:
 
         for signal in signals:
             try:
+                # ── Risk manager gate ─────────────────────────────────────
                 if not self.risk_manager.can_trade(signal):
                     logger.info(f"Blocked by risk: {signal.stock} -- {signal.reason}")
+                    signal.status = getattr(signal, "status", "") or "SKIPPED-RISK"
+                    signal.skip_reason = signal.reason
+                    # Push all signals (including skipped) to Firebase
+                    try:
+                        self.firebase.push_signal(signal)
+                    except Exception:
+                        pass
                     continue
 
-                # Push signal to dashboard — non-critical, wrap separately
+                # ── Pre-flight checklist (sniper mode) ────────────────────
+                preflight_ok, fail_reason = self.order_manager.pre_flight_check(
+                    signal, scanner=self.scanner
+                )
+                if not preflight_ok:
+                    signal.status = "SKIPPED-PREFLIGHT"
+                    signal.skip_reason = fail_reason
+                    logger.info(f"PREFLIGHT FAILED: {signal.stock} — {fail_reason}")
+                    try:
+                        self.firebase.push_signal(signal)
+                    except Exception:
+                        pass
+                    continue
+
+                # ── Signal passed all checks — push and execute ───────────
+                signal.status = "EXECUTED"
                 try:
                     self.firebase.push_signal(signal)
                 except Exception as fe:
@@ -653,7 +680,8 @@ class TradingBot:
                 if config.trading.suggest_only:
                     logger.info(
                         f"SIGNAL (suggest only): {signal.stock} {signal.direction} "
-                        f"@ Rs.{signal.entry_price:.2f}"
+                        f"@ Rs.{signal.entry_price:.2f} | Score: {signal.score} | "
+                        f"Confluence: {signal.confluence_count}"
                     )
                 else:
                     self._execute_signal(signal)
@@ -674,7 +702,7 @@ class TradingBot:
         Called once at 10:30 AM to lock in the day's market regime.
         Updates risk manager multipliers so position sizing reflects regime.
         """
-        regime = self.regime_detector.get_regime()
+        regime = self.regime_detector.regime
         size_mult = self.regime_detector.get_size_multiplier()
         sl_mult = self.regime_detector.get_sl_multiplier()
         score_override = self.regime_detector.get_min_score_override()
@@ -766,8 +794,17 @@ class TradingBot:
 
         # Add market context at time of close for analytics
         trade_data["nifty_direction"] = self.scanner.market_context.get("nifty_direction", "")
-        trade_data["regime"] = self.regime_detector.get_regime() if self.regime_determined else "UNKNOWN"
+        trade_data["regime"] = self.regime_detector.regime if self.regime_determined else "UNKNOWN"
         trade_data["vix"] = self.scanner.market_context.get("vix", 0)
+
+        # Add R-multiple from the last recorded trade in portfolio
+        if self.portfolio.trade_log:
+            last_trade = self.portfolio.trade_log[-1]
+            trade_data["r_multiple"] = last_trade.get("r_multiple", 0)
+            trade_data["planned_r_target"] = last_trade.get("planned_r_target", 0)
+            trade_data["confluence_count"] = last_trade.get("confluence_count", 0)
+            trade_data["confluence_strategies"] = last_trade.get("confluence_strategies", [])
+            trade_data["atr_value"] = last_trade.get("atr_value", 0)
 
         # Log to CSV — local file write, keep trading even if this fails
         try:
@@ -954,26 +991,47 @@ class TradingBot:
         logger.info("Bot shut down cleanly.")
 
     def _print_banner(self):
-        """Print startup info."""
+        """Print startup info — Sniper Mode V2 banner."""
+        capital = config.trading.initial_capital
+        risk_amt = capital * (config.trading.max_risk_per_trade_pct / 100)
+
         logger.info("=" * 60)
         logger.info(f"  NSE Trading Bot  |  Mode: {self.mode}")
         logger.info(
             f"  {'SUGGEST ONLY (no auto-trades)' if config.trading.suggest_only else 'AUTO-EXECUTE (live orders)'}"
         )
-        if config.trading.use_confirmation_window and not config.trading.suggest_only:
-            logger.info(f"  30-second confirmation window: ON")
-        logger.info(f"  Capital: Rs.{config.trading.initial_capital:,.0f}")
-        logger.info(f"  Watchlist: up to {config.trading.watchlist_max_size} stocks")
-        logger.info(f"  Min signal score: {config.trading.min_score_to_trade}/100")
-        logger.info(f"  Max risk/trade: {config.trading.max_risk_per_trade_pct}%")
-        logger.info(f"  Daily loss limit: {config.trading.daily_loss_limit_pct}%")
-        logger.info(
-            f"  Trading windows: "
-            f"{config.trading.trading_window_1_start.strftime('%H:%M')}-"
-            f"{config.trading.trading_window_1_end.strftime('%H:%M')} and "
-            f"{config.trading.trading_window_2_start.strftime('%H:%M')}-"
-            f"{config.trading.trading_window_2_end.strftime('%H:%M')}"
-        )
+        logger.info("")
+        logger.info("  SNIPER MODE V2 ACTIVE")
+        logger.info(f"  |- Score threshold: {config.trading.min_score_to_trade} "
+                     f"(need {config.trading.min_confluence_count}+ strategy confluence)")
+        logger.info(f"  |- Max trades/day: {config.trading.max_trades_per_day} | "
+                     f"Max losing: {config.trading.max_losses_per_day}")
+        logger.info(f"  |- Risk per trade: {config.trading.max_risk_per_trade_pct}% "
+                     f"of Rs.{capital:,.0f} = Rs.{risk_amt:,.0f}")
+        logger.info(f"  |- Stop-loss: {config.trading.atr_sl_multiplier_normal}x ATR "
+                     f"(floor {config.trading.atr_sl_floor_pct}%, "
+                     f"ceiling {config.trading.atr_sl_ceiling_pct}%)")
+        logger.info(f"  |- Target: {config.trading.risk_reward_ratio}R from entry")
+        logger.info(f"  |- Volume gate: {config.trading.volume_spike_multiplier}x average minimum")
+        logger.info(f"  |- VIX gates: NORMAL <{config.trading.vix_normal_threshold} | "
+                     f"CAUTION {config.trading.vix_normal_threshold}-"
+                     f"{config.trading.vix_caution_threshold} | "
+                     f"DANGER >{config.trading.vix_caution_threshold}")
+        logger.info(f"  |- Choppiness filter: ON (reject if CHOP > "
+                     f"{config.trading.chop_threshold})")
+        logger.info(f"  |- 15-min trend filter: "
+                     f"{'ON' if config.trading.trend_15m_enabled else 'OFF'}")
+        logger.info(f"  |- Candle close confirmation: ON (breakout strategies)")
+        logger.info(f"  |- Active hours: "
+                     f"{config.trading.trading_window_1_start.strftime('%H:%M')}-"
+                     f"{config.trading.trading_window_1_end.strftime('%H:%M')}, "
+                     f"{config.trading.trading_window_2_start.strftime('%H:%M')}-"
+                     f"{config.trading.trading_window_2_end.strftime('%H:%M')}")
+        logger.info(f"  |- Lunch block: "
+                     f"{config.trading.lunch_block_start.strftime('%H:%M')}-"
+                     f"{config.trading.lunch_block_end.strftime('%H:%M')} "
+                     f"(no new trades)")
+        logger.info(f"  |- Pre-flight checklist: 17 checks before every trade")
         logger.info("=" * 60)
 
 
