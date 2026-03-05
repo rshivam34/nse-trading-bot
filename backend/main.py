@@ -596,6 +596,8 @@ class TradingBot:
             try:
                 if token == self.vix_token:
                     vix = tick.get("ltp", 0)
+                    if vix == 0:
+                        logger.warning("VIX tick received with LTP=0 — possible data issue, treating as NORMAL")
                     self.regime_detector.update_vix(vix)
                     self.scanner.market_context["vix"] = vix
                     # Feed VIX to risk_manager and order_manager for sniper mode

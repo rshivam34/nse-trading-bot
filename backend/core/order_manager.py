@@ -430,13 +430,18 @@ class OrderManager:
         checks = []
         now = datetime.now().time()
 
-        # Check 1: Signal score >= 85
+        # Check 1: Signal score >= threshold
         ok = signal.score >= self.config.min_score_to_trade
-        checks.append(("Signal score >= 85", ok, f"score={signal.score}"))
+        checks.append((f"Signal score >= {self.config.min_score_to_trade}", ok, f"score={signal.score}"))
 
-        # Check 2: Confluence count >= 2
-        ok = signal.confluence_count >= self.config.min_confluence_count
-        checks.append(("Confluence >= 2 strategies", ok, f"confluence={signal.confluence_count}"))
+        # Check 2: Confluence >= 2 OR exceptional single-strategy (score >= 90)
+        ok = (signal.confluence_count >= self.config.min_confluence_count or
+              signal.score >= self.config.single_strategy_exception_score)
+        checks.append((
+            "Confluence >= 2 or exceptional score",
+            ok,
+            f"confluence={signal.confluence_count}, score={signal.score}"
+        ))
 
         # Check 3: Volume >= 3× average (already gated in scanner, double-check)
         ok = True  # Scanner already enforced this

@@ -220,18 +220,44 @@ class PatternScanner:
                 confluence_strategies = [s.strategy_name for s in short_signals]
                 confluent_signal = max(short_signals, key=lambda s: s.confidence)
 
-        # If no confluence, log all as skipped and return empty
+        # If no confluence, check for exceptional single-strategy exception
         if confluent_signal is None:
-            for s in raw_signals:
-                s.status = "SKIPPED-NO-CONFLUENCE"
-                s.skip_reason = f"Only {s.strategy_name} fired (need {self.trading_config.min_confluence_count}+ strategies)"
-                self._all_signals_today.append(s)
-            if raw_signals:
+            # Exception: allow single strategy if pre-scored signal would be >= 90 (EXCEPTIONAL)
+            exception_score = self.trading_config.single_strategy_exception_score
+            best_single = max(raw_signals, key=lambda s: s.confidence)
+            temp_score, _ = self.scorer.score(
+                signal=best_single,
+                market_context=stock_context,
+                news_sentiment=self.news_sentiment,
+            )
+
+            if temp_score >= exception_score:
+                # Exceptional signal — allow through with single strategy
+                confluent_signal = best_single
+                confluence_count = 1
+                confluence_strategies = [best_single.strategy_name]
+                confluent_signal.confluence_count = 1
+                confluent_signal.confluence_strategies = confluence_strategies
                 logger.info(
-                    f"No confluence for {stock}: {[s.strategy_name for s in raw_signals]} "
-                    f"(need {self.trading_config.min_confluence_count}+)"
+                    f"EXCEPTIONAL single-strategy signal: {stock} {best_single.direction} "
+                    f"from {best_single.strategy_name} — pre-score {temp_score} >= {exception_score}"
                 )
-            return []
+            else:
+                # Still rejected — log and return
+                for s in raw_signals:
+                    s.status = "SKIPPED-NO-CONFLUENCE"
+                    s.skip_reason = (
+                        f"Only {s.strategy_name} fired (need {self.trading_config.min_confluence_count}+ "
+                        f"or score >= {exception_score}), pre-score={temp_score}"
+                    )
+                    self._all_signals_today.append(s)
+                if raw_signals:
+                    logger.info(
+                        f"No confluence for {stock}: {[s.strategy_name for s in raw_signals]} "
+                        f"(need {self.trading_config.min_confluence_count}+ or score >= {exception_score}, "
+                        f"best pre-score={temp_score})"
+                    )
+                return []
 
         # Attach confluence info to the winning signal
         confluent_signal.confluence_count = confluence_count
@@ -252,18 +278,23 @@ class PatternScanner:
         now = datetime.now().time()
         if self.trading_config.lunch_block_start <= now <= self.trading_config.lunch_block_end:
             confluent_signal.status = "SKIPPED-LUNCH-BLOCK"
-            confluent_signal.skip_reason = "Lunch block 11:00-13:30"
+            confluent_signal.skip_reason = (
+                f"Lunch block {self.trading_config.lunch_block_start.strftime('%H:%M')}"
+                f"-{self.trading_config.lunch_block_end.strftime('%H:%M')}"
+            )
             self._all_signals_today.append(confluent_signal)
             logger.info(
                 f"SKIPPED-LUNCH-BLOCK: {stock} {confluent_signal.direction} — "
                 f"{' + '.join(confluence_strategies)} confluence ({confluence_count}/4), "
-                f"blocked during 11:00-13:30"
+                f"blocked during {self.trading_config.lunch_block_start.strftime('%H:%M')}"
+                f"-{self.trading_config.lunch_block_end.strftime('%H:%M')}"
             )
             return []
 
         # ── Step 3b: VIX gate ──────────────────────────────────────────
         vix = self.market_context.get("vix", 0)
-        if vix > self.trading_config.vix_caution_threshold:
+        # Only gate on VIX if we have real data (VIX=0 means no data received yet)
+        if vix > 0 and vix > self.trading_config.vix_caution_threshold:
             confluent_signal.status = "SKIPPED-VIX-GATE"
             confluent_signal.skip_reason = f"VIX {vix:.1f} > {self.trading_config.vix_caution_threshold} (DANGER zone)"
             self._all_signals_today.append(confluent_signal)

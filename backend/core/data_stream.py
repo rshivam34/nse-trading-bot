@@ -70,10 +70,13 @@ class DataStream:
         # Correlation ID: a unique string for this subscription session
         self._correlation_id = "trading_bot_stream"
 
-        # Reconnect settings
-        self._reconnect_delay = 5    # Seconds between reconnect attempts
-        self._max_reconnects = 10    # Give up after this many failed attempts
-        self._reconnect_count = 0    # Current consecutive failure count
+        # Reconnect settings — exponential backoff (5s → 10s → 20s → 40s → 60s cap)
+        self._base_reconnect_delay = 5       # Starting delay (seconds)
+        self._max_reconnect_delay = 60       # Cap delay at 60 seconds
+        self._max_reconnects = 50            # Give up after this many failed attempts (up from 10)
+        self._max_reconnect_time_mins = 60   # Also give up after 60 minutes total
+        self._reconnect_count = 0            # Current consecutive failure count
+        self._first_disconnect_time = None   # Track when disconnection started
 
         # Track if this is a reconnect (not the first connection)
         self._is_reconnect = False
@@ -153,11 +156,33 @@ class DataStream:
         - After successful reconnect (_is_reconnect=True), _on_open() calls
           on_reconnect() so main.py can reconcile positions.
         """
-        while self.is_streaming and self._reconnect_count < self._max_reconnects:
+        while self.is_streaming:
             try:
                 # Before reconnecting: refresh auth tokens
                 # (no-op on first connection, important on subsequent reconnects)
                 if self._is_reconnect:
+                    # Check total reconnection time limit (60 minutes)
+                    if self._first_disconnect_time:
+                        elapsed_mins = (time.time() - self._first_disconnect_time) / 60
+                        if elapsed_mins > self._max_reconnect_time_mins:
+                            logger.error(
+                                f"WebSocket reconnection timed out after {elapsed_mins:.0f} minutes. "
+                                "Restart the bot manually."
+                            )
+                            self.is_streaming = False
+                            break
+                    else:
+                        self._first_disconnect_time = time.time()
+
+                    # Check attempt count limit
+                    if self._reconnect_count >= self._max_reconnects:
+                        logger.error(
+                            f"Max reconnection attempts ({self._max_reconnects}) reached. "
+                            "Data stream stopped. Restart the bot manually."
+                        )
+                        self.is_streaming = False
+                        break
+
                     logger.info("Refreshing auth tokens before reconnect...")
                     refreshed = self.broker.refresh_session()
                     if not refreshed:
@@ -194,18 +219,17 @@ class DataStream:
 
             self._reconnect_count += 1
             self._is_reconnect = True  # Flag future iterations as reconnects
+
+            # Exponential backoff: 5s, 10s, 20s, 40s, 60s (cap), 60s, 60s...
+            delay = min(
+                self._base_reconnect_delay * (2 ** min(self._reconnect_count - 1, 4)),
+                self._max_reconnect_delay,
+            )
             logger.warning(
-                f"WebSocket disconnected. Reconnecting in {self._reconnect_delay}s "
+                f"WebSocket disconnected. Reconnecting in {delay}s "
                 f"(attempt {self._reconnect_count}/{self._max_reconnects})..."
             )
-            time.sleep(self._reconnect_delay)
-
-        if self._reconnect_count >= self._max_reconnects:
-            logger.error(
-                "Max reconnection attempts reached. Data stream stopped. "
-                "Restart the bot manually."
-            )
-            self.is_streaming = False
+            time.sleep(delay)
 
     def _on_open(self, wsapp):
         """
@@ -214,7 +238,8 @@ class DataStream:
         After a reconnect, we also call on_reconnect() to reconcile positions.
         """
         logger.info("WebSocket connected! Subscribing to price feeds...")
-        self._reconnect_count = 0  # Reset failure counter on success
+        self._reconnect_count = 0       # Reset failure counter on success
+        self._first_disconnect_time = None  # Reset disconnect timer — we're back
 
         # Format tokens for Angel One's subscription format
         # Angel One wants: [{"exchangeType": 1, "tokens": ["2885", "1594", ...]}]

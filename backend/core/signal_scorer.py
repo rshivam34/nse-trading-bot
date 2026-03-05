@@ -166,7 +166,13 @@ class SignalScorer:
 
         # ── INDIA VIX BONUS ──────────────────────────────────────────────
         vix = market_context.get("vix", 20.0)
-        breakdown["vix_low"] = 5 if vix > 0 and vix < 15.0 else 0
+        # VIX=0 means no data (not real) — give partial credit (3 pts) instead of 0
+        if vix > 0 and vix < 15.0:
+            breakdown["vix_low"] = 5
+        elif vix == 0:
+            breakdown["vix_low"] = 3  # No VIX data — assume normal, partial credit
+        else:
+            breakdown["vix_low"] = 0
 
         # ── COMPUTE TOTAL ─────────────────────────────────────────────────
         total = sum(breakdown.values())

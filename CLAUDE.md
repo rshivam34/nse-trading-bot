@@ -75,7 +75,7 @@ Philosophy: "Fewer, higher-quality trades." Instead of taking every decent signa
 ### Sniper Mode Config Summary:
 | Setting | Value |
 |---------|-------|
-| min_signal_score | 85 |
+| min_signal_score | 80 (was 85) |
 | max_trades_per_day | 3 (hard cap) |
 | max_losing_trades | 2 |
 | Risk per trade | 1.5% of capital |
@@ -86,7 +86,8 @@ Philosophy: "Fewer, higher-quality trades." Instead of taking every decent signa
 | VIX NORMAL | < 18 (full size, 1.5× ATR) |
 | VIX CAUTION | 18-20 (50% size, 2× ATR) |
 | VIX DANGER | > 20 (no new trades) |
-| Lunch block | 11:00-13:30 |
+| Lunch block | 11:30-13:00 (was 11:00-13:30) |
+| Single-strategy exception | Score ≥ 90 bypasses confluence |
 | Choppiness gate | > 61.8 = reject |
 | Capital | ₹15,000 |
 
@@ -553,3 +554,62 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 - Pre-flight checks 3, 11, 13 are verified in scanner, not re-verified in pre-flight. Functionally safe but redundant.
 
 ### Audit Confidence After Fixes: 8/10 — Safe for ₹15K live trading
+
+---
+
+## FILTER RELAXATION (March 5, 2026)
+
+### Problem: Zero trades on 2026-03-05
+- Morning: 13,396 single-strategy signals rejected (confluence needed 2+)
+- Lunch: 38 good 2+ confluence signals blocked by 11:00-13:30 block
+- Afternoon: WebSocket died at 13:00, only 10 retries, never recovered
+
+### 5 Changes Made
+
+#### Change 1: VIX 0.0 Bug Fix
+- **signal_scorer.py**: VIX=0 (no data) now gets 3 partial points instead of 0 for `vix_low` bonus
+- **scanner.py**: VIX DANGER gate now requires `vix > 0` before checking threshold (matches pre-flight behavior)
+- **main.py**: Warning log when VIX tick arrives with LTP=0
+
+#### Change 2: WebSocket Exponential Backoff
+- **data_stream.py**: Reconnection now uses exponential backoff (5s → 10s → 20s → 40s → 60s cap)
+- Max retries: 10 → 50
+- Added 60-minute total timeout (not just attempt count)
+- Resets disconnect timer on successful reconnect
+
+#### Change 3: Shorter Lunch Block (2.5h → 1.5h)
+- **config.py**: Lunch block narrowed from 11:00-13:30 to 11:30-13:00
+- Trading window 1 extended: 9:30-11:00 → 9:30-11:30
+- Trading window 2 starts earlier: 13:30 → 13:00
+- Recovers 60 minutes of trading time (30 min each side)
+
+#### Change 4: Score Threshold Lowered (85 → 80)
+- **config.py**: `min_score_to_trade` 85 → 80
+- Score 80 = ~8/11 factors confirmed = "EXCELLENT" quality
+- All other filters (volume 3×, choppiness, VIX) still apply
+
+#### Change 5: Single-Strategy Exception (Score ≥ 90)
+- **config.py**: New `single_strategy_exception_score = 90`
+- **scanner.py**: If only 1 strategy fires, pre-scores it. If score ≥ 90 (EXCEPTIONAL), allows through with `confluence_count = 1`
+- **order_manager.py**: Pre-flight check #2 updated: pass if `confluence >= 2 OR score >= 90`
+- Pre-flight check #1 now uses dynamic config value instead of hardcoded "85"
+
+### Updated Sniper Mode Config Summary
+| Setting | Old | New |
+|---------|-----|-----|
+| min_signal_score | 85 | 80 |
+| Lunch block | 11:00-13:30 | 11:30-13:00 |
+| Confluence | 2+ required | 2+ OR score >= 90 |
+| WebSocket retries | 10 (fixed 5s) | 50 (exponential backoff 5-60s) |
+| VIX=0 handling | Silent pass + 0 score pts | Warning log + 3 partial pts |
+
+### Safety Rules Unchanged
+- Max 3 trades/day, max 2 losses/day, 1.5% risk/trade
+- Volume ≥ 3× hard gate, Choppiness < 61.8, ATR-based SL (0.5%-3%)
+- Broker-side SL orders, force exit 3:15 PM, daily loss limit 3%
+- Kill switch, 30-min re-entry cooldown, 17-point pre-flight checklist
+
+### Design Decisions
+- **Single-strategy exception at 90, not 85**: Score 90+ means ~10/11 factors confirmed — more stringent than old 70+ with 2 strategies. A 90-score single signal is higher quality than an 80-score two-strategy signal.
+- **Lunch block shortened, not removed**: 11:30-13:00 is still the worst period. Extended morning (11:00-11:30) still has residual momentum; early afternoon (13:00-13:30) is when momentum rebuilds.
+- **Score 80 not 70**: All other sniper filters still apply. Combined with volume 3×, choppiness, VIX gates, and pre-flight — 80 is still very selective.

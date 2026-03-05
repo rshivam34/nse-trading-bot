@@ -62,24 +62,24 @@ class TradingConfig:
 
     # ── Time windows — only trade during high-probability periods ─────
     trading_window_1_start: time = time(9, 30)
-    trading_window_1_end: time = time(11, 0)
-    trading_window_2_start: time = time(13, 30)
+    trading_window_1_end: time = time(11, 30)
+    trading_window_2_start: time = time(13, 0)
     trading_window_2_end: time = time(14, 30)
 
-    # ── Lunch block — NO new trades during 11:00-13:30 (sniper mode) ──
-    lunch_block_start: time = time(11, 0)
-    lunch_block_end: time = time(13, 30)
+    # ── Lunch block — NO new trades during 11:30-13:00 (relaxed from 11:00-13:30) ──
+    lunch_block_start: time = time(11, 30)
+    lunch_block_end: time = time(13, 0)
 
     # ── Time-based position size scaling ─────────────────────────────
     # Sniper mode: 100% in both active windows, lunch is fully blocked.
-    position_size_window_1_pct: float = 100.0   # 9:30-11:00 — morning momentum
-    position_size_lunch_pct: float = 0.0         # 11:00-13:30 — BLOCKED (sniper mode)
-    position_size_window_2_pct: float = 100.0    # 13:30-14:30 — afternoon momentum
+    position_size_window_1_pct: float = 100.0   # 9:30-11:30 — morning momentum
+    position_size_lunch_pct: float = 0.0         # 11:30-13:00 — BLOCKED (sniper mode)
+    position_size_window_2_pct: float = 100.0    # 13:00-14:30 — afternoon momentum
 
     # ── Signal scoring — only trade if score >= threshold ─────────────
-    # Sniper mode: 85+ required. ~9 out of 11 scoring factors must confirm.
-    # 85+ = strong setup. 90+ = exceptional.
-    min_score_to_trade: int = 85
+    # Sniper mode: 80+ required. ~8 out of 11 scoring factors must confirm.
+    # 80+ = excellent setup. 90+ = exceptional (allows single-strategy exception).
+    min_score_to_trade: int = 80
 
     # ── ORB-specific settings ─────────────────────────────────────────
     orb_min_range_pct: float = 0.3          # Skip if opening range < 0.3%
@@ -111,6 +111,7 @@ class TradingConfig:
 
     # ── Multi-strategy confluence (sniper mode) ───────────────────────
     min_confluence_count: int = 2           # At least 2 strategies must agree
+    single_strategy_exception_score: int = 90  # Allow 1 strategy if score >= 90 (EXCEPTIONAL)
 
     # ── VIX graduated response (sniper mode) ──────────────────────────
     vix_normal_threshold: float = 18.0      # VIX < 18 = normal
