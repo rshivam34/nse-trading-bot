@@ -61,15 +61,15 @@ All three phases are implemented and running live:
 Philosophy: "Fewer, higher-quality trades." Instead of taking every decent signal, the bot now applies 10+ independent filters before executing. Max 3 trades/day, each with strong multi-strategy confluence.
 
 ### Filter Layers (signal must pass ALL):
-1. **Score >= 85** (up from 70) — ~9/11 scoring factors must confirm
-2. **2+ strategy confluence** — at least 2 of 4 strategies agree on same stock + direction
+1. **Score >= 80** (was 85, originally 70) — ~8/11 scoring factors must confirm
+2. **2+ strategy confluence OR score >= 90** — at least 2 of 4 strategies agree, OR single strategy with EXCEPTIONAL score
 3. **Volume >= 3× average** — hard gate, reject below
 4. **Choppiness Index < 61.8** — both stock AND NIFTY must not be choppy
 5. **15-min trend aligned** — 9/21 EMA on 15-min must match signal direction
 6. **Candle close confirmation** — breakout strategies require completed candle above/below level
 7. **ATR expansion** — -10 score penalty if ATR is compressing (breakout strategies)
 8. **VIX < 20** — no new trades in DANGER zone (VIX > 20)
-9. **Not in lunch block** — 11:00-13:30 fully blocked
+9. **Not in lunch block** — 11:30-13:00 fully blocked
 10. **17-point pre-flight checklist** — all safety/risk checks in one place
 
 ### Sniper Mode Config Summary:
@@ -254,10 +254,10 @@ Default fallback: NIFTY 50 liquid stocks (RELIANCE, TCS, HDFCBANK, INFY, etc.).
 - **9:00 AM** — Bot starts, authenticates, adopts positions, loads watchlist
 - **9:15 AM** — Market opens, WebSocket stream begins
 - **9:15–9:30** — Opening Range period (watch only, no trades)
-- **9:30–11:00** — **ACTIVE WINDOW 1**: Morning momentum (100% position size). Best setups happen here.
+- **9:30–11:30** — **ACTIVE WINDOW 1**: Morning momentum (100% position size). Best setups happen here.
 - **10:30 AM** — Market regime determined (TRENDING/VOLATILE/RANGE_BOUND/GAP_DAY)
-- **11:00–1:30 PM** — **LUNCH BLOCK**: No new trades. Fully blocked (0% position size). Existing positions continue to be monitored with normal SL/target logic.
-- **1:30–2:30 PM** — **ACTIVE WINDOW 2**: Afternoon momentum (100% position size). Second chance for setups.
+- **11:30–1:00 PM** — **LUNCH BLOCK**: No new trades. Fully blocked (0% position size). Existing positions continue to be monitored with normal SL/target logic.
+- **1:00–2:30 PM** — **ACTIVE WINDOW 2**: Afternoon momentum (100% position size). Second chance for setups.
 - **2:30 PM** — No new trades. Tighten all SLs to 1× ATR from current price (or 1% if ATR unavailable).
 - **3:00 PM** — Exit any position that is in profit (don't wait for target).
 - **3:15 PM** — Force-exit ALL open positions (regardless of P&L).
@@ -278,10 +278,10 @@ Default fallback: NIFTY 50 liquid stocks (RELIANCE, TCS, HDFCBANK, INFY, etc.).
 11. 30-minute re-entry cooldown per stock after exit (prevents whipsaw).
 12. Kill switch on dashboard immediately cancels all orders and exits positions.
 13. Broker-side SL order placed for every position (exchange-level crash protection).
-14. Signal score >= 85 with 2+ strategy confluence required.
-15. VIX > 20 = no new trades (DANGER mode).
+14. Signal score >= 80 with 2+ strategy confluence required (OR score >= 90 for single-strategy exception).
+15. VIX > 20 = no new trades (DANGER mode). VIX = 0 treated as "no data" (NORMAL).
 16. VIX 18-20 = CAUTION mode (50% position size, 2× ATR stop-loss).
-17. Lunch block: 11:00-13:30 fully blocked for new entries.
+17. Lunch block: 11:30-13:00 fully blocked for new entries.
 18. ATR-based stops (1.5× ATR normal, 2× ATR caution, bounded 0.5%-3% of entry).
 19. Choppiness Index > 61.8 = reject signal (both stock and NIFTY checked independently).
 20. 15-minute trend must align with signal direction (9/21 EMA on 15-min candles).
@@ -307,11 +307,12 @@ Every signal must pass through these 5 layers before execution. Each layer is in
 - All 4 strategies run on every stock every tick
 - Signals grouped by stock + direction
 - At least 2 strategies must agree (e.g., ORB + SR_BREAKOUT both say LONG on RELIANCE)
+- **Exception**: If only 1 strategy fires but pre-scored signal is >= 90 (EXCEPTIONAL), it passes through
 - The best signal (highest base score) represents the group; others are listed in `confluence_strategies`
 
 **Layer 2: Market Environment Gates (scanner.py + risk_manager.py)**
-- **VIX gate**: VIX > 20 → reject all signals (DANGER). VIX 18-20 → allow but reduce size 50% and use 2× ATR SL (CAUTION). VIX < 18 → normal.
-- **Lunch block**: 11:00-13:30 → reject all new signals (0% position size)
+- **VIX gate**: VIX > 20 → reject all signals (DANGER). VIX 18-20 → allow but reduce size 50% and use 2× ATR SL (CAUTION). VIX < 18 → normal. VIX = 0 → treated as "no data" (NORMAL, skips gate).
+- **Lunch block**: 11:30-13:00 → reject all new signals (0% position size)
 - **NIFTY Choppiness**: Choppiness Index of NIFTY > 61.8 → reject (market is ranging, breakouts will fail)
 
 **Layer 3: Stock-Level Filters (scanner.py)**
@@ -326,7 +327,7 @@ Every signal must pass through these 5 layers before execution. Each layer is in
 - Momentum strategies (VWAP_BOUNCE, EMA_CROSSOVER) skip this check
 
 **Layer 5: Score Threshold + Pre-flight Checklist (scanner.py + order_manager.py)**
-- After all filters, the final score must be >= 85 (out of 100)
+- After all filters, the final score must be >= 80 (out of 100)
 - If multiple signals qualify in the same scan cycle, they are ranked by score — only the top 1 is executed
 - Before placing the order, `pre_flight_check()` runs 17 sequential safety checks (capital, margin, daily limits, cooldowns, kill switch, etc.)
 - All signals (including rejected ones) are logged with status tags (EXECUTED, SKIPPED-LUNCH, SKIPPED-VIX, SKIPPED-CHOPPY, etc.) for review
@@ -399,7 +400,7 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 ### All Changes Summary
 | Setting | Old | New |
 |---------|-----|-----|
-| min_signal_score | 70 | 85 |
+| min_signal_score | 70 | 80 (was 85, relaxed Mar 5) |
 | max_trades_per_day | 15 | 3 |
 | max_losing_trades | 3 | 2 |
 | Risk per trade | 2% | 1.5% |
@@ -407,9 +408,9 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 | SL at VIX 18-20 | Same as normal | 2.0× ATR + 50% size |
 | VIX > 20 | Score penalty | NO new trades |
 | Volume minimum | 2× avg | 3× avg hard gate |
-| Strategy confluence | Not required | 2+ must agree |
+| Strategy confluence | Not required | 2+ must agree (OR score >= 90 single exception) |
 | Signal execution | First past threshold | Queue, rank, pick best |
-| Lunch hours 11-1:30 | 50% position size | Fully blocked |
+| Lunch hours 11:30-1:00 | 50% position size | Fully blocked (narrowed from 11:00-1:30) |
 | Target (R:R) | Fixed 2:1 | 2.5R (ATR-based) |
 | Trailing SL distance | Fixed 1% | 1× ATR |
 | Trail activation | 2% profit | 1.5R profit |
@@ -450,7 +451,7 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 
 ### Risk Manager Updates (core/risk_manager.py)
 - VIX graduated response: NORMAL/CAUTION/DANGER
-- Lunch block: 0% position size during 11:00-13:30
+- Lunch block: 0% position size during 11:30-13:00
 - 1.5% risk per trade (down from 2%)
 
 ### New CSV Fields (utils/trade_analytics.py)
@@ -459,12 +460,12 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 ### New Config Fields (config.py)
 - **ATR SL**: `atr_sl_multiplier_normal` (1.5), `atr_sl_multiplier_caution` (2.0), `atr_sl_floor_pct` (0.5), `atr_sl_ceiling_pct` (3.0)
 - **Trailing**: `trailing_activation_r` (1.5), `trailing_sl_atr_multiplier` (1.0)
-- **Confluence**: `min_confluence_count` (2)
+- **Confluence**: `min_confluence_count` (2), `single_strategy_exception_score` (90)
 - **VIX**: `vix_normal_threshold` (18.0), `vix_caution_threshold` (20.0), `vix_caution_size_pct` (50.0), `vix_caution_risk_pct` (0.75)
 - **Choppiness**: `chop_threshold` (61.8), `chop_period` (14)
 - **15-min trend**: `trend_15m_enabled` (True), `trend_15m_flat_threshold_pct` (0.05)
 - **ATR expansion**: `atr_expansion_lookback` (5), `atr_compression_penalty` (10)
-- **Lunch block**: `lunch_block_start` (11:00), `lunch_block_end` (13:30)
+- **Lunch block**: `lunch_block_start` (11:30), `lunch_block_end` (13:00)
 - **Target**: `final_exit_rr` (2.5), `adopted_sl_fallback_pct` (2.5)
 
 ---
@@ -515,9 +516,9 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 - Instrument token cache: currently refreshes if from previous day; may still go stale during very long sessions (>12h unlikely for intraday bot)
 
 ### Design Decisions (not bugs — do not "fix" these)
-- **Confirmation window disabled**: `USE_CONFIRMATION` is off. Signals execute immediately when score >= 85 and all filters pass — no 30-second countdown. This is intentional. The 10+ filter layers and 17-point pre-flight checklist provide far more rigorous gating than a human-in-the-loop delay ever could.
+- **Confirmation window disabled**: `USE_CONFIRMATION` is off. Signals execute immediately when score >= 80 and all filters pass — no 30-second countdown. This is intentional. The 10+ filter layers and 17-point pre-flight checklist provide far more rigorous gating than a human-in-the-loop delay ever could.
 - **Price monitoring uses WebSocket cache, not API**: `monitor_positions()` reads prices from `data_stream.price_cache` (populated on every WebSocket tick). The broker `get_ltp()` API is only called as a fallback if a token has no cached tick yet (rare — only at startup before first tick). This was changed after "Access denied because of exceeding access rate" errors from polling the API for 9 positions every second. API calls are now restricted to: placing orders, modifying/cancelling SL orders, startup position fetch, and margin checks.
-- **Lunch block is a full block, not reduced sizing**: 11:00-13:30 returns 0% position size (not 50%). Lunch-hour signals have historically lower win rates due to low volume and whipsaw. The sniper approach says: don't try to trade bad conditions at reduced size — just don't trade at all.
+- **Lunch block is a full block, not reduced sizing**: 11:30-13:00 returns 0% position size (not 50%). Lunch-hour signals have historically lower win rates due to low volume and whipsaw. The sniper approach says: don't try to trade bad conditions at reduced size — just don't trade at all. Block was narrowed from 11:00-13:30 to 11:30-13:00 to recover 60 minutes of usable trading time.
 - **Volume is a hard gate, not a score modifier**: Volume < 3× average = signal rejected outright. Previous approach added/subtracted score points for volume. Sniper mode treats insufficient volume as a dealbreaker — you cannot enter a breakout in thin volume, period.
 - **Choppiness is checked for both stock AND NIFTY independently**: A trending stock in a choppy market will still fail. A clean-trending market doesn't save a choppy stock. Both must show directional conviction (Choppiness Index < 61.8).
 - **All rejected signals are logged with status tags**: Every signal the scanner evaluates gets tagged (EXECUTED, SKIPPED-LUNCH, SKIPPED-VIX, SKIPPED-CHOPPY, SKIPPED-TREND, SKIPPED-VOLUME, etc.). This is for post-session review to answer: "What did the bot see today? What did it reject and why?"
