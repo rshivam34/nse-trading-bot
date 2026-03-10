@@ -28,10 +28,11 @@ from typing import Optional
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, Signal
+from utils.indicators import calculate_rsi
 
 logger = logging.getLogger(__name__)
 
-MIN_TICKS_NEEDED = 60    # Need 60 ticks for the "30+ min above VWAP" check
+MIN_CANDLES_NEEDED = 6   # Need 6+ five-minute candles (30 min of data)
 SL_BUFFER_PCT = 0.3      # 0.3% SL below/above VWAP
 BOUNCE_THRESHOLD_PCT = 0.2  # Price must be within 0.2% of VWAP
 
@@ -63,7 +64,7 @@ class VWAPBounceStrategy(BaseStrategy):
     ) -> Optional[Signal]:
         """Check for VWAP bounce pattern with full production conditions."""
 
-        if len(candles) < MIN_TICKS_NEEDED:
+        if len(candles) < MIN_CANDLES_NEEDED:
             return None
 
         # VWAP is pre-computed by scanner and passed in context
@@ -147,7 +148,6 @@ class VWAPBounceStrategy(BaseStrategy):
                 round(swing_low, 2) if swing_low < entry else float("inf"),
                 round(entry - risk * self.config.risk_reward_ratio, 2),
             )
-            target = round(entry - risk * self.config.risk_reward_ratio, 2)
 
             return Signal(
                 stock=stock,
@@ -212,7 +212,7 @@ class VWAPBounceStrategy(BaseStrategy):
             if len(candles) < 5:
                 return False
             recent_close = float(candles["Close"].iloc[-1])
-            candle_open = float(candles["Close"].iloc[-5])  # Close 5 ticks ago = "open"
+            candle_open = float(candles["Open"].iloc[-1])
             return recent_close > candle_open
         except Exception:
             return False
@@ -223,40 +223,41 @@ class VWAPBounceStrategy(BaseStrategy):
             if len(candles) < 5:
                 return False
             recent_close = float(candles["Close"].iloc[-1])
-            candle_open = float(candles["Close"].iloc[-5])
+            candle_open = float(candles["Open"].iloc[-1])
             return recent_close < candle_open
         except Exception:
             return False
 
-    def _rsi_not_overbought(self, candles: pd.DataFrame, threshold: float = 70.0) -> bool:
+    def _rsi_not_overbought(self, candles: pd.DataFrame, threshold: float = None) -> bool:
         """True if RSI is not overbought — don't enter long if already stretched."""
+        if threshold is None:
+            threshold = self.config.rsi_overbought_entry  # 75.0 from config
         rsi = self._calc_rsi(candles["Close"])
         return rsi is None or rsi <= threshold
 
-    def _rsi_not_oversold(self, candles: pd.DataFrame, threshold: float = 30.0) -> bool:
+    def _rsi_not_oversold(self, candles: pd.DataFrame, threshold: float = None) -> bool:
         """True if RSI is not oversold — don't enter short if already stretched."""
+        if threshold is None:
+            threshold = self.config.rsi_oversold_entry  # 25.0 from config
         rsi = self._calc_rsi(candles["Close"])
         return rsi is None or rsi >= threshold
 
     def _calc_rsi(self, closes: pd.Series, period: int = 14) -> Optional[float]:
-        """Calculate RSI (14) from close prices."""
+        """Calculate RSI using shared indicator function. Returns None if insufficient data."""
         if len(closes) < period + 1:
             return None
-        delta = closes.diff()
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = (-delta.clip(upper=0)).rolling(period).mean()
-        if loss.iloc[-1] == 0:
-            return 100.0
-        rs = gain.iloc[-1] / loss.iloc[-1]
-        return round(100 - (100 / (1 + rs)), 1)
+        rsi_series = calculate_rsi(closes, period=period)
+        val = float(rsi_series.iloc[-1])
+        return round(val, 1)
 
     def _volume_adequate(self, candles: pd.DataFrame) -> bool:
         """True if current volume is not significantly below average (not a dead market)."""
-        if len(candles) < 21:
+        lookback = self.config.volume_lookback
+        if len(candles) < lookback + 1:
             return True
         vol = candles["Volume"]
         current = vol.iloc[-1]
-        avg = vol.iloc[-21:-1].mean()
+        avg = vol.iloc[-(lookback + 1):-1].mean()
         if avg <= 0:
             return True
         return current >= avg * 0.5   # Volume must be at least 50% of average
@@ -277,7 +278,7 @@ class VWAPBounceStrategy(BaseStrategy):
 
     def _calc_confidence(self, distance_pct: float, nifty_dir: str, direction: str) -> float:
         """Score 0.0-1.0 for the bounce quality."""
-        score = 0.5  # Base (all conditions passed = minimum 0.5)
+        score = 0.4  # Base (all conditions passed = minimum 0.4, matches other strategies)
 
         if distance_pct < 0.05:    # Within 0.05% of VWAP = very precise bounce
             score += 0.3

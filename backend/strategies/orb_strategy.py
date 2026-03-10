@@ -40,6 +40,7 @@ from typing import Optional
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, Signal
+from utils.indicators import calculate_rsi
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +190,7 @@ class ORBStrategy(BaseStrategy):
                 return None
 
         # ── ALL CHECKS PASSED — Build signal ─────────────────────────────
-        # ORB uses final_exit_rr (2.0x) instead of risk_reward_ratio (1.5x)
+        # ORB uses final_exit_rr (2.5x from config.final_exit_rr) for its target
         # because it has a well-defined range and partial exit at 1x is planned.
         if direction == "LONG":
             entry = round(orb_high + buffer, 2)
@@ -252,33 +253,12 @@ class ORBStrategy(BaseStrategy):
         return current_vol >= avg_vol * multiplier
 
     def _calc_rsi(self, closes: pd.Series, period: int = 14) -> Optional[float]:
-        """
-        Calculate RSI (Relative Strength Index) from close prices.
-
-        RSI formula:
-        1. delta = daily price changes
-        2. gain = average of positive deltas over 'period' candles
-        3. loss = average of absolute negative deltas over 'period' candles
-        4. RS = gain / loss
-        5. RSI = 100 - (100 / (1 + RS))
-
-        RSI of 70+ = overbought (price ran up too fast, may reverse)
-        RSI of 30- = oversold (price fell too fast, may bounce)
-        We use 75/25 — wider bands to avoid over-filtering.
-        """
+        """Calculate RSI using shared indicator function. Returns None if insufficient data."""
         if len(closes) < period + 1:
             return None
-
-        delta = closes.diff()
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = (-delta.clip(upper=0)).rolling(period).mean()
-
-        if loss.iloc[-1] == 0:
-            return 100.0  # All gains, no losses — maximum overbought
-
-        rs = gain.iloc[-1] / loss.iloc[-1]
-        rsi = 100 - (100 / (1 + rs))
-        return round(rsi, 1)
+        rsi_series = calculate_rsi(closes, period=period)
+        val = float(rsi_series.iloc[-1])
+        return round(val, 1)
 
     def _too_close_to_prev_levels(self, price: float, prev_day: dict) -> bool:
         """

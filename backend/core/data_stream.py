@@ -25,6 +25,7 @@ Production upgrades:
 import logging
 import threading
 import time
+import uuid
 from typing import Callable, Optional
 
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2  # Angel One WebSocket library
@@ -67,8 +68,10 @@ class DataStream:
         # Token list for re-subscription on reconnect
         self._subscribed_tokens: list = []
 
-        # Correlation ID: a unique string for this subscription session
-        self._correlation_id = "trading_bot_stream"
+        # Correlation ID: unique per connection to prevent subscription accumulation
+        # Angel One tracks subscriptions per correlation ID; reusing the same ID
+        # across reconnects causes subscriptions to double (196 → 392 → 784...)
+        self._correlation_id = f"bot_{uuid.uuid4().hex[:8]}"
 
         # Reconnect settings — exponential backoff (5s → 10s → 20s → 40s → 60s cap)
         self._base_reconnect_delay = 5       # Starting delay (seconds)
@@ -131,13 +134,20 @@ class DataStream:
         return 0.0
 
     def disconnect(self):
-        """Stop streaming and close the WebSocket."""
+        """Stop streaming and close the WebSocket. Waits for thread to exit."""
         self.is_streaming = False
         if self._sws:
             try:
                 self._sws.close_connection()
             except Exception as e:
                 logger.debug(f"WebSocket close error: {e}")
+
+        # Wait for WebSocket thread to finish (prevents zombie reconnects after shutdown)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning("WebSocket thread did not exit within 10s — may reconnect as zombie")
+
         logger.info("Data stream disconnected")
 
     # ──────────────────────────────────────────────────────────
@@ -192,6 +202,9 @@ class DataStream:
                         )
                     else:
                         logger.info("Auth tokens refreshed successfully")
+
+                # Fresh correlation ID per connection to prevent subscription doubling
+                self._correlation_id = f"bot_{uuid.uuid4().hex[:8]}"
 
                 # Create a fresh WebSocket object (always — can't reuse after close)
                 self._sws = SmartWebSocketV2(

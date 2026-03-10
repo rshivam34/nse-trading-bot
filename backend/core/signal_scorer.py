@@ -1,7 +1,7 @@
 """
 Signal Scorer — 0-100 Confidence Score for Every Signal
 =========================================================
-Only signals scoring 70+ get executed. This prevents trading on weak setups.
+Only signals scoring 80+ get executed (Sniper Mode V2 threshold).
 
 Point breakdown (max 115 before cap at 100):
 - ORB breakout:                +15 (strategy already identified a range breakout)
@@ -14,13 +14,12 @@ Point breakdown (max 115 before cap at 100):
 - Price vs prev day close:     +5  (above prev close for longs, below for shorts)
 - News sentiment aligned:      +10 (positive news for longs, negative for shorts)
 - Away from prev day levels:   +5  (not at known support/resistance)
-- Time-of-day bonus:           +5  (in high-probability window 9:30-11 or 1:30-2:30)
+- Time-of-day bonus:           +5  (in high-probability window 9:30-11:30 or 1:00-2:30)
 - India VIX < 15:              +5  (low fear environment = cleaner trends)
 
 Score zones:
-- 70-79: Acceptable — trade it (minimum threshold)
-- 80-89: Good setup — higher confidence
-- 90-100: Excellent — best setups of the day
+- 80-89: Excellent — trade it (minimum threshold, Sniper Mode V2)
+- 90-100: Exceptional — best setups of the day
 
 This scoring ensures we only trade when multiple conditions align,
 not just when one indicator fires a signal.
@@ -160,8 +159,8 @@ class SignalScorer:
 
         # ── TIME-OF-DAY BONUS ────────────────────────────────────────────
         now = datetime.now().time()
-        in_window_1 = time(9, 30) <= now <= time(11, 0)
-        in_window_2 = time(13, 30) <= now <= time(14, 30)
+        in_window_1 = time(9, 30) <= now <= time(11, 30)
+        in_window_2 = time(13, 0) <= now <= time(14, 30)
         breakdown["time_bonus"] = 5 if (in_window_1 or in_window_2) else 0
 
         # ── INDIA VIX BONUS ──────────────────────────────────────────────

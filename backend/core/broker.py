@@ -524,6 +524,32 @@ class BrokerConnection:
             return ltp
         return 0.0
 
+    def get_vix(self) -> float:
+        """
+        Fetch India VIX via REST API (LTP quote).
+
+        Why: Angel One WebSocket doesn't reliably stream India VIX ticks
+        (token 99919000). As a fallback, we poll VIX every few minutes
+        via the REST API. This ensures VIX safety gates always have data.
+
+        Returns VIX value (e.g., 14.5), or 0.0 on failure.
+        """
+        if not self._check_connected():
+            return 0.0
+
+        try:
+            response = self._api_with_retry(
+                self.session.ltpData, "NSE", "India VIX", "99919000"
+            )
+            if response and response.get("status"):
+                ltp = float(response.get("data", {}).get("ltp", 0))
+                if ltp > 0:
+                    return ltp
+        except Exception as e:
+            logger.debug(f"VIX REST API fetch failed: {e}")
+
+        return 0.0
+
     def get_positions(self) -> list:
         """
         Get all open intraday positions from Angel One.
@@ -844,6 +870,200 @@ class BrokerConnection:
         )
 
         return ohlc_results, affordable, ltp_cache
+
+    # ──────────────────────────────────────────────────────────
+    # Intraday Candle Fetch (pre-seed for instant strategy readiness)
+    # ──────────────────────────────────────────────────────────
+
+    def fetch_intraday_candles(self, token: str, exchange: str = "NSE") -> list[dict]:
+        """
+        Fetch today's completed 5-minute intraday candles from Angel One.
+
+        Used at startup to pre-seed the scanner's candle store so that
+        all strategies and indicators (ATR, Choppiness, EMA) are ready
+        immediately instead of waiting 60-110 minutes for enough ticks.
+
+        How it works:
+        - Calls getCandleData with interval=FIVE_MINUTE from 9:15 AM to now
+        - Parses each candle: [timestamp, open, high, low, close, volume]
+        - Skips the last candle if it's still incomplete (current 5-min window)
+
+        Args:
+            token: Instrument token (e.g., "3045" for SBIN)
+            exchange: Exchange name ("NSE" for stocks and indices)
+
+        Returns:
+            List of candle dicts: [{Open, High, Low, Close, Volume}, ...]
+            Empty list on failure (caller falls back to building from ticks).
+        """
+        from utils.rate_limiter import HISTORICAL_LIMITER
+
+        if not self._check_connected():
+            return []
+
+        now = datetime.now()
+        from_date = now.replace(hour=9, minute=15, second=0, microsecond=0)
+
+        # Don't fetch if market hasn't opened yet
+        if now < from_date:
+            return []
+
+        params = {
+            "exchange": exchange,
+            "symboltoken": str(token),
+            "interval": "FIVE_MINUTE",
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": now.strftime("%Y-%m-%d %H:%M"),
+        }
+
+        max_retries = 2
+        backoff_delays = [5, 15]
+
+        for attempt in range(max_retries + 1):
+            try:
+                HISTORICAL_LIMITER.wait()
+
+                response = self._api_with_retry(self.session.getCandleData, params)
+
+                # Check for rate limit error
+                if response and self._is_rate_limit_error(response):
+                    if attempt < max_retries:
+                        delay = backoff_delays[attempt]
+                        logger.warning(
+                            f"Rate limited fetching intraday candles for token {token}. "
+                            f"Backoff {delay}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        time_module.sleep(delay)
+                        continue
+                    else:
+                        return []
+
+                if not response or not response.get("status"):
+                    return []
+
+                raw_candles = response.get("data") or []
+                if not raw_candles:
+                    return []
+
+                # Parse candles: [timestamp, open, high, low, close, volume]
+                # Skip the last candle if it hasn't closed yet (incomplete)
+                candles = []
+                for c in raw_candles:
+                    try:
+                        ts_str = c[0]
+                        # Strip timezone for parsing (Python 3.10 compat)
+                        if "+" in ts_str:
+                            ts_clean = ts_str.rsplit("+", 1)[0]
+                        elif ts_str.endswith("Z"):
+                            ts_clean = ts_str[:-1]
+                        else:
+                            ts_clean = ts_str
+
+                        candle_start = datetime.strptime(ts_clean, "%Y-%m-%dT%H:%M:%S")
+                        candle_end = candle_start + timedelta(minutes=5)
+
+                        # Skip incomplete candle (current window still open)
+                        if candle_end > now:
+                            continue
+
+                        candles.append({
+                            "Open": float(c[1]),
+                            "High": float(c[2]),
+                            "Low": float(c[3]),
+                            "Close": float(c[4]),
+                            "Volume": int(c[5]),
+                        })
+                    except (IndexError, ValueError, TypeError) as e:
+                        logger.debug(f"Skipping malformed candle for token {token}: {e}")
+                        continue
+
+                return candles
+
+            except Exception as e:
+                if attempt < max_retries:
+                    delay = backoff_delays[attempt]
+                    logger.warning(
+                        f"Error fetching intraday candles for token {token}: {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    time_module.sleep(delay)
+                else:
+                    logger.error(
+                        f"Failed to fetch intraday candles for token {token}: {e}"
+                    )
+                    return []
+
+        return []
+
+    def fetch_all_intraday_candles(
+        self,
+        tokens: list[dict],
+        index_tokens: list[dict] | None = None,
+    ) -> dict[str, list[dict]]:
+        """
+        Fetch today's 5-min intraday candles for multiple stocks and indices.
+
+        Used at startup to pre-seed the scanner so all strategies and
+        indicators are immediately ready instead of waiting for WebSocket ticks.
+
+        Args:
+            tokens: List of {token, symbol} dicts for stocks
+            index_tokens: List of {token, symbol, exchange} dicts for NIFTY/BANKNIFTY
+
+        Returns:
+            Dict mapping token string -> list of candle dicts
+        """
+        results: dict[str, list[dict]] = {}
+        total = len(tokens) + (len(index_tokens) if index_tokens else 0)
+
+        if total == 0:
+            return results
+
+        logger.info(f"Fetching intraday 5-min candles for {total} instruments...")
+
+        ok_count = 0
+        fail_count = 0
+        batch_size = 5
+        batch_gap = 2.0  # extra seconds between batches
+
+        # Fetch stock candles (exchange = NSE)
+        for i in range(0, len(tokens), batch_size):
+            batch = tokens[i:i + batch_size]
+            for item in batch:
+                token = item.get("token", "")
+                candles = self.fetch_intraday_candles(token, exchange="NSE")
+                if candles:
+                    results[token] = candles
+                    ok_count += 1
+                else:
+                    fail_count += 1
+
+            done = min(i + batch_size, len(tokens))
+            logger.info(
+                f"Intraday candle fetch: {done}/{total} "
+                f"({ok_count} OK, {fail_count} failed)"
+            )
+
+            if i + batch_size < len(tokens):
+                time_module.sleep(batch_gap)
+
+        # Fetch index candles (NIFTY, BANKNIFTY)
+        if index_tokens:
+            for item in index_tokens:
+                token = item.get("token", "")
+                exchange = item.get("exchange", "NSE")
+                candles = self.fetch_intraday_candles(token, exchange=exchange)
+                if candles:
+                    results[token] = candles
+                    ok_count += 1
+                else:
+                    fail_count += 1
+
+        logger.info(
+            f"Intraday candle fetch complete: {ok_count} OK, {fail_count} failed "
+            f"out of {total} instruments"
+        )
+        return results
 
     def get_funds(self) -> dict:
         """

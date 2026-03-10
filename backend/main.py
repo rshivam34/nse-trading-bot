@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 # How often to push portfolio state to Firebase (in seconds)
 PORTFOLIO_UPDATE_INTERVAL = 5
+HEARTBEAT_INTERVAL = 300  # Log a status heartbeat every 5 minutes
+VIX_POLL_INTERVAL = 300   # Poll VIX via REST API every 5 minutes (WebSocket fallback)
 
 # NSE holidays 2026 (update annually; bot skips these dates)
 NSE_HOLIDAYS_2026 = {
@@ -97,6 +99,13 @@ class TradingBot:
         self.mode = "PAPER" if config.trading.paper_trading else "LIVE"
 
         self._last_portfolio_push = 0.0
+        self._last_heartbeat = 0.0
+        self._last_vix_poll = 0.0     # VIX REST API fallback (WebSocket doesn't deliver VIX)
+        self._vix_ws_received = False  # True if at least one VIX tick arrived via WebSocket
+        self._tick_count = 0          # Total ticks processed since startup
+        self._scan_count = 0          # Total scanner.scan() calls (stock ticks after 9:30)
+        self._positions_exited = False  # Prevents double exit_all_positions calls
+        self._position_lock = threading.Lock()  # Thread safety for position operations
 
         # Core components
         self.broker = BrokerConnection(config.broker, config.trading)
@@ -275,8 +284,20 @@ class TradingBot:
             logger.error("Pre-market checks failed. Bot will not start.")
             return
 
+        # Warn if adopted positions exist on a global risk day
+        # (adopted positions keep their broker-set quantity — risk day only affects NEW trades)
+        if adopted_count > 0 and self.news_fetcher.is_global_risk_day():
+            logger.warning(
+                f"GLOBAL RISK DAY with {adopted_count} adopted positions — "
+                f"adopted positions keep existing size, new trades will be reduced 50%"
+            )
+
         # Step 7: Wire scanner to watchlist
         self.scanner.set_watchlist(self.watchlist)
+
+        # Step 7a: Pre-seed intraday candles (if market already open)
+        # Makes all strategies + indicators ready immediately on late starts
+        self._fetch_intraday_candles()
 
         # Step 8: Set up Firebase listeners
         if self.firebase.is_connected:
@@ -478,7 +499,20 @@ class TradingBot:
         news_sentiment = self.news_fetcher.fetch_all(symbols)
         self.scanner.set_news_sentiment(news_sentiment)
         status["news_loaded"] = bool(news_sentiment)
-        self.firebase.push_news_sentiment(news_sentiment)
+
+        # Push to Firebase with global_risk flag — use a copy so we don't
+        # pollute the scanner's sentiment dict with non-stock keys
+        firebase_news = {**news_sentiment, "global_risk_day": self.news_fetcher.is_global_risk_day()}
+        self.firebase.push_news_sentiment(firebase_news)
+
+        # If global risk day detected, notify risk manager to reduce position sizes
+        if self.news_fetcher.is_global_risk_day():
+            logger.warning(
+                "GLOBAL RISK DAY — geopolitical/macro event detected. "
+                "Position sizes will be reduced by 50%."
+            )
+            self.risk_manager.set_global_risk_day(True)
+
         logger.info(
             f"News sentiment loaded for {len(news_sentiment)} stocks. "
             f"Global risk day: {self.news_fetcher.is_global_risk_day()}"
@@ -507,8 +541,7 @@ class TradingBot:
             f"All systems ready. "
             f"{len(self.watchlist)} stocks loaded. "
             f"Margin: Rs.{status['margin_available']:,.2f}. "
-            f"Market opens in "
-            f"{max(0, (datetime.now().replace(hour=9, minute=15, second=0) - datetime.now()).seconds // 60)} min."
+            f"{'Market already open.' if datetime.now() >= datetime.now().replace(hour=9, minute=15, second=0, microsecond=0) else f'Market opens in {max(0, int((datetime.now().replace(hour=9, minute=15, second=0, microsecond=0) - datetime.now()).total_seconds()) // 60)} min.'}"
         )
         logger.info(status["message"])
         self.firebase.push_premarket_status(status)
@@ -556,6 +589,98 @@ class TradingBot:
 
         return ohlc_results, affordable, ltp_cache
 
+    def _fetch_intraday_candles(self):
+        """
+        Pre-seed today's 5-minute candles from Angel One Historical API.
+
+        This makes all strategies and indicators (ATR, EMA, Choppiness)
+        ready immediately on startup instead of waiting 60-110 minutes
+        for enough WebSocket ticks to build candles.
+
+        Without pre-seeding (bot starts 10:00 AM):
+          - EMA needs 22 candles → first signal at 11:50 AM (inside lunch block!)
+          - ATR/Choppiness need 15 candles → defaults until ~10:30 AM
+
+        With pre-seeding (bot starts 10:00 AM):
+          - 9 completed candles loaded instantly (9:15-10:00)
+          - All strategies ready within seconds of WebSocket connecting
+
+        Only runs if market has been open long enough for at least one
+        completed 5-min candle (after 9:20 AM). Fetches for affordable
+        stocks + NIFTY + BANKNIFTY.
+        """
+        now = datetime.now()
+
+        # Need at least one completed 5-min candle (9:15-9:20)
+        if (now.hour, now.minute) < (9, 20):
+            logger.info(
+                "Intraday candle pre-seed skipped — "
+                "market not open long enough for completed candles"
+            )
+            return
+
+        # Use affordable stocks from capital filter (set in _fetch_prev_day_levels)
+        stocks_to_fetch = getattr(self, "_affordable_stocks", [])
+        if not stocks_to_fetch:
+            stocks_to_fetch = self.watchlist
+
+        # Build index token list (NIFTY + BANKNIFTY for choppiness/context)
+        index_tokens = []
+        if self.nifty_token:
+            index_tokens.append({
+                "token": self.nifty_token,
+                "symbol": "NIFTY",
+                "exchange": "NSE",
+            })
+        if self.banknifty_token:
+            index_tokens.append({
+                "token": self.banknifty_token,
+                "symbol": "BANKNIFTY",
+                "exchange": "NSE",
+            })
+
+        all_candles = self.broker.fetch_all_intraday_candles(
+            tokens=stocks_to_fetch,
+            index_tokens=index_tokens,
+        )
+
+        if not all_candles:
+            logger.warning(
+                "No intraday candles fetched — "
+                "strategies will build candles from WebSocket ticks"
+            )
+            return
+
+        # Seed candles into scanner
+        stock_count = 0
+        max_candle_count = 0
+        for token, candles in all_candles.items():
+            if token == self.nifty_token:
+                self.scanner.seed_nifty_candles(candles)
+            else:
+                self.scanner.seed_candles(token, candles)
+            stock_count += 1
+            max_candle_count = max(max_candle_count, len(candles))
+
+        logger.info(
+            f"Pre-seeded {stock_count} instruments with up to "
+            f"{max_candle_count} candles each — all strategies ready immediately"
+        )
+
+        # Reconstruct ORB ranges if observation period was missed
+        if (now.hour, now.minute) >= (9, 30):
+            orb_count = self.scanner.reconstruct_orb_ranges()
+            if orb_count > 0:
+                logger.info(
+                    f"ORB strategy ACTIVE — ranges reconstructed from "
+                    f"historical candles for {orb_count} stocks"
+                )
+            else:
+                logger.info(
+                    "ORB strategy inactive — no historical candles "
+                    "available for reconstruction"
+                )
+
     # ----------------------------------------------------------------
     # WebSocket Streaming
     # ----------------------------------------------------------------
@@ -587,8 +712,17 @@ class TradingBot:
         if not self.is_running or self.kill_switch_activated:
             return
 
+        self._tick_count += 1
         token = tick.get("token", "")
         now = datetime.now().time()
+
+        # Log first tick to confirm data is flowing
+        if self._tick_count == 1:
+            stock = self.scanner.token_to_symbol.get(token, token)
+            logger.info(
+                f"First tick received: {stock} @ Rs.{tick.get('ltp', 0):.2f} — "
+                f"WebSocket data is flowing"
+            )
 
         # ── INDEX TICKS: update market context and regime detector ──────
         is_index_tick = token in (self.nifty_token, self.banknifty_token, self.vix_token)
@@ -598,11 +732,9 @@ class TradingBot:
                     vix = tick.get("ltp", 0)
                     if vix == 0:
                         logger.warning("VIX tick received with LTP=0 — possible data issue, treating as NORMAL")
-                    self.regime_detector.update_vix(vix)
-                    self.scanner.market_context["vix"] = vix
-                    # Feed VIX to risk_manager and order_manager for sniper mode
-                    self.risk_manager.update_vix(vix)
-                    self.order_manager.set_vix(vix)
+                    else:
+                        self._vix_ws_received = True  # WebSocket is delivering VIX data
+                    self._apply_vix(vix)
                 else:
                     self.scanner.update_market_context(tick)
                     self.regime_detector.update_nifty(tick)
@@ -641,6 +773,7 @@ class TradingBot:
             return
 
         # ── ACTIVE TRADING (9:30 AM - 2:30 PM) ─────────────────────────
+        self._scan_count += 1
         try:
             signals = self.scanner.scan(tick)
         except Exception as e:
@@ -701,6 +834,66 @@ class TradingBot:
             except Exception as fe:
                 logger.debug(f"Firebase portfolio push failed: {fe}")
             self._last_portfolio_push = now_ts
+
+        # ── HEARTBEAT LOG (every 5 min) — proves the bot is alive ──────
+        if now_ts - self._last_heartbeat >= HEARTBEAT_INTERVAL:
+            tokens_with_candles = sum(1 for c in self.scanner.candle_store.values() if c)
+            total_tokens = len(self.scanner.candle_store)
+            all_signals = self.scanner.get_all_signals_today()
+            vix = self.scanner.market_context.get("vix", 0)
+            nifty_dir = self.scanner.market_context.get("nifty_direction", "?")
+
+            logger.info(
+                f"HEARTBEAT | Ticks: {self._tick_count} | Scans: {self._scan_count} | "
+                f"Candles: {tokens_with_candles}/{total_tokens} tokens have data | "
+                f"Signals today: {len(all_signals)} | "
+                f"VIX: {vix:.1f} | NIFTY: {nifty_dir} | "
+                f"Positions: {len(self.order_manager.open_positions)} | "
+                f"Trades: {self.risk_manager.trades_today}"
+            )
+            self._last_heartbeat = now_ts
+
+    def _apply_vix(self, vix: float):
+        """Distribute VIX value to all components that need it."""
+        self.regime_detector.update_vix(vix)
+        self.scanner.market_context["vix"] = vix
+        self.risk_manager.update_vix(vix)
+        self.order_manager.set_vix(vix)
+
+    def _poll_vix(self):
+        """
+        Poll India VIX via REST API as fallback.
+
+        Why: Angel One WebSocket doesn't reliably deliver ticks for India VIX
+        (token 99919000). On 2026-03-09, VIX was 0.0 all day despite being
+        subscribed. This REST fallback polls every 5 minutes to ensure VIX
+        safety gates always have data.
+
+        If WebSocket IS delivering VIX data (_vix_ws_received=True), this
+        method does nothing — no need to waste an API call.
+        """
+        if self._vix_ws_received:
+            return  # WebSocket is working, no need to poll
+
+        now_ts = time.time()
+        if now_ts - self._last_vix_poll < VIX_POLL_INTERVAL:
+            return  # Not time yet
+
+        self._last_vix_poll = now_ts
+        try:
+            vix = self.broker.get_vix()
+            if vix > 0:
+                logger.info(f"VIX polled via REST API: {vix:.2f} (WebSocket not delivering VIX)")
+                self._apply_vix(vix)
+                # Push updated market context to Firebase
+                try:
+                    self.firebase.push_market_context(self.scanner.market_context)
+                except Exception:
+                    pass
+            else:
+                logger.debug("VIX REST API returned 0.0 — no data available")
+        except Exception as e:
+            logger.debug(f"VIX REST poll failed: {e}")
 
     def _determine_and_apply_regime(self):
         """
@@ -847,8 +1040,9 @@ class TradingBot:
         """
         logger.info("WebSocket reconnected -- reconciling positions with broker...")
         try:
-            broker_positions = self.broker.get_positions()
-            self.order_manager.reconcile_positions(broker_positions)
+            with self._position_lock:
+                broker_positions = self.broker.get_positions()
+                self.order_manager.reconcile_positions(broker_positions)
             logger.info("Position reconciliation complete")
         except Exception as e:
             logger.error(f"Position reconciliation failed: {e}")
@@ -899,11 +1093,15 @@ class TradingBot:
                     self._end_of_day()
                     break
 
+                # Poll VIX via REST API if WebSocket isn't delivering it
+                self._poll_vix()
+
                 # Monitor open positions (check SL, trailing SL, partial/full targets)
                 if not config.trading.suggest_only and self.order_manager.open_positions:
-                    closed_positions, partial_updates = (
-                        self.order_manager.monitor_positions()
-                    )
+                    with self._position_lock:
+                        closed_positions, partial_updates = (
+                            self.order_manager.monitor_positions()
+                        )
 
                     for pos in closed_positions:
                         self._on_position_closed(pos)
@@ -927,8 +1125,10 @@ class TradingBot:
         """End-of-day: close all positions, generate report, push to Firebase."""
         logger.info("Running end-of-day routine...")
 
-        if not config.trading.suggest_only:
-            self.order_manager.exit_all_positions()
+        if not config.trading.suggest_only and not self._positions_exited:
+            with self._position_lock:
+                self.order_manager.exit_all_positions()
+            self._positions_exited = True
 
         report = self.portfolio.daily_report()
         self._print_report(report)
@@ -972,8 +1172,10 @@ class TradingBot:
         self.kill_switch_activated = True
         self.is_running = False
 
-        if not config.trading.suggest_only:
-            self.order_manager.exit_all_positions()
+        if not config.trading.suggest_only and not self._positions_exited:
+            with self._position_lock:
+                self.order_manager.exit_all_positions()
+            self._positions_exited = True
 
         report = self.portfolio.daily_report()
         self.firebase.push_daily_report(report)
@@ -986,10 +1188,11 @@ class TradingBot:
         self.is_running = False
         self.data_stream.disconnect()
 
-        # Only exit positions if there are still open ones
-        # (_end_of_day or _on_kill_switch may have already closed them)
-        if not config.trading.suggest_only and self.order_manager.open_positions:
-            self.order_manager.exit_all_positions()
+        # Only exit positions if not already closed by _end_of_day or _on_kill_switch
+        if not config.trading.suggest_only and not self._positions_exited and self.order_manager.open_positions:
+            with self._position_lock:
+                self.order_manager.exit_all_positions()
+            self._positions_exited = True
 
         self.broker.disconnect()
         self.firebase.set_stopped()
@@ -1073,6 +1276,7 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
     bot.start()
 
 

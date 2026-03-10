@@ -147,14 +147,14 @@ def get_current_atr(candles: pd.DataFrame, period: int = 14) -> float:
 def get_current_choppiness(candles: pd.DataFrame, period: int = 14) -> float:
     """
     Get the current Choppiness Index value from candle data.
-    Returns 50.0 (neutral) if insufficient data.
+    Returns 100.0 (maximally choppy = safe default that blocks signals) if insufficient data.
     """
     if len(candles) < period + 1:
-        return 50.0
+        return 100.0
 
     chop = choppiness_index(candles["High"], candles["Low"], candles["Close"], period=period)
     val = chop.iloc[-1]
-    return round(float(val), 1) if not np.isnan(val) else 50.0
+    return round(float(val), 1) if not np.isnan(val) else 100.0
 
 
 def get_15min_trend(candles_5min: pd.DataFrame, flat_threshold_pct: float = 0.05) -> str:

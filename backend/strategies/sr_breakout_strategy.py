@@ -42,7 +42,7 @@ from strategies.base_strategy import BaseStrategy, Signal
 
 logger = logging.getLogger(__name__)
 
-MIN_TICKS_NEEDED = 30  # Need at least 30 ticks for volume analysis
+MIN_CANDLES_NEEDED = 5  # Need 5+ five-minute candles — main logic uses prev-day levels
 VOLUME_SPIKE_MULTIPLIER = 3.0    # Higher bar for S/R breakout confirmation
 LEVEL_BUFFER_PCT = 0.1            # 0.1% buffer to confirm a genuine break
 
@@ -72,7 +72,7 @@ class SRBreakoutStrategy(BaseStrategy):
     ) -> Optional[Signal]:
         """Check if price is breaking a key S/R level with volume confirmation."""
 
-        if len(candles) < MIN_TICKS_NEEDED:
+        if len(candles) < MIN_CANDLES_NEEDED:
             return None
 
         ltp = current_tick.get("ltp", 0)
@@ -132,10 +132,10 @@ class SRBreakoutStrategy(BaseStrategy):
                 if risk <= 0:
                     continue
 
-                # Target is next key level, minimum 2× risk
+                # Target is next key level, minimum config RR × risk
                 target = max(
                     round(next_level if next_level else 0, 2),
-                    round(entry + risk * 2.0, 2),
+                    round(entry + risk * self.config.risk_reward_ratio, 2),
                 )
 
                 self._broken_levels.add(level_key)
@@ -178,9 +178,9 @@ class SRBreakoutStrategy(BaseStrategy):
                     continue
 
                 target = min(
-                    round(next_level if next_level else 0, 2) or round(entry - risk * 2.0, 2),
-                    round(entry - risk * 2.0, 2),
-                ) if next_level else round(entry - risk * 2.0, 2)
+                    round(next_level, 2) if next_level else float("inf"),
+                    round(entry - risk * self.config.risk_reward_ratio, 2),
+                )
 
                 self._broken_levels.add(level_key)
                 confidence = self._calc_confidence(vol_ratio, nifty_dir, "SHORT", not is_above_vwap)
@@ -235,13 +235,14 @@ class SRBreakoutStrategy(BaseStrategy):
         return levels
 
     def _calc_volume_ratio(self, candles: pd.DataFrame) -> float:
-        """Volume ratio: latest candle vs 20-candle average."""
-        if len(candles) < 21:
+        """Volume ratio: latest candle vs N-candle average (uses config.volume_lookback)."""
+        lookback = self.config.volume_lookback
+        if len(candles) < lookback + 1:
             return 1.0
 
         vol_series = candles["Volume"]
         current_vol = vol_series.iloc[-1]
-        avg_vol = vol_series.iloc[-21:-1].mean()
+        avg_vol = vol_series.iloc[-(lookback + 1):-1].mean()
 
         if avg_vol <= 0:
             return 1.0

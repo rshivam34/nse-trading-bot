@@ -614,3 +614,78 @@ At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8%
 - **Single-strategy exception at 90, not 85**: Score 90+ means ~10/11 factors confirmed — more stringent than old 70+ with 2 strategies. A 90-score single signal is higher quality than an 80-score two-strategy signal.
 - **Lunch block shortened, not removed**: 11:30-13:00 is still the worst period. Extended morning (11:00-11:30) still has residual momentum; early afternoon (13:00-13:30) is when momentum rebuilds.
 - **Score 80 not 70**: All other sniper filters still apply. Combined with volume 3×, choppiness, VIX gates, and pre-flight — 80 is still very selective.
+
+---
+
+## STABILITY FIXES (March 10, 2026)
+
+### Problem: Zero trades on 2026-03-09 + multiple infrastructure issues
+- 57,205 single-strategy signals generated, zero 2-strategy confluence achieved
+- 124 afternoon signals that DID achieve confluence were all SKIPPED-CHOPPY (NIFTY choppiness 67-91)
+- VIX stuck at 0.0 all day (WebSocket never delivered VIX ticks)
+- WebSocket subscriptions doubled on every reconnect (196 → 392 → 784 → 1568)
+- Zombie WebSocket thread reconnected after bot shutdown
+- Marketaux API 402 quota exhaustion wasted 50+ failed API calls
+- "Market opens in 1436 min" when market was already open
+
+### 7 Fixes Applied
+
+#### Fix 1: VIX REST API Polling Fallback (CRITICAL)
+- **broker.py**: New `get_vix()` method fetches India VIX via REST LTP API
+- **main.py**: `_poll_vix()` calls broker every 5 minutes in trading loop
+- **main.py**: `_apply_vix()` helper distributes VIX to all components (regime, scanner, risk_manager, order_manager)
+- **Behavior**: If WebSocket delivers VIX ticks (`_vix_ws_received=True`), REST polling is skipped. Otherwise, polls every 5 min.
+- **Root cause**: Angel One WebSocket doesn't reliably stream India VIX (token 99919000). NIFTY/BANKNIFTY work fine.
+
+#### Fix 2: Single-Strategy Exception Lowered (90 → 85)
+- **config.py**: `single_strategy_exception_score` changed from 90 to 85
+- **Why**: On 2026-03-09, 57,205 signals fired but ZERO achieved 2-strategy confluence. Best pre-score was 72. Score 90 was unreachable.
+- Score 85 means ~9/11 scoring factors confirmed. Combined with volume 3×, choppiness, VIX gates, and 17-point pre-flight — still very selective.
+- Pre-flight check #2 reads from config (not hardcoded), so change flows automatically.
+
+#### Fix 3: WebSocket Subscription Doubling Fixed
+- **data_stream.py**: Correlation ID now uses `uuid.uuid4()` instead of static `"trading_bot_stream"`
+- **Why**: Angel One tracks subscriptions per correlation ID. Reusing the same ID across reconnects caused subscriptions to accumulate (196 → 392 → 784 → 1568).
+- Each new connection gets a fresh correlation ID, preventing doubling.
+
+#### Fix 4: Zombie WebSocket Thread After Shutdown
+- **data_stream.py**: `disconnect()` now calls `self._thread.join(timeout=10)` to wait for thread exit
+- **Why**: Previous code set `is_streaming=False` and closed connection, but didn't wait for the thread. The daemon thread could still be mid-reconnect, creating zombie WebSocket connections after bot shutdown.
+
+#### Fix 5: Market-Open Time Calculation Bug
+- **main.py**: Fixed "Market opens in 1436 min" when market is already open
+- **Root cause**: `timedelta.seconds` wraps negative values (Python quirk). Now shows "Market already open" when past 9:15 AM.
+
+#### Fix 6: Log Spam Reduction (57K → ~0 INFO lines)
+- **scanner.py**: "No confluence" messages changed from INFO to DEBUG level
+- **Why**: 57,205 "No confluence" messages (one per single-strategy signal per tick) generated 6.5MB log. These are expected behavior, not actionable.
+
+#### Fix 7: Marketaux API Quota Early Bail-out
+- **news_sentiment.py**: On 402 (Payment Required) or 429 (Rate Limited), stops fetching immediately
+- **news_sentiment.py**: `_fetch_stock_news()` propagates 402/429 errors instead of silently swallowing them
+- **Why**: After quota exhaustion, the old code made 50+ failed API calls (one per stock). Now it stops after the first 402.
+
+#### Fix 8: Intraday Candle Pre-seeding
+- **broker.py**: New `fetch_intraday_candles()` and `fetch_all_intraday_candles()` fetch today's completed 5-min candles from Angel One Historical API
+- **scanner.py**: New `seed_candles()`, `seed_nifty_candles()`, `reconstruct_orb_ranges()` pre-populate candle stores at startup
+- **main.py**: `_fetch_intraday_candles()` called in Step 7a after watchlist is wired
+- **Why**: Without pre-seeding, strategies waited 60-110 minutes for enough ticks to accumulate (EMA needs 22 candles = 110 min). With pre-seeding, all strategies are ready on first tick.
+- **ORB reconstruction**: If bot starts after 9:30 AM, ORB ranges are reconstructed from the first 3 historical candles (9:15-9:30 window)
+- **Rate limiting**: Uses HISTORICAL_LIMITER (1 req/sec), ~55 seconds for 50 stocks + 2 indices
+
+### Updated Sniper Mode Config
+| Setting | Old | New |
+|---------|-----|-----|
+| single_strategy_exception_score | 90 | 85 |
+| VIX data source | WebSocket only | WebSocket + REST API fallback (5 min poll) |
+
+### Safety Rules Unchanged
+- Max 3 trades/day, max 2 losses/day, 1.5% risk/trade
+- Volume >= 3× hard gate, Choppiness < 61.8, ATR-based SL (0.5%-3%)
+- Broker-side SL orders, force exit 3:15 PM, daily loss limit 3%
+- Kill switch, 30-min re-entry cooldown, 17-point pre-flight checklist
+
+### Design Decisions
+- **VIX poll interval is 5 minutes, not per-tick**: VIX changes slowly. Polling every 5 min uses 1 API call and provides sufficient resolution for the NORMAL/CAUTION/DANGER gates.
+- **Single-strategy exception at 85, not 80 or lower**: Score 85 means ~9/11 factors confirmed — more stringent than the 2-strategy confluence at score 80 (where ~8/11 factors confirm). A high-scoring single signal is better quality than a mediocre confluence signal.
+- **"No confluence" is DEBUG, not removed**: The data is still logged for post-session analysis if DEBUG logging is enabled. Just not cluttering the INFO-level production log.

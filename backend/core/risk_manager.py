@@ -9,7 +9,7 @@ Sniper Mode V2 changes:
 - Max 2 losing trades/day (sniper mode is about quality, not quantity)
 - VIX graduated response: NORMAL (<18) / CAUTION (18-20) / DANGER (>20)
 - ATR-based position sizing (risk amount / ATR-based SL distance)
-- Lunch block fully enforced (11:00-13:30 = no new trades)
+- Lunch block fully enforced (11:30-13:00 = no new trades)
 - 1.5% risk per trade (tightened from 2%)
 - 80% margin deployment limit still applies
 
@@ -65,6 +65,13 @@ class RiskManager:
         self.regime_size_multiplier: float = 1.0
         self.regime_sl_multiplier: float = 1.0
 
+        # VIX value for position sizing decisions
+        self._current_vix: float = 0.0
+
+        # Global risk day flag — set when geopolitical/macro events detected in news
+        # Reduces ALL position sizes by 50% (same effect as VIX CAUTION)
+        self._global_risk_day: bool = False
+
     def reset_daily(self):
         """Call this at start of each trading day."""
         self.trades_today = 0
@@ -76,6 +83,7 @@ class RiskManager:
         self._reentry_blocked_until.clear()
         self._deployed_capital = 0.0
         self._deployed_by_stock.clear()
+        self._global_risk_day = False
         self._start_of_day_capital = self.portfolio.current_capital
         self.refresh_margin()  # Get fresh margin at start of day
 
@@ -87,6 +95,17 @@ class RiskManager:
     def update_vix(self, vix: float):
         """Update current VIX value for position sizing decisions."""
         self._current_vix = vix
+
+    def set_global_risk_day(self, is_risk_day: bool):
+        """Set global risk day flag — reduces all position sizes by 50%.
+
+        Called from main.py when news sentiment detects a major geopolitical
+        or macro event (e.g., USA-Iran tensions, trade war, oil shock).
+        Effect: same as VIX CAUTION — 50% position size reduction.
+        """
+        self._global_risk_day = is_risk_day
+        if is_risk_day:
+            logger.warning("Global risk day ACTIVE — all position sizes reduced 50%")
 
     def mark_stock_active(self, stock: str):
         """Record that we have an open position in this stock."""
@@ -176,6 +195,7 @@ class RiskManager:
         # Rule 3: Daily loss limit (3% of starting capital)
         if self.daily_loss_limit_hit():
             signal.reason = "Daily loss limit hit (3% of capital)"
+            signal.status = "SKIPPED-DAILY-LOSS-LIMIT"
             return False
 
         # Rule 4: No trading after cutoff time
@@ -197,7 +217,7 @@ class RiskManager:
 
         # Rule 6: Consecutive loss circuit breaker + cooldown
         if self._is_in_cooldown():
-            remaining = (self._cooldown_until - datetime.now()).seconds // 60
+            remaining = int((self._cooldown_until - datetime.now()).total_seconds()) // 60
             signal.reason = (
                 f"Consecutive loss cooldown — {remaining} min remaining"
             )
@@ -212,7 +232,7 @@ class RiskManager:
         if signal.stock in self._reentry_blocked_until:
             block_until = self._reentry_blocked_until[signal.stock]
             if datetime.now() < block_until:
-                remaining = (block_until - datetime.now()).seconds // 60
+                remaining = int((block_until - datetime.now()).total_seconds()) // 60
                 signal.reason = (
                     f"Re-entry blocked for {signal.stock} "
                     f"({remaining} min remaining of {self.config.reentry_cooldown_minutes}-min cooldown)"
@@ -402,7 +422,7 @@ class RiskManager:
 
         # VIX graduated response: reduce risk in caution mode
         vix = getattr(self, '_current_vix', 0)
-        if vix >= self.config.vix_normal_threshold and vix < self.config.vix_caution_threshold:
+        if vix >= self.config.vix_normal_threshold and vix <= self.config.vix_caution_threshold:
             risk_pct = self.config.vix_caution_risk_pct  # 0.75%
             logger.info(
                 f"VIX={vix:.1f} -> CAUTION: risk reduced to {risk_pct}% per trade"
@@ -422,9 +442,14 @@ class RiskManager:
         scaled_qty = int(base_qty * time_pct / 100)
 
         # Apply VIX caution size scaling
-        if vix >= self.config.vix_normal_threshold and vix < self.config.vix_caution_threshold:
+        if vix >= self.config.vix_normal_threshold and vix <= self.config.vix_caution_threshold:
             vix_size_pct = self.config.vix_caution_size_pct / 100  # 50%
             scaled_qty = int(scaled_qty * vix_size_pct)
+
+        # Apply global risk day scaling (geopolitical/macro event → 50% size)
+        if self._global_risk_day:
+            scaled_qty = int(scaled_qty * 0.5)
+            logger.info("Global risk day: position size halved")
 
         # Apply regime scaling
         regime_qty = int(scaled_qty * self.regime_size_multiplier)
@@ -436,9 +461,9 @@ class RiskManager:
         Position size % based on time of day.
 
         Sniper mode:
-        9:30-11:00:  100% — morning momentum, highest quality signals
-        11:00-13:30: 0%   — BLOCKED (lunch block, no new trades)
-        13:30-14:30: 100% — afternoon momentum
+        9:30-11:30:  100% — morning momentum, highest quality signals
+        11:30-13:00: 0%   — BLOCKED (lunch block, no new trades)
+        13:00-14:30: 100% — afternoon momentum
         """
         w1_start = self.config.trading_window_1_start
         w1_end = self.config.trading_window_1_end
@@ -446,11 +471,11 @@ class RiskManager:
         w2_end = self.config.trading_window_2_end
 
         if w1_start <= now <= w1_end:
-            return self.config.position_size_window_1_pct   # 100%
+            return 100.0   # Morning momentum window
         elif w2_start <= now <= w2_end:
-            return self.config.position_size_window_2_pct   # 100%
+            return 100.0   # Afternoon momentum window
         elif w1_end < now < w2_start:
-            return self.config.position_size_lunch_pct      # 0% (lunch block)
+            return 0.0     # Lunch block — no new trades
         else:
             return 100.0  # Default (outside normal windows but before cutoff)
 

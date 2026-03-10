@@ -70,12 +70,6 @@ class TradingConfig:
     lunch_block_start: time = time(11, 30)
     lunch_block_end: time = time(13, 0)
 
-    # ── Time-based position size scaling ─────────────────────────────
-    # Sniper mode: 100% in both active windows, lunch is fully blocked.
-    position_size_window_1_pct: float = 100.0   # 9:30-11:30 — morning momentum
-    position_size_lunch_pct: float = 0.0         # 11:30-13:00 — BLOCKED (sniper mode)
-    position_size_window_2_pct: float = 100.0    # 13:00-14:30 — afternoon momentum
-
     # ── Signal scoring — only trade if score >= threshold ─────────────
     # Sniper mode: 80+ required. ~8 out of 11 scoring factors must confirm.
     # 80+ = excellent setup. 90+ = exceptional (allows single-strategy exception).
@@ -111,7 +105,7 @@ class TradingConfig:
 
     # ── Multi-strategy confluence (sniper mode) ───────────────────────
     min_confluence_count: int = 2           # At least 2 strategies must agree
-    single_strategy_exception_score: int = 90  # Allow 1 strategy if score >= 90 (EXCEPTIONAL)
+    single_strategy_exception_score: int = 85  # Allow 1 strategy if score >= 85 (was 90 — too strict, 57K signals but zero confluence on 2026-03-09)
 
     # ── VIX graduated response (sniper mode) ──────────────────────────
     vix_normal_threshold: float = 18.0      # VIX < 18 = normal
@@ -157,7 +151,6 @@ class TradingConfig:
     # ── Time-based exit rules ──────────────────────────────────────────
     late_session_sl_pct: float = 1.0        # Tighten SL to 1% after 2:30 PM
     profit_exit_time: time = time(15, 0)    # Exit any in-profit position after 3:00 PM
-    late_session_start: time = time(14, 30) # When to start tightening SLs
 
     # ── Re-entry prevention ────────────────────────────────────────────
     reentry_cooldown_minutes: int = 30      # Block re-entry for 30 min after exiting a stock
@@ -248,6 +241,14 @@ class TradingConfig:
     ohlc_batch_size: int = int(os.getenv("OHLC_BATCH_SIZE", "5"))
     ohlc_batch_gap: float = float(os.getenv("OHLC_BATCH_GAP", "2.0"))
     ohlc_max_retries: int = int(os.getenv("OHLC_MAX_RETRIES", "2"))
+
+    def __post_init__(self):
+        """Validate config values to catch misconfiguration early."""
+        assert self.max_trades_per_day > 0, "max_trades_per_day must be > 0"
+        assert self.max_losses_per_day > 0, "max_losses_per_day must be > 0"
+        assert self.atr_sl_floor_pct < self.atr_sl_ceiling_pct, "ATR SL floor must be < ceiling"
+        assert 0 < self.max_risk_per_trade_pct <= 5, "risk per trade must be 0-5%"
+        assert self.lunch_block_start < self.lunch_block_end, "lunch block start must be before end"
 
 
 @dataclass

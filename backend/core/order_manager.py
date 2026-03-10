@@ -176,6 +176,9 @@ class OrderManager:
         # Used to detect and cancel unfilled LIMIT orders after timeout
         self._pending_orders: dict[str, dict] = {}
 
+        # VIX value for pre-flight checks
+        self._current_vix: float = 0.0
+
         # WebSocket price cache reference — set via set_data_stream() after construction.
         # Used by monitor_positions() to read live prices without any API calls.
         self._data_stream = None
@@ -250,14 +253,14 @@ class OrderManager:
                     logger.warning(f"Skipping {symbol}: invalid avg price {avg_price}")
                     continue
 
-                # Calculate SL at 2.5% from entry
+                # Calculate SL at 2.5% from entry, target at 2.5R (config.risk_reward_ratio)
                 sl_distance = avg_price * 0.025
                 if direction == "LONG":
                     stop_loss = round(avg_price - sl_distance, 2)
-                    target = round(avg_price + sl_distance * 2, 2)  # 2:1 RR
+                    target = round(avg_price + sl_distance * self.config.risk_reward_ratio, 2)
                 else:
                     stop_loss = round(avg_price + sl_distance, 2)
-                    target = round(avg_price - sl_distance * 2, 2)
+                    target = round(avg_price - sl_distance * self.config.risk_reward_ratio, 2)
 
                 # Create a synthetic Signal for this adopted position
                 signal = Signal(
@@ -434,7 +437,7 @@ class OrderManager:
         ok = signal.score >= self.config.min_score_to_trade
         checks.append((f"Signal score >= {self.config.min_score_to_trade}", ok, f"score={signal.score}"))
 
-        # Check 2: Confluence >= 2 OR exceptional single-strategy (score >= 90)
+        # Check 2: Confluence >= 2 OR exceptional single-strategy (score >= config threshold)
         ok = (signal.confluence_count >= self.config.min_confluence_count or
               signal.score >= self.config.single_strategy_exception_score)
         checks.append((
@@ -470,9 +473,9 @@ class OrderManager:
         checks.append(("Choppiness < 61.8", ok, f"CHOP={signal.choppiness:.1f}"))
 
         # Check 9: NIFTY Choppiness < 61.8
-        nifty_chop = 50.0
+        nifty_chop = 100.0
         if scanner:
-            nifty_chop = scanner.market_context.get("nifty_choppiness", 50.0)
+            nifty_chop = scanner.market_context.get("nifty_choppiness", 100.0)
         ok = nifty_chop <= self.config.chop_threshold
         checks.append(("NIFTY CHOP < 61.8", ok, f"NIFTY_CHOP={nifty_chop:.1f}"))
 
@@ -716,7 +719,7 @@ class OrderManager:
         self._check_pending_timeouts()
 
         now = datetime.now().time()
-        is_late_session = now >= self.config.late_session_start
+        is_late_session = now >= self.config.no_new_trades_after
         is_profit_exit_time = now >= self.config.profit_exit_time
 
         for pos in self.open_positions[:]:
@@ -828,6 +831,8 @@ class OrderManager:
             if is_late_session and not is_profit_exit_time:
                 # After 2:30 PM: tighten SL to 1% from current price
                 # Use ATR if available, else fall back to fixed 1%
+                # ATR is from signal creation time (intentional): using entry ATR provides
+                # consistent risk measurement. Fresh ATR would shift the goalposts mid-trade.
                 atr = getattr(pos.signal, "atr_value", 0)
                 if atr > 0:
                     late_sl_distance = atr * self.config.trailing_sl_atr_multiplier  # 1× ATR
@@ -1014,8 +1019,11 @@ class OrderManager:
 
         pos.status = "PARTIAL"
 
-        # Place new broker SL order for remaining quantity
-        new_sl_price = max(pos.effective_sl, pos.trailing_sl) if pos.signal.direction == "LONG" else min(pos.effective_sl, pos.trailing_sl) if pos.trailing_sl > 0 else pos.effective_sl
+        # Place new broker SL order for remaining quantity at the tighter SL level
+        if pos.signal.direction == "LONG":
+            pos.effective_sl = max(pos.effective_sl, pos.trailing_sl)
+        elif pos.trailing_sl > 0:
+            pos.effective_sl = min(pos.effective_sl, pos.trailing_sl)
         sl_id = self._place_broker_sl_order(pos)
         if sl_id:
             pos.sl_order_id = sl_id

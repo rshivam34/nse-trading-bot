@@ -61,9 +61,9 @@ def calculate_trade_viability(
     stt = position_value * 0.00025                      # 0.025% sell side
     exchange_txn = position_value * 0.0000297 * 2       # both sides
     gst = (total_brokerage + exchange_txn) * 0.18       # 18% GST
-    sebi_stamp = position_value * 0.00003               # negligible
+    stamp_duty = position_value * 0.00003                # 0.003% stamp duty
 
-    total_charges = total_brokerage + stt + exchange_txn + gst + sebi_stamp
+    total_charges = total_brokerage + stt + exchange_txn + gst + stamp_duty
 
     # Required price move to achieve min_net_profit
     required_profit = total_charges + min_net_profit
@@ -137,13 +137,13 @@ def filter_stocks_by_capital(
                 else:
                     skipped.append((symbol, ltp, reason))
             else:
-                # If LTP fetch fails, include stock (fail-open, not fail-closed)
-                logger.debug(f"LTP fetch returned no data for {symbol}, including anyway")
-                affordable.append(stock)
+                # If LTP fetch fails, exclude stock (fail-closed — don't risk unaffordable stocks)
+                logger.warning(f"LTP fetch returned no data for {symbol}, excluding")
+                skipped.append((symbol, 0, "LTP fetch failed — no data"))
 
         except Exception as e:
-            logger.debug(f"LTP fetch failed for {symbol}: {e}, including anyway")
-            affordable.append(stock)
+            logger.warning(f"LTP fetch failed for {symbol}: {e}, excluding")
+            skipped.append((symbol, 0, f"LTP fetch error: {e}"))
             time.sleep(2.0)  # extra pause on error
 
         # Progress log every 50 stocks

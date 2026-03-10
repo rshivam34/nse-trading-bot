@@ -21,7 +21,7 @@ SL placement:
 - LONG: Below the recent swing low from last 10 ticks
 - SHORT: Above the recent swing high from last 10 ticks
 
-Target: 2× risk from entry
+Target: 2.5× risk from entry (overridden by scanner ATR-based SL/target)
 
 This strategy produces fewer but higher-quality signals than ORB.
 Best on trending days (after regime detection shows TRENDING).
@@ -33,10 +33,11 @@ from typing import Optional
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, Signal
+from utils.indicators import calculate_rsi
 
 logger = logging.getLogger(__name__)
 
-MIN_TICKS_NEEDED = 30            # Need 30+ ticks for meaningful 21-EMA calculation
+MIN_CANDLES_NEEDED = 22          # Need 22+ five-minute candles for meaningful 21-EMA
 MIN_EMA_SEPARATION_PCT = 0.05   # EMAs must be at least 0.05% apart to count as crossover
 
 
@@ -63,7 +64,7 @@ class EMACrossoverStrategy(BaseStrategy):
     ) -> Optional[Signal]:
         """Check if EMA9 just crossed EMA21 with all production confirmations."""
 
-        if len(candles) < MIN_TICKS_NEEDED:
+        if len(candles) < MIN_CANDLES_NEEDED:
             return None
 
         closes = candles["Close"]
@@ -91,6 +92,8 @@ class EMACrossoverStrategy(BaseStrategy):
 
         # ── Pre-checks that apply to both directions ──────────────────────
         # EMA separation must be meaningful (not just noise)
+        if ema_slow == 0:
+            return None  # Prevent division by zero on zero-valued EMA
         separation_pct = abs(ema_fast - ema_slow) / ema_slow * 100
         if separation_pct < MIN_EMA_SEPARATION_PCT:
             return None  # EMAs too close — crossover signal is noise
@@ -116,7 +119,7 @@ class EMACrossoverStrategy(BaseStrategy):
             if risk <= 0 or sl >= entry:
                 return None
 
-            target = round(entry + risk * self.config.risk_reward_ratio * 2, 2)
+            target = round(entry + risk * self.config.risk_reward_ratio, 2)
 
             separation_str = f"{separation_pct:.3f}%"
             confidence = self._calc_confidence(ema_fast, ema_slow, nifty_dir, "LONG")
@@ -158,8 +161,13 @@ class EMACrossoverStrategy(BaseStrategy):
             if risk <= 0 or sl <= entry:
                 return None
 
-            target = round(entry - risk * self.config.risk_reward_ratio * 2, 2)
+            target = round(entry - risk * self.config.risk_reward_ratio, 2)
             confidence = self._calc_confidence(ema_fast, ema_slow, nifty_dir, "SHORT")
+
+            logger.info(
+                f"EMA crossover SHORT: {stock} | EMA9={ema_fast:.2f}, EMA21={ema_slow:.2f} | "
+                f"Sep: {separation_pct:.3f}% | NIFTY: {nifty_dir}"
+            )
 
             return Signal(
                 stock=stock,
@@ -201,16 +209,8 @@ class EMACrossoverStrategy(BaseStrategy):
         if len(candles) < period + 1:
             return True  # Not enough data — give benefit of the doubt
 
-        closes = candles["Close"]
-        delta = closes.diff()
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = (-delta.clip(upper=0)).rolling(period).mean()
-
-        if loss.iloc[-1] == 0:
-            rsi = 100.0
-        else:
-            rs = gain.iloc[-1] / loss.iloc[-1]
-            rsi = 100 - (100 / (1 + rs))
+        rsi_series = calculate_rsi(candles["Close"], period=period)
+        rsi = float(rsi_series.iloc[-1])
 
         if direction == "LONG":
             return rsi <= self.config.rsi_overbought_entry   # Not overbought

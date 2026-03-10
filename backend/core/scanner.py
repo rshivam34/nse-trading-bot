@@ -12,7 +12,7 @@ Sniper Mode changes:
 - 15-minute trend filter: only trade in direction of higher timeframe
 - ATR expansion check: -10 score penalty if ATR compressing on breakouts
 - Candle close confirmation: breakout strategies require candle close above level
-- Lunch block: 11:00-13:30 fully blocked for new entries
+- Lunch block: 11:30-13:00 fully blocked for new entries
 - All signals logged with status tags: EXECUTED/QUEUED/SKIPPED-*
 
 Flow:
@@ -26,6 +26,7 @@ Flow:
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -68,6 +69,18 @@ class PatternScanner:
         # Price data: token → list of ticks (ring buffer, last 500)
         self.tick_buffer: dict[str, list] = {}
 
+        # Completed 5-minute candles per token (built from tick LTP data)
+        self.candle_store: dict[str, list[dict]] = {}
+        # Track current candle window start per token
+        self._candle_window_start: dict[str, float] = {}
+        # Ticks in the current (incomplete) 5-min window per token
+        self._current_window_ticks: dict[str, list] = {}
+
+        # Completed 5-minute NIFTY candles
+        self.nifty_candle_store: list[dict] = []
+        self._nifty_candle_window_start: float = 0.0
+        self._nifty_current_window_ticks: list = []
+
         # ORB range tracking (high/low during 9:15-9:30)
         self.orb_highs: dict[str, float] = {}
         self.orb_lows: dict[str, float] = {}
@@ -77,7 +90,7 @@ class PatternScanner:
             "nifty_direction": "NEUTRAL",
             "nifty_ltp": 0.0,
             "vix": 0.0,
-            "nifty_choppiness": 50.0,
+            "nifty_choppiness": 100.0,
             "vix_regime": "NORMAL",
         }
 
@@ -120,6 +133,46 @@ class PatternScanner:
         self.news_sentiment = sentiment
         logger.info(f"News sentiment set for {len(sentiment)} stocks")
 
+    def seed_candles(self, token: str, candles: list[dict]):
+        """
+        Pre-seed candle history for a stock from historical API data.
+
+        Called at startup to give strategies immediate access to enough
+        candles for indicators (ATR needs 14, EMA needs 22, Choppiness needs 14).
+        After seeding, the next WebSocket tick continues seamlessly —
+        it starts a new 5-min window while the historical candles persist.
+
+        Args:
+            token: Instrument token string (e.g., "3045")
+            candles: List of completed 5-min candle dicts
+                     [{Open, High, Low, Close, Volume}, ...]
+        """
+        if not candles:
+            return
+
+        self.candle_store[token] = list(candles)
+        # Set window start to now — next tick starts a fresh 5-min window
+        self._candle_window_start[token] = time.time()
+        self._current_window_ticks[token] = []
+
+    def seed_nifty_candles(self, candles: list[dict]):
+        """
+        Pre-seed NIFTY candle history for choppiness calculation.
+
+        Without pre-seeding, NIFTY choppiness defaults to 50.0 until
+        ~75 minutes of ticks accumulate (15 candles × 5 min each).
+        With pre-seeding, it's accurate from the first NIFTY tick.
+
+        Args:
+            candles: List of completed 5-min NIFTY candle dicts
+        """
+        if not candles:
+            return
+
+        self.nifty_candle_store = list(candles)
+        self._nifty_candle_window_start = time.time()
+        self._nifty_current_window_ticks = []
+
     def update_orb_range(self, tick: dict):
         """Called during 9:15-9:30 to track the opening range."""
         token = tick["token"]
@@ -140,6 +193,66 @@ class PatternScanner:
                     high=self.orb_highs[token],
                     low=self.orb_lows[token],
                 )
+
+    def reconstruct_orb_ranges(self) -> int:
+        """
+        Reconstruct ORB ranges from pre-seeded historical candles.
+
+        Called on late starts (after 9:30 AM) when the live ORB observation
+        window was missed. Uses the first 3 candles in candle_store
+        (= the 9:15-9:20, 9:20-9:25, 9:25-9:30 windows) to compute
+        orb_high = max(High) and orb_low = min(Low), which is mathematically
+        equivalent to tracking every tick during 9:15-9:30.
+
+        Returns:
+            Number of stocks with ORB ranges successfully reconstructed.
+        """
+        orb_strategy = None
+        for strat in self.strategies:
+            if isinstance(strat, ORBStrategy):
+                orb_strategy = strat
+                break
+
+        if orb_strategy is None:
+            logger.warning("ORB strategy not found — cannot reconstruct ranges")
+            return 0
+
+        count = 0
+        skipped = 0
+        for token, candles in self.candle_store.items():
+            # Skip indices (NIFTY/BANKNIFTY) — they don't trade via ORB
+            stock = self.token_to_symbol.get(token)
+            if stock is None:
+                continue
+
+            # Need at least the first 3 candles (9:15-9:30 window)
+            orb_candles = candles[:3]
+            if len(orb_candles) < 3:
+                skipped += 1
+                continue
+
+            orb_high = max(c["High"] for c in orb_candles)
+            orb_low = min(c["Low"] for c in orb_candles)
+
+            # Sanity check — skip invalid ranges
+            if orb_high <= 0 or orb_low <= 0 or orb_high <= orb_low:
+                skipped += 1
+                continue
+
+            # Update scanner tracking
+            self.orb_highs[token] = orb_high
+            self.orb_lows[token] = orb_low
+
+            # Set range in ORB strategy (same path as live tracking)
+            orb_strategy.set_orb_range(stock=stock, high=orb_high, low=orb_low)
+            count += 1
+
+        logger.info(
+            f"ORB reconstruction: {count} stocks reconstructed, {skipped} skipped "
+            f"(insufficient candles or invalid data)"
+        )
+
+        return count
 
     def get_all_signals_today(self) -> list[Signal]:
         """Return all signals generated today (including skipped) for Firebase."""
@@ -166,7 +279,13 @@ class PatternScanner:
         if token in self.signals_today:
             return []
 
-        # Build tick buffer
+        # Skip stocks flagged by news sentiment (earnings day, major events)
+        stock_sentiment = self.news_sentiment.get(stock, {})
+        if stock_sentiment.get("skip_today", False):
+            return []
+
+        # Build tick buffer (tag with arrival time for 5-min candle building)
+        tick["_time"] = time.time()
         if token not in self.tick_buffer:
             self.tick_buffer[token] = []
         buf = self.tick_buffer[token]
@@ -207,18 +326,47 @@ class PatternScanner:
         confluence_strategies = []
 
         # Check LONG confluence
+        long_candidate = None
+        long_conf_count = 0
         if len(long_signals) >= self.trading_config.min_confluence_count:
-            confluence_count = len(long_signals)
-            confluence_strategies = [s.strategy_name for s in long_signals]
-            # Use the signal with highest confidence as the base
-            confluent_signal = max(long_signals, key=lambda s: s.confidence)
+            long_conf_count = len(long_signals)
+            long_candidate = max(long_signals, key=lambda s: s.confidence)
 
-        # Check SHORT confluence (prefer whichever has more strategies)
+        # Check SHORT confluence
+        short_candidate = None
+        short_conf_count = 0
         if len(short_signals) >= self.trading_config.min_confluence_count:
-            if confluence_count == 0 or len(short_signals) > confluence_count:
-                confluence_count = len(short_signals)
+            short_conf_count = len(short_signals)
+            short_candidate = max(short_signals, key=lambda s: s.confidence)
+
+        # Pick direction: prefer higher confidence (quality), then more strategies
+        if long_candidate and short_candidate:
+            if long_candidate.confidence > short_candidate.confidence:
+                confluent_signal = long_candidate
+                confluence_count = long_conf_count
+                confluence_strategies = [s.strategy_name for s in long_signals]
+            elif short_candidate.confidence > long_candidate.confidence:
+                confluent_signal = short_candidate
+                confluence_count = short_conf_count
                 confluence_strategies = [s.strategy_name for s in short_signals]
-                confluent_signal = max(short_signals, key=lambda s: s.confidence)
+            else:
+                # Equal confidence — pick whichever has more strategies
+                if short_conf_count > long_conf_count:
+                    confluent_signal = short_candidate
+                    confluence_count = short_conf_count
+                    confluence_strategies = [s.strategy_name for s in short_signals]
+                else:
+                    confluent_signal = long_candidate
+                    confluence_count = long_conf_count
+                    confluence_strategies = [s.strategy_name for s in long_signals]
+        elif long_candidate:
+            confluent_signal = long_candidate
+            confluence_count = long_conf_count
+            confluence_strategies = [s.strategy_name for s in long_signals]
+        elif short_candidate:
+            confluent_signal = short_candidate
+            confluence_count = short_conf_count
+            confluence_strategies = [s.strategy_name for s in short_signals]
 
         # If no confluence, check for exceptional single-strategy exception
         if confluent_signal is None:
@@ -252,7 +400,7 @@ class PatternScanner:
                     )
                     self._all_signals_today.append(s)
                 if raw_signals:
-                    logger.info(
+                    logger.debug(
                         f"No confluence for {stock}: {[s.strategy_name for s in raw_signals]} "
                         f"(need {self.trading_config.min_confluence_count}+ or score >= {exception_score}, "
                         f"best pre-score={temp_score})"
@@ -316,7 +464,7 @@ class PatternScanner:
             return []
 
         # ── Step 3d: NIFTY choppiness gate ─────────────────────────────
-        nifty_chop = self.market_context.get("nifty_choppiness", 50.0)
+        nifty_chop = self.market_context.get("nifty_choppiness", 100.0)
         if nifty_chop > self.trading_config.chop_threshold:
             confluent_signal.status = "SKIPPED-CHOPPY"
             confluent_signal.skip_reason = f"NIFTY Choppiness {nifty_chop} > {self.trading_config.chop_threshold}"
@@ -467,7 +615,7 @@ class PatternScanner:
         Target = entry ± (SL distance × 2.5R).
         """
         # Choose ATR multiplier based on VIX regime
-        if vix > 0 and vix >= self.trading_config.vix_normal_threshold:
+        if vix > 0 and vix >= self.trading_config.vix_normal_threshold and vix <= self.trading_config.vix_caution_threshold:
             atr_mult = self.trading_config.atr_sl_multiplier_caution
         else:
             atr_mult = self.trading_config.atr_sl_multiplier_normal
@@ -597,12 +745,14 @@ class PatternScanner:
             return None
 
     def _calc_volume_ratio(self, candles: pd.DataFrame, lookback: int = 20) -> float:
-        """Volume ratio: current tick vs 20-candle average."""
-        if len(candles) < lookback + 1:
-            return 1.0
+        """Volume ratio: current candle vs average of previous candles (adaptive lookback)."""
+        if len(candles) < 3:
+            return 1.0  # Not enough candles for any comparison
+        # Use adaptive lookback — compare to whatever history we have
+        actual_lookback = min(lookback, len(candles) - 1)
         vol = candles["Volume"]
         current = vol.iloc[-1]
-        avg = vol.iloc[-(lookback + 1):-1].mean()
+        avg = vol.iloc[-(actual_lookback + 1):-1].mean()
         if avg <= 0:
             return 1.0
         return round(current / avg, 2)
@@ -622,24 +772,84 @@ class PatternScanner:
         return ", ".join(missing[:5]) if missing else "none"
 
     def _build_candles(self, token: str) -> pd.DataFrame:
-        """Convert raw ticks into OHLCV DataFrame with per-tick volume (diff)."""
+        """
+        Build proper 5-minute OHLCV candles from tick LTP data (incremental).
+
+        Each tick from Angel One carries the DAY's cumulative open/high/low,
+        NOT per-candle values. So we build candles from LTP:
+        - Open  = first LTP in the 5-min window
+        - High  = max LTP in the 5-min window
+        - Low   = min LTP in the 5-min window
+        - Close = last LTP in the 5-min window
+        - Volume = cumulative volume at end minus start of window
+
+        Called on every tick — only processes the latest tick (O(1) per call).
+        Completed candles persist in candle_store across calls.
+        """
         ticks = self.tick_buffer.get(token, [])
         if not ticks:
             return pd.DataFrame()
 
-        recent = ticks[-200:]
-        data = [{
-            "Open": t.get("open", t["ltp"]),
-            "High": t.get("high", t["ltp"]),
-            "Low": t.get("low", t["ltp"]),
-            "Close": t["ltp"],
-            "Volume": t.get("volume", 0),
-            "AvgPrice": t.get("avg_price", t["ltp"]),
-        } for t in recent]
+        latest_tick = ticks[-1]
+        tick_time = latest_tick.get("_time", 0)
+        if tick_time == 0:
+            return pd.DataFrame()
 
-        df = pd.DataFrame(data)
-        df["Volume"] = df["Volume"].diff().fillna(0).clip(lower=0)
-        return df
+        candle_interval = 300  # 5 minutes in seconds
+
+        # Initialize tracking for this token on first call
+        if token not in self.candle_store:
+            self.candle_store[token] = []
+        if token not in self._candle_window_start:
+            self._candle_window_start[token] = tick_time
+        if token not in self._current_window_ticks:
+            self._current_window_ticks[token] = []
+
+        window_start = self._candle_window_start[token]
+
+        # If latest tick crossed into a new 5-min window, close current window
+        while tick_time >= window_start + candle_interval:
+            cwt = self._current_window_ticks[token]
+            if cwt:
+                ltps = [x["ltp"] for x in cwt]
+                vols = [x.get("volume", 0) for x in cwt]
+                self.candle_store[token].append({
+                    "Open": ltps[0],
+                    "High": max(ltps),
+                    "Low": min(ltps),
+                    "Close": ltps[-1],
+                    "Volume": max(0, vols[-1] - vols[0]),
+                })
+            self._current_window_ticks[token] = []
+            window_start += candle_interval
+
+        self._candle_window_start[token] = window_start
+
+        # Add latest tick to current (incomplete) window
+        self._current_window_ticks[token].append(latest_tick)
+
+        # Keep at most 100 completed candles (enough for all indicators)
+        if len(self.candle_store[token]) > 100:
+            self.candle_store[token] = self.candle_store[token][-100:]
+
+        # Build result: completed candles + current incomplete candle
+        all_candle_data = list(self.candle_store[token])
+        cwt = self._current_window_ticks[token]
+        if cwt:
+            ltps = [x["ltp"] for x in cwt]
+            vols = [x.get("volume", 0) for x in cwt]
+            all_candle_data.append({
+                "Open": ltps[0],
+                "High": max(ltps),
+                "Low": min(ltps),
+                "Close": ltps[-1],
+                "Volume": max(0, vols[-1] - vols[0]),
+            })
+
+        if not all_candle_data:
+            return pd.DataFrame()
+
+        return pd.DataFrame(all_candle_data)
 
     def update_market_context(self, nifty_tick: dict):
         """Update global NIFTY direction, VIX, and NIFTY choppiness from index ticks."""
@@ -676,13 +886,14 @@ class PatternScanner:
             self.market_context["nifty_ltp"] = ltp
             self.market_context["nifty_change_pct"] = round(change_pct, 2)
 
-        # Track NIFTY ticks for choppiness calculation
+        # Track NIFTY ticks for choppiness calculation (tag with arrival time)
+        nifty_tick["_time"] = time.time()
         self.nifty_tick_buffer.append(nifty_tick)
         if len(self.nifty_tick_buffer) > 500:
             self.nifty_tick_buffer.pop(0)
 
-        # Compute NIFTY choppiness from buffered ticks (need enough data)
-        if len(self.nifty_tick_buffer) >= 20:
+        # Compute NIFTY choppiness from candles (pre-seeded or built from ticks)
+        if len(self.nifty_tick_buffer) >= 20 or len(self.nifty_candle_store) >= 15:
             nifty_candles = self._build_nifty_candles()
             if len(nifty_candles) >= 15:
                 nifty_chop = get_current_choppiness(
@@ -691,26 +902,78 @@ class PatternScanner:
                 self.market_context["nifty_choppiness"] = nifty_chop
 
     def _build_nifty_candles(self) -> pd.DataFrame:
-        """Build candle DataFrame from NIFTY tick buffer."""
+        """Build proper 5-minute candles from NIFTY tick buffer (incremental, same as stock candles)."""
         if not self.nifty_tick_buffer:
             return pd.DataFrame()
 
-        recent = self.nifty_tick_buffer[-200:]
-        data = [{
-            "Open": t.get("open", t.get("ltp", 0)),
-            "High": t.get("high", t.get("ltp", 0)),
-            "Low": t.get("low", t.get("ltp", 0)),
-            "Close": t.get("ltp", 0),
-            "Volume": t.get("volume", 0),
-        } for t in recent]
+        latest_tick = self.nifty_tick_buffer[-1]
+        tick_time = latest_tick.get("_time", 0)
+        ltp = latest_tick.get("ltp", 0)
+        if tick_time == 0 or ltp <= 0:
+            return pd.DataFrame()
 
-        df = pd.DataFrame(data)
-        df["Volume"] = df["Volume"].diff().fillna(0).clip(lower=0)
-        return df
+        candle_interval = 300  # 5 minutes
+
+        if self._nifty_candle_window_start == 0:
+            self._nifty_candle_window_start = tick_time
+
+        window_start = self._nifty_candle_window_start
+
+        # If latest tick crossed into a new window, close current window
+        while tick_time >= window_start + candle_interval:
+            cwt = self._nifty_current_window_ticks
+            if cwt:
+                ltps = [x.get("ltp", 0) for x in cwt if x.get("ltp", 0) > 0]
+                if ltps:
+                    vols = [x.get("volume", 0) for x in cwt]
+                    self.nifty_candle_store.append({
+                        "Open": ltps[0],
+                        "High": max(ltps),
+                        "Low": min(ltps),
+                        "Close": ltps[-1],
+                        "Volume": max(0, vols[-1] - vols[0]),
+                    })
+            self._nifty_current_window_ticks = []
+            window_start += candle_interval
+
+        self._nifty_candle_window_start = window_start
+
+        # Add latest tick to current window
+        self._nifty_current_window_ticks.append(latest_tick)
+
+        # Keep at most 100 completed candles
+        if len(self.nifty_candle_store) > 100:
+            self.nifty_candle_store = self.nifty_candle_store[-100:]
+
+        # Completed candles + current incomplete
+        all_candle_data = list(self.nifty_candle_store)
+        cwt = self._nifty_current_window_ticks
+        if cwt:
+            ltps = [x.get("ltp", 0) for x in cwt if x.get("ltp", 0) > 0]
+            if ltps:
+                vols = [x.get("volume", 0) for x in cwt]
+                all_candle_data.append({
+                    "Open": ltps[0],
+                    "High": max(ltps),
+                    "Low": min(ltps),
+                    "Close": ltps[-1],
+                    "Volume": max(0, vols[-1] - vols[0]),
+                })
+
+        if not all_candle_data:
+            return pd.DataFrame()
+
+        return pd.DataFrame(all_candle_data)
 
     def reset_daily(self):
         """Reset all state for a new trading day."""
         self.tick_buffer.clear()
+        self.candle_store.clear()
+        self._candle_window_start.clear()
+        self._current_window_ticks.clear()
+        self.nifty_candle_store.clear()
+        self._nifty_candle_window_start = 0.0
+        self._nifty_current_window_ticks.clear()
         self.orb_highs.clear()
         self.orb_lows.clear()
         self.signals_today.clear()
