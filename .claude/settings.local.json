@@ -12,7 +12,14 @@
       "WebFetch(domain:www.marketaux.com)",
       "WebFetch(domain:api.marketaux.com)",
       "Bash(python3:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ls -lah /c/Users/rshiv/nse-trading-bot/logs/ 2>/dev/null || ls -lah C:/Users/rshiv/nse-trading-bot/logs/ 2>/dev/null || find C:/Users/rshiv/nse-trading-bot -name \"*.log\" -type f 2>/dev/null | head -10)",
+      "Bash(find /c/Users/rshiv/nse-trading-bot/logs -name \"*2026-03-11*\" 2>/dev/null | head -10)",
+      "WebFetch(domain:www.nseindia.com)",
+      "WebFetch(domain:smartapi.angelone.in)",
+      "WebFetch(domain:api.angel.co)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:query1.finance.yahoo.com)"
     ]
   }
 }

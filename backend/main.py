@@ -843,6 +843,13 @@ class TradingBot:
             vix = self.scanner.market_context.get("vix", 0)
             nifty_dir = self.scanner.market_context.get("nifty_direction", "?")
 
+            # Count signal statuses for visibility
+            status_counts: dict[str, int] = {}
+            for sig in all_signals:
+                st = getattr(sig, "status", "UNKNOWN") or "UNKNOWN"
+                status_counts[st] = status_counts.get(st, 0) + 1
+            status_summary = " | ".join(f"{k}:{v}" for k, v in sorted(status_counts.items()))
+
             logger.info(
                 f"HEARTBEAT | Ticks: {self._tick_count} | Scans: {self._scan_count} | "
                 f"Candles: {tokens_with_candles}/{total_tokens} tokens have data | "
@@ -851,6 +858,8 @@ class TradingBot:
                 f"Positions: {len(self.order_manager.open_positions)} | "
                 f"Trades: {self.risk_manager.trades_today}"
             )
+            if status_summary:
+                logger.info(f"SIGNAL BREAKDOWN | {status_summary}")
             self._last_heartbeat = now_ts
 
     def _apply_vix(self, vix: float):
@@ -860,17 +869,26 @@ class TradingBot:
         self.risk_manager.update_vix(vix)
         self.order_manager.set_vix(vix)
 
+        # Set VIX regime label for dashboard/logging
+        if vix > config.trading.vix_caution_threshold:
+            self.scanner.market_context["vix_regime"] = "DANGER"
+        elif vix >= config.trading.vix_elevated_threshold:
+            self.scanner.market_context["vix_regime"] = "CAUTION"
+        elif vix >= config.trading.vix_normal_threshold:
+            self.scanner.market_context["vix_regime"] = "ELEVATED"
+        elif vix > 0:
+            self.scanner.market_context["vix_regime"] = "NORMAL"
+
     def _poll_vix(self):
         """
-        Poll India VIX via REST API as fallback.
+        Poll India VIX via Yahoo Finance every 5 minutes.
 
-        Why: Angel One WebSocket doesn't reliably deliver ticks for India VIX
-        (token 99919000). On 2026-03-09, VIX was 0.0 all day despite being
-        subscribed. This REST fallback polls every 5 minutes to ensure VIX
-        safety gates always have data.
+        Why: Angel One WebSocket doesn't deliver India VIX ticks, and their
+        REST API rejects the VIX token (AB4006). Yahoo Finance is free,
+        reliable, and needs no API key.
 
         If WebSocket IS delivering VIX data (_vix_ws_received=True), this
-        method does nothing — no need to waste an API call.
+        method does nothing — no need to waste a request.
         """
         if self._vix_ws_received:
             return  # WebSocket is working, no need to poll
@@ -883,7 +901,7 @@ class TradingBot:
         try:
             vix = self.broker.get_vix()
             if vix > 0:
-                logger.info(f"VIX polled via REST API: {vix:.2f} (WebSocket not delivering VIX)")
+                logger.info(f"VIX polled via Yahoo Finance: {vix:.2f}")
                 self._apply_vix(vix)
                 # Push updated market context to Firebase
                 try:
@@ -891,9 +909,9 @@ class TradingBot:
                 except Exception:
                     pass
             else:
-                logger.debug("VIX REST API returned 0.0 — no data available")
+                logger.debug("VIX fetch returned 0.0 — no data available")
         except Exception as e:
-            logger.debug(f"VIX REST poll failed: {e}")
+            logger.debug(f"VIX poll failed: {e}")
 
     def _determine_and_apply_regime(self):
         """
@@ -1211,7 +1229,8 @@ class TradingBot:
         logger.info("")
         logger.info("  SNIPER MODE V2 ACTIVE")
         logger.info(f"  |- Score threshold: {config.trading.min_score_to_trade} "
-                     f"(need {config.trading.min_confluence_count}+ strategy confluence)")
+                     f"(need {config.trading.min_confluence_count}+ confluence OR score >= "
+                     f"{config.trading.single_strategy_exception_score} single-strategy)")
         logger.info(f"  |- Max trades/day: {config.trading.max_trades_per_day} | "
                      f"Max losing: {config.trading.max_losses_per_day}")
         logger.info(f"  |- Risk per trade: {config.trading.max_risk_per_trade_pct}% "
@@ -1221,8 +1240,10 @@ class TradingBot:
                      f"ceiling {config.trading.atr_sl_ceiling_pct}%)")
         logger.info(f"  |- Target: {config.trading.risk_reward_ratio}R from entry")
         logger.info(f"  |- Volume gate: {config.trading.volume_spike_multiplier}x average minimum")
-        logger.info(f"  |- VIX gates: NORMAL <{config.trading.vix_normal_threshold} | "
-                     f"CAUTION {config.trading.vix_normal_threshold}-"
+        logger.info(f"  |- VIX zones: NORMAL <{config.trading.vix_normal_threshold} | "
+                     f"ELEVATED {config.trading.vix_normal_threshold}-"
+                     f"{config.trading.vix_elevated_threshold} | "
+                     f"CAUTION {config.trading.vix_elevated_threshold}-"
                      f"{config.trading.vix_caution_threshold} | "
                      f"DANGER >{config.trading.vix_caution_threshold}")
         logger.info(f"  |- Choppiness filter: ON (reject if CHOP > "

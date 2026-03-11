@@ -7,7 +7,7 @@ If the risk manager says no, the trade does not happen. Period.
 Sniper Mode V2 changes:
 - Hard cap: 3 trades/day maximum (no exceptions)
 - Max 2 losing trades/day (sniper mode is about quality, not quantity)
-- VIX graduated response: NORMAL (<18) / CAUTION (18-20) / DANGER (>20)
+- VIX 4-zone response: NORMAL (<15) / ELEVATED (15-20) / CAUTION (20-25) / DANGER (>25)
 - ATR-based position sizing (risk amount / ATR-based SL distance)
 - Lunch block fully enforced (11:30-13:00 = no new trades)
 - 1.5% risk per trade (tightened from 2%)
@@ -407,26 +407,34 @@ class RiskManager:
 
     def _calc_quantity(self, signal: Signal, now) -> int:
         """
-        Position sizing with VIX-based, time-based, and regime scaling.
+        Position sizing with VIX 4-zone scaling, time-based, and regime scaling.
 
-        Sniper Mode V2:
-        - VIX < 18 (NORMAL):  full risk (1.5% of capital)
-        - VIX 18-20 (CAUTION): half risk (0.75% of capital), wider ATR SL
-        - VIX > 20 (DANGER):  blocked before reaching this point
+        VIX zones:
+        - VIX < 15 (NORMAL):    100% risk (1.5% of capital), 1.5× ATR SL
+        - VIX 15-20 (ELEVATED): 75% risk (1.125% of capital), 1.75× ATR SL
+        - VIX 20-25 (CAUTION):  50% risk (0.75% of capital), 2× ATR SL
+        - VIX > 25 (DANGER):    blocked before reaching this point
 
         Base formula: quantity = (capital x risk%) / risk_per_share
-        Then apply: time-of-day scaling + regime scaling
+        Then apply: VIX scaling + time-of-day scaling + regime scaling
         """
         capital = self.portfolio.current_capital
         risk_pct = self.config.max_risk_per_trade_pct  # 1.5%
 
-        # VIX graduated response: reduce risk in caution mode
+        # VIX 4-zone graduated response
         vix = getattr(self, '_current_vix', 0)
-        if vix >= self.config.vix_normal_threshold and vix <= self.config.vix_caution_threshold:
-            risk_pct = self.config.vix_caution_risk_pct  # 0.75%
-            logger.info(
-                f"VIX={vix:.1f} -> CAUTION: risk reduced to {risk_pct}% per trade"
-            )
+        vix_size_pct = 1.0  # 100% default
+
+        if vix > 0 and vix >= self.config.vix_caution_threshold:
+            # CAUTION zone (20-25): 50% size, 0.75% risk
+            risk_pct = self.config.vix_caution_risk_pct
+            vix_size_pct = self.config.vix_caution_size_pct / 100
+            logger.info(f"VIX={vix:.1f} -> CAUTION: risk {risk_pct}%, size {vix_size_pct*100:.0f}%")
+        elif vix > 0 and vix >= self.config.vix_normal_threshold:
+            # ELEVATED zone (15-20): 75% size, 1.125% risk
+            risk_pct = self.config.vix_elevated_risk_pct
+            vix_size_pct = self.config.vix_elevated_size_pct / 100
+            logger.info(f"VIX={vix:.1f} -> ELEVATED: risk {risk_pct}%, size {vix_size_pct*100:.0f}%")
 
         risk_amount = capital * (risk_pct / 100)
         risk_per_share = signal.risk_points
@@ -441,9 +449,8 @@ class RiskManager:
         time_pct = self._get_time_size_pct(now)
         scaled_qty = int(base_qty * time_pct / 100)
 
-        # Apply VIX caution size scaling
-        if vix >= self.config.vix_normal_threshold and vix <= self.config.vix_caution_threshold:
-            vix_size_pct = self.config.vix_caution_size_pct / 100  # 50%
+        # Apply VIX size scaling
+        if vix_size_pct < 1.0:
             scaled_qty = int(scaled_qty * vix_size_pct)
 
         # Apply global risk day scaling (geopolitical/macro event → 50% size)

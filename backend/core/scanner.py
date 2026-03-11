@@ -614,10 +614,15 @@ class PatternScanner:
         SL = entry ± (ATR × multiplier), clamped to [0.5%, 3%] of entry.
         Target = entry ± (SL distance × 2.5R).
         """
-        # Choose ATR multiplier based on VIX regime
-        if vix > 0 and vix >= self.trading_config.vix_normal_threshold and vix <= self.trading_config.vix_caution_threshold:
+        # Choose ATR multiplier based on VIX 4-zone regime
+        if vix > 0 and vix >= self.trading_config.vix_caution_threshold:
+            # CAUTION (20-25): widest SL
             atr_mult = self.trading_config.atr_sl_multiplier_caution
+        elif vix > 0 and vix >= self.trading_config.vix_normal_threshold:
+            # ELEVATED (15-20): slightly wider SL
+            atr_mult = self.trading_config.atr_sl_multiplier_elevated
         else:
+            # NORMAL (<15) or no VIX data: standard SL
             atr_mult = self.trading_config.atr_sl_multiplier_normal
 
         sl_distance = atr * atr_mult
@@ -860,11 +865,13 @@ class PatternScanner:
             vix_value = nifty_tick.get("ltp", 0)
             self.market_context["vix"] = vix_value
 
-            # Determine VIX regime
+            # Determine VIX 4-zone regime
             if vix_value > self.trading_config.vix_caution_threshold:
                 self.market_context["vix_regime"] = "DANGER"
-            elif vix_value >= self.trading_config.vix_normal_threshold:
+            elif vix_value >= self.trading_config.vix_elevated_threshold:
                 self.market_context["vix_regime"] = "CAUTION"
+            elif vix_value >= self.trading_config.vix_normal_threshold:
+                self.market_context["vix_regime"] = "ELEVATED"
             else:
                 self.market_context["vix_regime"] = "NORMAL"
             return

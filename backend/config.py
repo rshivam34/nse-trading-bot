@@ -105,14 +105,21 @@ class TradingConfig:
 
     # ── Multi-strategy confluence (sniper mode) ───────────────────────
     min_confluence_count: int = 2           # At least 2 strategies must agree
-    single_strategy_exception_score: int = 85  # Allow 1 strategy if score >= 85 (was 90 — too strict, 57K signals but zero confluence on 2026-03-09)
+    single_strategy_exception_score: int = 75  # Allow 1 strategy if score >= 75 (was 85/90 — still too strict, zero confluence on 3 consecutive days)
 
-    # ── VIX graduated response (sniper mode) ──────────────────────────
-    vix_normal_threshold: float = 18.0      # VIX < 18 = normal
-    vix_caution_threshold: float = 20.0     # VIX 18-20 = caution (50% size, wider SL)
-    # VIX > 20 = DANGER: no new trades at all
-    vix_caution_size_pct: float = 50.0      # Position size in caution mode (50%)
-    vix_caution_risk_pct: float = 0.75      # Risk per trade in caution mode
+    # ── VIX 4-zone graduated response ──────────────────────────────────
+    # NORMAL:   VIX < 15  → 100% size, 1.5× ATR SL. Calm market, best conditions.
+    # ELEVATED: VIX 15-20 → 75% size, 1.75× ATR SL. Normal Indian market volatility.
+    # CAUTION:  VIX 20-25 → 50% size, 2× ATR SL. Fast moves, stop-hunts common.
+    # DANGER:   VIX > 25  → 0% size, no new trades. Panic/crash territory.
+    vix_normal_threshold: float = 15.0      # VIX < 15 = NORMAL (100% size)
+    vix_elevated_threshold: float = 20.0    # VIX 15-20 = ELEVATED (75% size)
+    vix_caution_threshold: float = 25.0     # VIX 20-25 = CAUTION (50% size)
+    # VIX > 25 = DANGER: no new trades at all
+    vix_elevated_size_pct: float = 75.0     # Position size in ELEVATED mode
+    vix_elevated_risk_pct: float = 1.125    # Risk per trade in ELEVATED (75% of 1.5%)
+    vix_caution_size_pct: float = 50.0      # Position size in CAUTION mode
+    vix_caution_risk_pct: float = 0.75      # Risk per trade in CAUTION (50% of 1.5%)
 
     # ── Choppiness Index filter (sniper mode) ─────────────────────────
     chop_threshold: float = 61.8            # CHOP > 61.8 = choppy market, reject signal
@@ -138,8 +145,9 @@ class TradingConfig:
     trailing_sl_atr_multiplier: float = 1.0 # Trail at 1× ATR from peak/trough (sniper mode)
 
     # ── ATR-based dynamic stop-loss (sniper mode) ─────────────────────
-    atr_sl_multiplier_normal: float = 1.5   # SL = 1.5× ATR from entry (VIX < 18)
-    atr_sl_multiplier_caution: float = 2.0  # SL = 2.0× ATR from entry (VIX 18-20)
+    atr_sl_multiplier_normal: float = 1.5    # SL = 1.5× ATR (VIX < 15, NORMAL)
+    atr_sl_multiplier_elevated: float = 1.75  # SL = 1.75× ATR (VIX 15-20, ELEVATED)
+    atr_sl_multiplier_caution: float = 2.0  # SL = 2.0× ATR (VIX 20-25, CAUTION)
     atr_sl_floor_pct: float = 0.5           # SL never tighter than 0.5% from entry
     atr_sl_ceiling_pct: float = 3.0         # SL never wider than 3% from entry
     adopted_sl_fallback_pct: float = 2.5    # Fallback SL for adopted positions (if no ATR data)
@@ -208,7 +216,7 @@ class TradingConfig:
     gap_day_nifty_threshold_pct: float = 0.7     # >0.7% gap = gap day
     trending_nifty_move_pct: float = 0.5         # >0.5% move = trending
     range_bound_nifty_pct: float = 0.3           # <0.3% move = range bound
-    volatile_vix_threshold: float = 18.0         # VIX > 18 = volatile
+    volatile_vix_threshold: float = 20.0         # VIX > 20 = volatile regime
     volatile_nifty_range_pct: float = 1.5        # NIFTY range > 1.5% = volatile
     gap_day_wait_until: time = time(10, 0)       # On gap day, wait until 10 AM
 

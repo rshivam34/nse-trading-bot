@@ -20,6 +20,7 @@ import time as time_module
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
+import requests  # For Yahoo Finance VIX fetch (already installed as dependency of smartapi)
 import pyotp  # Generates Time-based One-Time Passwords (like Google Authenticator)
 from SmartApi import SmartConnect  # Angel One's official Python SDK
 from utils.watchlist import lookup_token_for_symbol
@@ -526,27 +527,32 @@ class BrokerConnection:
 
     def get_vix(self) -> float:
         """
-        Fetch India VIX via REST API (LTP quote).
+        Fetch India VIX value.
 
-        Why: Angel One WebSocket doesn't reliably stream India VIX ticks
-        (token 99919000). As a fallback, we poll VIX every few minutes
-        via the REST API. This ensures VIX safety gates always have data.
+        Uses Yahoo Finance free API (no API key needed) because Angel One's
+        SmartAPI does not support India VIX via ltpData endpoint (AB4006 error).
+
+        Yahoo Finance URL returns JSON with regularMarketPrice for ^INDIAVIX.
+        This is polled every 5 minutes from main.py — not per-tick.
 
         Returns VIX value (e.g., 14.5), or 0.0 on failure.
         """
-        if not self._check_connected():
-            return 0.0
-
         try:
-            response = self._api_with_retry(
-                self.session.ltpData, "NSE", "India VIX", "99919000"
+            response = requests.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX",
+                params={"interval": "1d", "range": "1d"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
             )
-            if response and response.get("status"):
-                ltp = float(response.get("data", {}).get("ltp", 0))
-                if ltp > 0:
-                    return ltp
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get("chart", {}).get("result", [])
+                if result:
+                    vix = float(result[0].get("meta", {}).get("regularMarketPrice", 0))
+                    if vix > 0:
+                        return vix
         except Exception as e:
-            logger.debug(f"VIX REST API fetch failed: {e}")
+            logger.debug(f"Yahoo Finance VIX fetch failed: {e}")
 
         return 0.0
 
