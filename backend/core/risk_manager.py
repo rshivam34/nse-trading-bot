@@ -97,15 +97,16 @@ class RiskManager:
         self._current_vix = vix
 
     def set_global_risk_day(self, is_risk_day: bool):
-        """Set global risk day flag — reduces all position sizes by 50%.
+        """Flag global risk day for awareness — NO size reduction.
 
         Called from main.py when news sentiment detects a major geopolitical
-        or macro event (e.g., USA-Iran tensions, trade war, oil shock).
-        Effect: same as VIX CAUTION — 50% position size reduction.
+        or macro event. Previously halved position sizes, but VIX zones + ATR-based
+        SL already adapt to real volatility. Crude keyword matching caused too many
+        false positives (e.g., "geopolitical" in a routine market preview article).
         """
         self._global_risk_day = is_risk_day
         if is_risk_day:
-            logger.warning("Global risk day ACTIVE — all position sizes reduced 50%")
+            logger.info("Global risk day flagged (awareness only — no size reduction)")
 
     def mark_stock_active(self, stock: str):
         """Record that we have an open position in this stock."""
@@ -426,12 +427,12 @@ class RiskManager:
         vix_size_pct = 1.0  # 100% default
 
         if vix > 0 and vix >= self.config.vix_caution_threshold:
-            # CAUTION zone (20-25): 50% size, 0.75% risk
+            # CAUTION zone (30-35): 50% size, 0.75% risk
             risk_pct = self.config.vix_caution_risk_pct
             vix_size_pct = self.config.vix_caution_size_pct / 100
             logger.info(f"VIX={vix:.1f} -> CAUTION: risk {risk_pct}%, size {vix_size_pct*100:.0f}%")
-        elif vix > 0 and vix >= self.config.vix_normal_threshold:
-            # ELEVATED zone (15-20): 75% size, 1.125% risk
+        elif vix > 0 and vix >= self.config.vix_elevated_threshold:
+            # ELEVATED zone (25-30): 75% size, 1.125% risk
             risk_pct = self.config.vix_elevated_risk_pct
             vix_size_pct = self.config.vix_elevated_size_pct / 100
             logger.info(f"VIX={vix:.1f} -> ELEVATED: risk {risk_pct}%, size {vix_size_pct*100:.0f}%")
@@ -453,10 +454,11 @@ class RiskManager:
         if vix_size_pct < 1.0:
             scaled_qty = int(scaled_qty * vix_size_pct)
 
-        # Apply global risk day scaling (geopolitical/macro event → 50% size)
+        # Global risk day: flag only, no size reduction.
+        # VIX zones + ATR-based SL already adapt to real volatility.
+        # Keyword-based news detection is too crude to justify halving positions.
         if self._global_risk_day:
-            scaled_qty = int(scaled_qty * 0.5)
-            logger.info("Global risk day: position size halved")
+            logger.info("Global risk day flagged (no size reduction — VIX/ATR handle volatility)")
 
         # Apply regime scaling
         regime_qty = int(scaled_qty * self.regime_size_multiplier)

@@ -437,18 +437,18 @@ class OrderManager:
         ok = signal.score >= self.config.min_score_to_trade
         checks.append((f"Signal score >= {self.config.min_score_to_trade}", ok, f"score={signal.score}"))
 
-        # Check 2: Confluence >= 2 OR exceptional single-strategy (score >= config threshold)
-        ok = (signal.confluence_count >= self.config.min_confluence_count or
-              signal.score >= self.config.single_strategy_exception_score)
+        # Check 2: Signal passed scanner filters (confluence removed — Option C)
+        # Confluence count is informational only. Score gate is check #1.
+        ok = True
         checks.append((
-            "Confluence >= 2 or exceptional score",
+            "Scanner filter pipeline passed",
             ok,
-            f"confluence={signal.confluence_count}, score={signal.score}"
+            f"strategy={signal.strategy_name}, confluence={signal.confluence_count} (informational)"
         ))
 
-        # Check 3: Volume >= 3× average (already gated in scanner, double-check)
-        ok = True  # Scanner already enforced this
-        checks.append(("Volume >= 3x average", ok, "passed in scanner"))
+        # Check 3: RVOL (informational — soft score modifier, not a hard gate)
+        ok = True  # RVOL adjusts score (-10 to +5) instead of blocking
+        checks.append(("RVOL score modifier", ok, f"RVOL={signal.rvol:.1f}x (score adjusted)"))
 
         # Check 4: VIX regime not DANGER
         vix = getattr(self, '_current_vix', 0)
@@ -460,24 +460,24 @@ class OrderManager:
         ok = not in_lunch
         checks.append(("Not in lunch block", ok, f"time={now.strftime('%H:%M')}"))
 
-        # Check 6: Daily trade count < 3
+        # Check 6: Daily trade count within limit
         ok = self.risk_manager.trades_today < self.config.max_trades_per_day
-        checks.append(("Daily trades < 3", ok, f"trades={self.risk_manager.trades_today}"))
+        checks.append((f"Daily trades < {self.config.max_trades_per_day}", ok, f"trades={self.risk_manager.trades_today}"))
 
-        # Check 7: Daily losing trades < 2
+        # Check 7: Daily losing trades within limit
         ok = self.risk_manager.losses_today < self.config.max_losses_per_day
-        checks.append(("Daily losses < 2", ok, f"losses={self.risk_manager.losses_today}"))
+        checks.append((f"Daily losses < {self.config.max_losses_per_day}", ok, f"losses={self.risk_manager.losses_today}"))
 
-        # Check 8: Choppiness Index < 61.8 (stock)
+        # Check 8: Choppiness Index < threshold (stock)
         ok = signal.choppiness <= self.config.chop_threshold
-        checks.append(("Choppiness < 61.8", ok, f"CHOP={signal.choppiness:.1f}"))
+        checks.append((f"Choppiness < {self.config.chop_threshold}", ok, f"CHOP={signal.choppiness:.1f}"))
 
-        # Check 9: NIFTY Choppiness < 61.8
-        nifty_chop = 100.0
+        # Check 9: NIFTY Choppiness < threshold
+        nifty_chop = 50.0  # Neutral default (don't block if no data yet)
         if scanner:
-            nifty_chop = scanner.market_context.get("nifty_choppiness", 100.0)
+            nifty_chop = scanner.market_context.get("nifty_choppiness", 50.0)
         ok = nifty_chop <= self.config.chop_threshold
-        checks.append(("NIFTY CHOP < 61.8", ok, f"NIFTY_CHOP={nifty_chop:.1f}"))
+        checks.append((f"NIFTY CHOP < {self.config.chop_threshold}", ok, f"NIFTY_CHOP={nifty_chop:.1f}"))
 
         # Check 10: 15-min trend agrees with direction
         if self.config.trend_15m_enabled:
@@ -613,45 +613,94 @@ class OrderManager:
         except Exception as e:
             logger.warning(f"Margin check error for {signal.stock}: {e}. Proceeding anyway.")
 
-        # ── Place the entry order ──────────────────────────────────────────
-        try:
-            order_id = self.broker.place_order(
-                stock=signal.stock,
-                token=signal.token,
-                direction=signal.direction,
-                quantity=signal.quantity,
-                price=signal.entry_price,
-            )
-        except Exception as e:
-            logger.error(
-                f"Order placement exception for {signal.stock}: {e}. "
-                "Position not opened."
-            )
-            return None
+        # ── Place the entry order (with retry on failure) ─────────────────
+        order_id = None
+        max_order_retries = 3
+        for order_attempt in range(1, max_order_retries + 1):
+            try:
+                order_id = self.broker.place_order(
+                    stock=signal.stock,
+                    token=signal.token,
+                    direction=signal.direction,
+                    quantity=signal.quantity,
+                    price=signal.entry_price,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Order placement exception for {signal.stock} "
+                    f"(attempt {order_attempt}/{max_order_retries}): {e}"
+                )
+                order_id = None
 
-        if not order_id:
-            logger.error(f"Order placement failed: {signal.stock}")
-            return None
+            if order_id:
+                break
 
-        # Track as pending — check later for fill
+            if order_attempt < max_order_retries:
+                wait = order_attempt * 2  # 2s, 4s
+                logger.warning(
+                    f"Order placement failed for {signal.stock} "
+                    f"(attempt {order_attempt}/{max_order_retries}). "
+                    f"Retrying in {wait}s..."
+                )
+                time_module.sleep(wait)
+            else:
+                logger.error(
+                    f"Order placement failed for {signal.stock} after "
+                    f"{max_order_retries} attempts. Giving up."
+                )
+                return None
+
+        # Track as pending — check later for fill if not confirmed now
         self._pending_orders[order_id] = {
             "placed_at": time_module.time(),
             "stock": signal.stock,
             "signal": signal,
         }
 
-        # Verify actual fill
-        filled_qty = self.broker.get_filled_quantity(order_id)
+        # Poll broker for fill confirmation (up to 3 checks, 1s apart).
+        # The broker needs a moment to process the order — checking immediately
+        # after placement often returns 0 filled even if the order will fill.
+        filled_qty = 0
+        actual_entry = 0.0
+        for fill_attempt in range(1, 4):
+            time_module.sleep(1)
+            filled_qty, actual_entry = self.broker.get_order_fill_details(order_id)
+            if filled_qty > 0:
+                break
+            logger.info(
+                f"Fill check {fill_attempt}/3: {signal.stock} — "
+                f"{filled_qty}/{signal.quantity} filled (waiting...)"
+            )
+
         if filled_qty <= 0:
-            filled_qty = signal.quantity
-        elif filled_qty < signal.quantity:
+            # Order not filled after 3 seconds — DON'T create a Position.
+            # The order stays in _pending_orders and will be handled by
+            # _check_pending_timeouts() which will either adopt (if late fill)
+            # or cancel (if still unfilled).
+            logger.warning(
+                f"Order not filled after 3s: {signal.stock} (order {order_id}). "
+                "Pending timeout will handle cleanup or late-fill adoption."
+            )
+            return None
+
+        # Order confirmed filled — remove from pending
+        self._pending_orders.pop(order_id, None)
+
+        if filled_qty < signal.quantity:
             logger.warning(
                 f"Partial fill: {signal.stock} — got {filled_qty} of {signal.quantity} shares"
             )
             signal.quantity = filled_qty
 
-        # Get actual fill price for slippage calculation
-        actual_entry = self._get_cached_ltp(signal.token) or signal.entry_price
+        # Use broker's actual fill price (the real price you paid)
+        if actual_entry <= 0:
+            # Fallback to WebSocket LTP only if broker doesn't report fill price
+            actual_entry = self._get_cached_ltp(signal.token) or signal.entry_price
+            logger.warning(
+                f"No fill price from broker for {signal.stock}, "
+                f"using LTP fallback: Rs.{actual_entry:.2f}"
+            )
+
         slippage = actual_entry - signal.entry_price
         if abs(slippage) > 0.01:
             slippage_pct = abs(slippage / signal.entry_price) * 100
@@ -1008,7 +1057,7 @@ class OrderManager:
         pos.realized_pnl += (pnl_partial - charges["total_charges"])
         pos.remaining_quantity -= half_qty
         pos.partial_exit_done = True
-        pos.effective_sl = pos.signal.entry_price  # Move SL to breakeven
+        pos.effective_sl = pos.actual_entry  # Move SL to breakeven (actual fill price, not signal price)
         pos.breakeven_moved = True
 
         # Activate trailing SL on remaining position if not already active
@@ -1031,7 +1080,7 @@ class OrderManager:
         logger.info(
             f"Partial exit: {pos.signal.stock} -- sold {half_qty} @ Rs.{exit_price:.2f} | "
             f"Gross P&L: Rs.{pnl_partial:+.2f} | Net: Rs.{charges['net_pnl']:+.2f} | "
-            f"SL moved to breakeven Rs.{pos.signal.entry_price:.2f} | "
+            f"SL moved to breakeven Rs.{pos.actual_entry:.2f} | "
             f"Trailing SL: Rs.{pos.trailing_sl:.2f} | "
             f"Remaining: {pos.remaining_quantity} shares"
         )
@@ -1142,7 +1191,7 @@ class OrderManager:
                 )
                 continue
             exited_symbols.add(pos.signal.stock)
-            ltp = self._get_cached_ltp(pos.signal.token) or pos.signal.entry_price
+            ltp = self._get_cached_ltp(pos.signal.token) or pos.actual_entry
             self._close_remaining(pos, ltp, reason)
         logger.info(f"All positions closed ({reason}) — {len(exited_symbols)} exits placed")
 
@@ -1270,7 +1319,16 @@ class OrderManager:
 
     def _check_pending_timeouts(self):
         """
-        Cancel LIMIT orders that haven't filled within config.pending_order_timeout_secs.
+        Handle orders that weren't confirmed filled in execute().
+
+        After the timeout period:
+        - If order completed (late fill): adopt as a real position with broker SL
+        - If still open: cancel the order AND any associated SL order
+        - Clean up any phantom positions from edge cases
+
+        This prevents the critical bug where unfilled orders created phantom
+        positions with live SL orders on the exchange, causing the bot to
+        sell shares it didn't own.
         """
         timeout = self.config.pending_order_timeout_secs
         now = time_module.time()
@@ -1281,11 +1339,87 @@ class OrderManager:
 
         for order_id in timed_out:
             info = self._pending_orders.pop(order_id, {})
+            stock = info.get("stock", "?")
+            signal = info.get("signal")
+
+            # Check actual fill status from broker
+            filled_qty, fill_price = self.broker.get_order_fill_details(order_id)
             status = self.broker.get_order_status(order_id)
 
-            if status in ("open", "pending", "trigger pending"):
+            if filled_qty > 0 and signal:
+                # Late fill — order completed during the timeout window.
+                # Create a real Position from actual broker data.
+                if fill_price <= 0:
+                    fill_price = self._get_cached_ltp(signal.token) or signal.entry_price
+                    logger.warning(
+                        f"Late fill for {stock} but no avg price — using LTP: Rs.{fill_price:.2f}"
+                    )
+
+                signal.quantity = filled_qty
+                slippage = fill_price - signal.entry_price
+
+                pos = Position(
+                    signal=signal,
+                    order_id=order_id,
+                    remaining_quantity=filled_qty,
+                    actual_entry=fill_price,
+                    slippage=slippage,
+                )
+
+                sl_order_id = self._place_broker_sl_order(pos)
+                if sl_order_id:
+                    pos.sl_order_id = sl_order_id
+
+                self.open_positions.append(pos)
+                self.risk_manager.confirm_trade_placed(
+                    stock=signal.stock,
+                    entry_price=fill_price,
+                    quantity=filled_qty,
+                )
+
+                logger.info(
+                    f"Late fill adopted: {signal.direction} {filled_qty}x {stock} "
+                    f"@ Rs.{fill_price:.2f} | SL: Rs.{signal.stop_loss:.2f} | "
+                    f"Broker SL: {'YES' if sl_order_id else 'NO'}"
+                )
+
+            elif status in ("open", "pending", "trigger pending"):
+                # Order still unfilled — cancel it
                 logger.warning(
-                    f"Pending order timeout: {info.get('stock', '?')} "
-                    f"(order {order_id}) not filled in {timeout:.0f}s -- cancelling"
+                    f"Pending order timeout: {stock} "
+                    f"(order {order_id}) not filled in {timeout:.0f}s — cancelling"
                 )
                 self.broker.cancel_order(order_id)
+
+                # Safety: clean up any phantom Position + its SL order
+                self._cleanup_phantom_position(order_id, stock)
+
+            else:
+                # Order was already cancelled/rejected by broker
+                logger.info(
+                    f"Pending order {order_id} for {stock}: "
+                    f"status={status}, filled={filled_qty} (no action needed)"
+                )
+                # Safety: clean up any phantom Position
+                self._cleanup_phantom_position(order_id, stock)
+
+    def _cleanup_phantom_position(self, order_id: str, stock: str):
+        """
+        Remove a Position that was created for an unfilled order.
+
+        This handles the edge case where an older code path created a Position
+        before confirming the fill. The phantom Position would have a live SL
+        order on the exchange — we cancel that too to prevent selling shares
+        we don't own.
+        """
+        for pos in self.open_positions[:]:
+            if pos.order_id == order_id:
+                logger.warning(
+                    f"Removing phantom position for {stock} "
+                    f"(order {order_id} was not filled)"
+                )
+                # Cancel the broker SL order to prevent selling shares we don't own
+                self._cancel_broker_sl_order(pos)
+                self.open_positions.remove(pos)
+                self.risk_manager.mark_stock_closed(stock)
+                break

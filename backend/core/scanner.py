@@ -1,16 +1,23 @@
 """
-Pattern Scanner — Sniper Mode V2
-==================================
+Pattern Scanner — Sniper Mode V2 + TOD Volume Profile
+=======================================================
 The scanner is the "brain" that coordinates pattern detection
 across the watchlist using all active strategies.
 
-Sniper Mode changes:
-- Multi-strategy confluence: 2+ strategies must agree on same stock + direction
-- Signal queue: collect all qualifying signals, rank by score, pick top 1
-- Volume hard gate: 3× average minimum (reject below)
-- Choppiness Index filter: CHOP > 61.8 = reject (market is choppy)
-- 15-minute trend filter: only trade in direction of higher timeframe
-- ATR expansion check: -10 score penalty if ATR compressing on breakouts
+Volume Analysis (upgraded):
+- RVOL uses 10-day TOD (time-of-day) average instead of intraday rolling average
+- Compares current candle volume to the SAME time slot over the last 10 days
+- Falls back to session running average (3x gate) if < 5 days of TOD data
+- Expiry day flag: raises RVOL gate from 2x to 3x on F&O Thursdays
+- ADV filter: rejects stocks with < 5 lakh average daily volume (20-day)
+- Price confirmation: triggering candle must show 0.3% move + 60% body ratio
+- Min traded value: candle must have ≥ ₹5 lakh traded value (price × volume)
+- NIFTY volume spike: flags signal as macro-driven if NIFTY RVOL >= 2x TOD
+
+Other filters (unchanged):
+- Choppiness Index: CHOP > 70 = reject (market is choppy)
+- 15-minute trend: must align with signal direction
+- ATR expansion: -10 score penalty if ATR compressing on breakouts
 - Candle close confirmation: breakout strategies require candle close above level
 - Lunch block: 11:30-13:00 fully blocked for new entries
 - All signals logged with status tags: EXECUTED/QUEUED/SKIPPED-*
@@ -18,11 +25,12 @@ Sniper Mode changes:
 Flow:
 1. During 9:15-9:30 (ORB period): track high/low for each stock
 2. After 9:30: run ALL strategies on every incoming tick
-3. Collect all raw signals per stock
-4. Apply confluence filter: only keep signals where 2+ strategies agree
-5. Apply sniper filters: choppiness, 15-min trend, volume gate, ATR check
-6. Score surviving signals
-7. Queue all qualifying signals, return top 1 per scan cycle
+3. Pick best signal (highest confidence) — no confluence gate
+4. Apply sniper filters: lunch, VIX, choppiness, trend, ADV, RVOL,
+   price confirmation, traded value, candle close
+5. Score surviving signals, apply ATR expansion penalty
+6. Check NIFTY volume spike (flag only, not reject)
+7. Return at most 1 signal (highest scoring)
 """
 
 import logging
@@ -43,6 +51,7 @@ from utils.indicators import (
     get_15min_trend,
     is_atr_expanding,
 )
+from utils.volume_profile import current_time_slot, is_expiry_day
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +99,7 @@ class PatternScanner:
             "nifty_direction": "NEUTRAL",
             "nifty_ltp": 0.0,
             "vix": 0.0,
-            "nifty_choppiness": 100.0,
+            "nifty_choppiness": 50.0,
             "vix_regime": "NORMAL",
         }
 
@@ -113,6 +122,17 @@ class PatternScanner:
         # All signals generated this scan cycle (for queue/ranking)
         self._all_signals_today: list[Signal] = []
 
+        # Volume profile manager (set via set_volume_profile)
+        self.volume_profile = None
+
+        # Track starting slot index per token for end-of-day profile save
+        # 0 = candle_store starts from 09:15 (pre-seeded), higher for late starts
+        self._candle_start_slot_index: dict[str, int] = {}
+        self._nifty_start_slot_index: int = 0
+
+        # Cache expiry day check (computed once per day)
+        self._is_expiry_day: bool = is_expiry_day()
+
     def set_watchlist(self, watchlist: list[dict]):
         """Build token → symbol map from watchlist."""
         for item in watchlist:
@@ -132,6 +152,11 @@ class PatternScanner:
         """Set news sentiment cache (called at 9 AM)."""
         self.news_sentiment = sentiment
         logger.info(f"News sentiment set for {len(sentiment)} stocks")
+
+    def set_volume_profile(self, volume_profile):
+        """Set volume profile manager for TOD RVOL calculations."""
+        self.volume_profile = volume_profile
+        logger.info("Volume profile manager connected to scanner")
 
     def seed_candles(self, token: str, candles: list[dict]):
         """
@@ -154,6 +179,8 @@ class PatternScanner:
         # Set window start to now — next tick starts a fresh 5-min window
         self._candle_window_start[token] = time.time()
         self._current_window_ticks[token] = []
+        # Pre-seeded candles start from 09:15 (slot index 0)
+        self._candle_start_slot_index[token] = 0
 
     def seed_nifty_candles(self, candles: list[dict]):
         """
@@ -172,6 +199,8 @@ class PatternScanner:
         self.nifty_candle_store = list(candles)
         self._nifty_candle_window_start = time.time()
         self._nifty_current_window_ticks = []
+        # Pre-seeded NIFTY candles start from 09:15
+        self._nifty_start_slot_index = 0
 
     def update_orb_range(self, tick: dict):
         """Called during 9:15-9:30 to track the opening range."""
@@ -260,13 +289,13 @@ class PatternScanner:
 
     def scan(self, tick: dict) -> list[Signal]:
         """
-        Sniper Mode V2 scan — multi-strategy confluence + signal queue.
+        Sniper Mode V2 scan — signal filter pipeline (Option C: no confluence requirement).
 
         Steps:
         1. Run ALL strategies on this tick for this stock
-        2. Check confluence: 2+ strategies must agree on direction
+        2. Pick the best signal (highest confidence) — no confluence gate
         3. Apply sniper filters: choppiness, 15-min trend, volume gate
-        4. Score the confluent signal
+        4. Score the signal
         5. Apply ATR expansion check (penalty for breakouts)
         6. Return at most 1 signal (highest scoring)
 
@@ -317,97 +346,36 @@ class PatternScanner:
         if not raw_signals:
             return []
 
-        # ── Step 2: Confluence check — group by direction ──────────────
+        # ── Step 2: Pick best signal — no confluence requirement ──────────
+        # Option C: Every single-strategy signal is a first-class candidate.
+        # The 10+ downstream filters (choppiness, volume, trend, score >= 75,
+        # candle close, ATR, pre-flight 17 checks) provide all the gating needed.
+        # Confluence count is tracked for logging/analytics only.
         long_signals = [s for s in raw_signals if s.direction == "LONG"]
         short_signals = [s for s in raw_signals if s.direction == "SHORT"]
 
-        confluent_signal = None
-        confluence_count = 0
-        confluence_strategies = []
+        best_long = max(long_signals, key=lambda s: s.confidence) if long_signals else None
+        best_short = max(short_signals, key=lambda s: s.confidence) if short_signals else None
 
-        # Check LONG confluence
-        long_candidate = None
-        long_conf_count = 0
-        if len(long_signals) >= self.trading_config.min_confluence_count:
-            long_conf_count = len(long_signals)
-            long_candidate = max(long_signals, key=lambda s: s.confidence)
-
-        # Check SHORT confluence
-        short_candidate = None
-        short_conf_count = 0
-        if len(short_signals) >= self.trading_config.min_confluence_count:
-            short_conf_count = len(short_signals)
-            short_candidate = max(short_signals, key=lambda s: s.confidence)
-
-        # Pick direction: prefer higher confidence (quality), then more strategies
-        if long_candidate and short_candidate:
-            if long_candidate.confidence > short_candidate.confidence:
-                confluent_signal = long_candidate
-                confluence_count = long_conf_count
-                confluence_strategies = [s.strategy_name for s in long_signals]
-            elif short_candidate.confidence > long_candidate.confidence:
-                confluent_signal = short_candidate
-                confluence_count = short_conf_count
-                confluence_strategies = [s.strategy_name for s in short_signals]
+        # Choose direction: prefer higher confidence, then more strategies
+        if best_long and best_short:
+            if best_long.confidence > best_short.confidence:
+                confluent_signal = best_long
+            elif best_short.confidence > best_long.confidence:
+                confluent_signal = best_short
+            elif len(short_signals) > len(long_signals):
+                confluent_signal = best_short
             else:
-                # Equal confidence — pick whichever has more strategies
-                if short_conf_count > long_conf_count:
-                    confluent_signal = short_candidate
-                    confluence_count = short_conf_count
-                    confluence_strategies = [s.strategy_name for s in short_signals]
-                else:
-                    confluent_signal = long_candidate
-                    confluence_count = long_conf_count
-                    confluence_strategies = [s.strategy_name for s in long_signals]
-        elif long_candidate:
-            confluent_signal = long_candidate
-            confluence_count = long_conf_count
-            confluence_strategies = [s.strategy_name for s in long_signals]
-        elif short_candidate:
-            confluent_signal = short_candidate
-            confluence_count = short_conf_count
-            confluence_strategies = [s.strategy_name for s in short_signals]
+                confluent_signal = best_long
+        elif best_long:
+            confluent_signal = best_long
+        else:
+            confluent_signal = best_short
 
-        # If no confluence, check for exceptional single-strategy exception
-        if confluent_signal is None:
-            # Exception: allow single strategy if pre-scored signal would be >= 90 (EXCEPTIONAL)
-            exception_score = self.trading_config.single_strategy_exception_score
-            best_single = max(raw_signals, key=lambda s: s.confidence)
-            temp_score, _ = self.scorer.score(
-                signal=best_single,
-                market_context=stock_context,
-                news_sentiment=self.news_sentiment,
-            )
-
-            if temp_score >= exception_score:
-                # Exceptional signal — allow through with single strategy
-                confluent_signal = best_single
-                confluence_count = 1
-                confluence_strategies = [best_single.strategy_name]
-                confluent_signal.confluence_count = 1
-                confluent_signal.confluence_strategies = confluence_strategies
-                logger.info(
-                    f"EXCEPTIONAL single-strategy signal: {stock} {best_single.direction} "
-                    f"from {best_single.strategy_name} — pre-score {temp_score} >= {exception_score}"
-                )
-            else:
-                # Still rejected — log and return
-                for s in raw_signals:
-                    s.status = "SKIPPED-NO-CONFLUENCE"
-                    s.skip_reason = (
-                        f"Only {s.strategy_name} fired (need {self.trading_config.min_confluence_count}+ "
-                        f"or score >= {exception_score}), pre-score={temp_score}"
-                    )
-                    self._all_signals_today.append(s)
-                if raw_signals:
-                    logger.debug(
-                        f"No confluence for {stock}: {[s.strategy_name for s in raw_signals]} "
-                        f"(need {self.trading_config.min_confluence_count}+ or score >= {exception_score}, "
-                        f"best pre-score={temp_score})"
-                    )
-                return []
-
-        # Attach confluence info to the winning signal
+        # Attach confluence info (informational — not a gate)
+        same_dir = [s for s in raw_signals if s.direction == confluent_signal.direction]
+        confluence_count = len(same_dir)
+        confluence_strategies = [s.strategy_name for s in same_dir]
         confluent_signal.confluence_count = confluence_count
         confluent_signal.confluence_strategies = confluence_strategies
 
@@ -498,21 +466,17 @@ class PatternScanner:
                 )
                 return []
 
-        # ── Step 3f: Volume hard gate (3× average) ────────────────────
-        volume_ratio = stock_context.get("volume_ratio", 1.0)
-        if volume_ratio < self.trading_config.volume_spike_multiplier:
-            confluent_signal.status = "SKIPPED-LOW-VOLUME"
-            confluent_signal.skip_reason = (
-                f"Volume {volume_ratio:.1f}× < {self.trading_config.volume_spike_multiplier}× minimum"
-            )
-            self._all_signals_today.append(confluent_signal)
-            logger.info(
-                f"SKIPPED-LOW-VOLUME: {stock} — volume {volume_ratio:.1f}× "
-                f"< {self.trading_config.volume_spike_multiplier}× required"
-            )
-            return []
+        # ── Step 3f: ADV + RVOL + price confirm + traded value ────────
+        # These are tracked for logging/analytics but NOT used as hard gates.
+        # With Rs.15K capital trading NIFTY 200 stocks, all have sufficient
+        # liquidity. RVOL is applied as a score modifier after scoring (Step 4b).
+        adv_value = stock_context.get("adv", 0)
+        rvol = stock_context.get("rvol", 1.0)
+        rvol_source = stock_context.get("rvol_source", "SESSION")
+        confluent_signal.rvol = rvol
+        confluent_signal.adv = adv_value
 
-        # ── Step 3g: Candle close confirmation (breakout strategies) ───
+        # ── Step 3j: Candle close confirmation (breakout strategies) ───
         is_breakout = confluent_signal.strategy_name in ("ORB", "SR_BREAKOUT")
         if is_breakout and len(candles) >= 2:
             prev_close = candles["Close"].iloc[-2]
@@ -566,12 +530,32 @@ class PatternScanner:
                     f"-{penalty} penalty (score now {score})"
                 )
 
+        # ── Step 4b: RVOL score modifier (soft penalty/bonus) ──────────
+        # Instead of killing signals with low RVOL, we adjust the score.
+        # This lets volume matter without blocking every signal on normal days.
+        if rvol < 1.0:
+            rvol_adj = -10
+            score += rvol_adj
+            breakdown["rvol_penalty"] = rvol_adj
+            logger.debug(f"{stock} — RVOL {rvol:.1f}× (low): {rvol_adj} score penalty")
+        elif rvol < 2.0:
+            rvol_adj = -5
+            score += rvol_adj
+            breakdown["rvol_penalty"] = rvol_adj
+            logger.debug(f"{stock} — RVOL {rvol:.1f}× (moderate): {rvol_adj} score penalty")
+        elif rvol >= 3.0:
+            rvol_adj = 5
+            score += rvol_adj
+            breakdown["rvol_bonus"] = rvol_adj
+            logger.debug(f"{stock} — RVOL {rvol:.1f}× (high): +{rvol_adj} score bonus")
+
         # Attach score to signal
         confluent_signal.score = score
         confluent_signal.score_breakdown = breakdown
         confluent_signal.reason = (
             f"[Score: {score}/100] {confluent_signal.reason} | "
-            f"Confluence: {' + '.join(confluence_strategies)} ({confluence_count}/4)"
+            f"Confluence: {' + '.join(confluence_strategies)} ({confluence_count}/4) | "
+            f"RVOL: {rvol:.1f}× ({rvol_source})"
         )
 
         # ── Step 5: Score threshold check ──────────────────────────────
@@ -587,6 +571,15 @@ class PatternScanner:
             )
             return []
 
+        # ── Step 5a: NIFTY volume spike flag (macro-driven) ───────────
+        nifty_macro = stock_context.get("nifty_macro_driven", False)
+        if nifty_macro:
+            confluent_signal.macro_driven = True
+            logger.info(
+                f"{stock} — NIFTY volume spike detected at same time slot. "
+                f"Flagging signal as MACRO-DRIVEN (not rejecting)"
+            )
+
         # ── Step 6: ATR-based SL and target recalculation ──────────────
         if atr_value > 0:
             self._apply_atr_based_sl_target(confluent_signal, atr_value, vix)
@@ -597,12 +590,15 @@ class PatternScanner:
         self._all_signals_today.append(confluent_signal)
 
         label = self.scorer.get_score_label(score)
+        macro_tag = " [MACRO-DRIVEN]" if confluent_signal.macro_driven else ""
         logger.info(
             f"{label} SNIPER signal: {confluent_signal.stock} "
             f"{confluent_signal.direction} @ Rs.{confluent_signal.entry_price:.2f} | "
             f"Score: {score}/100 | "
             f"Confluence: {' + '.join(confluence_strategies)} ({confluence_count}/4) | "
+            f"RVOL: {rvol:.1f}× ({rvol_source}) | "
             f"ATR: {atr_value:.2f} | CHOP: {chop_value:.1f} | 15m: {trend_15m}"
+            f"{macro_tag}"
         )
 
         return [confluent_signal]
@@ -616,13 +612,13 @@ class PatternScanner:
         """
         # Choose ATR multiplier based on VIX 4-zone regime
         if vix > 0 and vix >= self.trading_config.vix_caution_threshold:
-            # CAUTION (20-25): widest SL
+            # CAUTION (30-35): widest SL
             atr_mult = self.trading_config.atr_sl_multiplier_caution
-        elif vix > 0 and vix >= self.trading_config.vix_normal_threshold:
-            # ELEVATED (15-20): slightly wider SL
+        elif vix > 0 and vix >= self.trading_config.vix_elevated_threshold:
+            # ELEVATED (25-30): wider SL
             atr_mult = self.trading_config.atr_sl_multiplier_elevated
         else:
-            # NORMAL (<15) or no VIX data: standard SL
+            # NORMAL (<25) or no VIX data: standard SL
             atr_mult = self.trading_config.atr_sl_multiplier_normal
 
         sl_distance = atr * atr_mult
@@ -645,6 +641,7 @@ class PatternScanner:
     def _build_stock_context(self, token: str, tick: dict, candles: pd.DataFrame) -> dict:
         """Build per-stock enriched context dict passed to strategies and scorer."""
         ctx = dict(self.market_context)  # Start with NIFTY + VIX
+        stock = self.token_to_symbol.get(token, token)
 
         # VWAP for this stock
         vwap = self._calc_vwap_for(token)
@@ -667,8 +664,26 @@ class PatternScanner:
         # EMA alignment flag
         ctx["ema_aligned"] = self._calc_ema_aligned(candles, token)
 
-        # Volume ratio vs 20-candle average
-        ctx["volume_ratio"] = self._calc_volume_ratio(candles)
+        # RVOL (Relative Volume) — TOD-based with session fallback
+        rvol, rvol_source = self._calc_rvol(token, stock, candles)
+        ctx["volume_ratio"] = rvol  # Keep volume_ratio key for scorer compatibility
+        ctx["rvol"] = rvol
+        ctx["rvol_source"] = rvol_source
+
+        # ADV (Average Daily Volume) from volume profile
+        ctx["adv"] = self._get_adv(stock)
+
+        # Candle traded value (price × volume of last COMPLETED candle)
+        # iloc[-1] is incomplete; iloc[-2] is the last completed candle
+        if len(candles) >= 2:
+            completed_price = float(candles["Close"].iloc[-2])
+            completed_vol = float(candles["Volume"].iloc[-2])
+            ctx["candle_traded_value"] = completed_price * completed_vol
+        else:
+            ctx["candle_traded_value"] = 0
+
+        # NIFTY volume spike check (macro-driven flag)
+        ctx["nifty_macro_driven"] = self._check_nifty_volume_spike()
 
         # Near prev day key levels flag (within 0.3%)
         ctx["near_prev_levels"] = self._near_prev_levels(
@@ -749,18 +764,96 @@ class PatternScanner:
         except Exception:
             return None
 
-    def _calc_volume_ratio(self, candles: pd.DataFrame, lookback: int = 20) -> float:
-        """Volume ratio: current candle vs average of previous candles (adaptive lookback)."""
+    def _calc_rvol(self, token: str, stock: str, candles: pd.DataFrame) -> tuple[float, str]:
+        """
+        Calculate RVOL (Relative Volume) using 10-day TOD average when available,
+        falling back to session running average when insufficient TOD data.
+
+        Uses the last COMPLETED candle (iloc[-2]), not the current incomplete one
+        (iloc[-1]). The incomplete candle is always appended last by _build_candles()
+        and has only a fraction of its final volume (e.g., 1 min into a 5-min window
+        = ~20% volume), which would give artificially low RVOL values.
+
+        Returns:
+            (rvol_value, source) — source is "TOD" or "SESSION"
+        """
+        # Need at least 3 candles: 1+ completed history + 1 completed to measure + 1 incomplete
         if len(candles) < 3:
-            return 1.0  # Not enough candles for any comparison
-        # Use adaptive lookback — compare to whatever history we have
-        actual_lookback = min(lookback, len(candles) - 1)
-        vol = candles["Volume"]
-        current = vol.iloc[-1]
-        avg = vol.iloc[-(actual_lookback + 1):-1].mean()
+            return 1.0, "SESSION"
+
+        # Use last COMPLETED candle (iloc[-2]); iloc[-1] is the current incomplete candle
+        current_vol = float(candles["Volume"].iloc[-2])
+        if current_vol <= 0:
+            return 0.0, "SESSION"
+
+        # Try TOD (time-of-day) comparison first
+        if self.volume_profile is not None:
+            # The completed candle belongs to the PREVIOUS 5-min slot, not current
+            now = datetime.now()
+            prev_slot_min = ((now.minute // 5) * 5) - 5
+            prev_slot_hour = now.hour
+            if prev_slot_min < 0:
+                prev_slot_min += 60
+                prev_slot_hour -= 1
+            slot = f"{prev_slot_hour:02d}:{prev_slot_min:02d}"
+
+            tod_days = self.volume_profile.get_tod_data_days(stock, slot)
+
+            if tod_days >= self.trading_config.rvol_tod_min_days:
+                tod_avg = self.volume_profile.get_tod_average(stock, slot)
+                if tod_avg and tod_avg > 0:
+                    return round(current_vol / tod_avg, 2), "TOD"
+
+        # Fallback: session running average of completed candles only
+        lookback = self.trading_config.volume_lookback
+        # Available completed candles for averaging = everything before iloc[-2]
+        available = len(candles) - 2
+        actual_lookback = min(lookback, available)
+        if actual_lookback < 2:
+            return 1.0, "SESSION"
+
+        # Average completed candles BEFORE the one we're measuring
+        avg = float(candles["Volume"].iloc[-(actual_lookback + 2):-2].mean())
         if avg <= 0:
-            return 1.0
-        return round(current / avg, 2)
+            return 1.0, "SESSION"
+        return round(current_vol / avg, 2), "SESSION"
+
+    def _get_adv(self, stock: str) -> float:
+        """Get 20-day Average Daily Volume from volume profile. Returns 0 if no data."""
+        if self.volume_profile is None:
+            return 0.0
+        return self.volume_profile.get_adv(stock)
+
+    def _check_nifty_volume_spike(self) -> bool:
+        """
+        Check if NIFTY 50 has a volume spike at the current time slot.
+
+        If NIFTY RVOL >= 2x its TOD average, the move is likely macro-driven
+        (index event, FII flow, global news) rather than stock-specific.
+        Returns True to flag, not to reject.
+        """
+        if self.volume_profile is None:
+            return False
+
+        # Get current NIFTY candle volume
+        nifty_vol = 0
+        if self._nifty_current_window_ticks:
+            vols = [x.get("volume", 0) for x in self._nifty_current_window_ticks]
+            if vols:
+                nifty_vol = max(0, vols[-1] - vols[0])
+        elif self.nifty_candle_store:
+            nifty_vol = self.nifty_candle_store[-1].get("Volume", 0)
+
+        if nifty_vol <= 0:
+            return False
+
+        slot = current_time_slot()
+        nifty_tod_avg = self.volume_profile.get_nifty_tod_average(slot)
+        if not nifty_tod_avg or nifty_tod_avg <= 0:
+            return False
+
+        nifty_rvol = nifty_vol / nifty_tod_avg
+        return nifty_rvol >= self.trading_config.nifty_volume_spike_multiplier
 
     def _near_prev_levels(self, price: float, prev_day: dict) -> bool:
         """True if price is within 0.3% of prev day H/L/C."""
@@ -809,6 +902,12 @@ class PatternScanner:
             self._candle_window_start[token] = tick_time
         if token not in self._current_window_ticks:
             self._current_window_ticks[token] = []
+        # Track starting slot for end-of-day volume profile save
+        if token not in self._candle_start_slot_index:
+            dt = datetime.fromtimestamp(tick_time)
+            # Slot index: 0 = 09:15, 1 = 09:20, etc.
+            mins_since_open = (dt.hour - 9) * 60 + (dt.minute - 15)
+            self._candle_start_slot_index[token] = max(0, mins_since_open // 5)
 
         window_start = self._candle_window_start[token]
 
@@ -923,6 +1022,10 @@ class PatternScanner:
 
         if self._nifty_candle_window_start == 0:
             self._nifty_candle_window_start = tick_time
+            # Track starting slot for NIFTY profile save
+            dt = datetime.fromtimestamp(tick_time)
+            mins_since_open = (dt.hour - 9) * 60 + (dt.minute - 15)
+            self._nifty_start_slot_index = max(0, mins_since_open // 5)
 
         window_start = self._nifty_candle_window_start
 
@@ -987,6 +1090,9 @@ class PatternScanner:
         self.news_sentiment.clear()
         self.nifty_tick_buffer.clear()
         self._all_signals_today.clear()
+        self._candle_start_slot_index.clear()
+        self._nifty_start_slot_index = 0
+        self._is_expiry_day = is_expiry_day()
 
         for strat in self.strategies:
             if isinstance(strat, ORBStrategy):

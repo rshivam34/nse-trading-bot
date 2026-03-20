@@ -256,7 +256,10 @@ class DataStream:
 
         # Format tokens for Angel One's subscription format
         # Angel One wants: [{"exchangeType": 1, "tokens": ["2885", "1594", ...]}]
-        token_list = [{"exchangeType": NSE_EXCHANGE_TYPE, "tokens": self._subscribed_tokens}]
+        # IMPORTANT: pass a COPY of the tokens list. SmartWebSocketV2.subscribe()
+        # mutates the list internally, so passing the original reference causes
+        # _subscribed_tokens to double on every reconnect (6272 → 12544 → 24K...)
+        token_list = [{"exchangeType": NSE_EXCHANGE_TYPE, "tokens": list(self._subscribed_tokens)}]
 
         try:
             self._sws.subscribe(

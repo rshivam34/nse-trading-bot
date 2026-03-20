@@ -150,8 +150,8 @@ class NewsSentimentFetcher:
             all_market_news = market_news + global_news
             self._global_risk = self._check_global_risk(all_market_news)
             if self._global_risk:
-                logger.warning(
-                    "GLOBAL RISK EVENT detected in news — position sizes will be reduced by 50%"
+                logger.info(
+                    "Global risk keyword detected in news (flagged for awareness, no size reduction)"
                 )
 
             # Step 2: Fetch targeted news for top N stocks (batch API calls)

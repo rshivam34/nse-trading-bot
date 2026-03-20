@@ -43,6 +43,11 @@ class Signal:
     skip_reason: str = ""         # Why signal was skipped (for logging)
     status: str = "PENDING"       # EXECUTED/QUEUED/SKIPPED-* (signal queue)
 
+    # ── Volume profile fields (TOD RVOL) ──────────────────────────────
+    rvol: float = 0.0            # Relative Volume vs TOD average (or session avg fallback)
+    adv: float = 0.0             # Average Daily Volume (20-day, shares)
+    macro_driven: bool = False   # True if NIFTY RVOL >= 2x at same time (macro event)
+
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = datetime.now()
@@ -90,6 +95,9 @@ class Signal:
             "trend_15m": self.trend_15m,
             "status": self.status,
             "skip_reason": self.skip_reason,
+            "rvol": self.rvol,
+            "adv": self.adv,
+            "macro_driven": self.macro_driven,
         }
 
     def __str__(self) -> str:

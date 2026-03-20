@@ -616,6 +616,38 @@ class BrokerConnection:
                     return filled
         return 0
 
+    def get_order_fill_details(self, order_id: str) -> tuple[int, float]:
+        """
+        Get filled quantity AND average fill price for an order in one API call.
+
+        Why both at once: Avoids two separate orderBook calls. The broker knows
+        the exact average price you paid (averageprice field), which may differ
+        from the LIMIT price you requested.
+
+        Returns:
+            (filled_qty, avg_fill_price). Returns (0, 0.0) if not found.
+        """
+        if not self._check_connected():
+            return 0, 0.0
+
+        response = self._api_with_retry(self.session.orderBook)
+        if response and response.get("status"):
+            orders = response.get("data") or []
+            for order in orders:
+                if order.get("orderid") == order_id:
+                    filled = int(order.get("filledshares", 0) or 0)
+                    avg_price = float(order.get("averageprice", 0) or 0)
+                    total = int(order.get("quantity", 0) or 0)
+                    status = order.get("status", "").lower()
+
+                    if filled > 0 and filled < total and status not in ("complete", "cancelled", "rejected"):
+                        logger.warning(
+                            f"Partial fill: order {order_id} filled {filled}/{total} shares "
+                            f"@ avg Rs.{avg_price:.2f}"
+                        )
+                    return filled, avg_price
+        return 0, 0.0
+
     def get_prev_day_ohlc(self, token: str, trading_symbol: str) -> dict:
         """
         Fetch yesterday's Open, High, Low, Close for a stock.
@@ -741,11 +773,21 @@ class BrokerConnection:
                     candles = data["data"]
                     if len(candles) >= 2:
                         prev = candles[-2]
+                        # Extract daily volumes from all candles for ADV calculation
+                        # Each candle: [timestamp, open, high, low, close, volume]
+                        daily_volumes = []
+                        for c in candles:
+                            try:
+                                if len(c) > 5:
+                                    daily_volumes.append(int(c[5]))
+                            except (ValueError, TypeError):
+                                pass
                         return {
                             "prev_open": float(prev[1]),
                             "prev_high": float(prev[2]),
                             "prev_low": float(prev[3]),
                             "prev_close": float(prev[4]),
+                            "daily_volumes": daily_volumes,
                         }
                     logger.debug(f"Not enough candle history for {symbol}")
                     return None
@@ -866,6 +908,37 @@ class BrokerConnection:
             # Extra pause between batches (not after last batch)
             if i + batch_size < len(affordable):
                 time_module.sleep(batch_gap)
+
+        # STEP 3b: Retry failed stocks after a cool-down pause
+        # Rate-limit errors (AB1019/AB1004) are transient — a second pass
+        # after a longer pause recovers most of them.
+        failed_stocks = [
+            s for s in affordable
+            if s.get("symbol", "UNKNOWN") not in ohlc_results
+        ]
+        if failed_stocks:
+            logger.info(
+                f"OHLC retry pass: {len(failed_stocks)} stocks failed on first attempt. "
+                f"Waiting 10s then retrying with slower rate..."
+            )
+            time_module.sleep(10)  # Cool-down before retry pass
+
+            retry_ok = 0
+            for i, stock_item in enumerate(failed_stocks):
+                symbol = stock_item.get("symbol", "UNKNOWN")
+                # Extra 1s gap between each retry call (on top of rate limiter)
+                if i > 0:
+                    time_module.sleep(1)
+                data = self.fetch_prev_day_ohlc(stock_item, from_date, to_date)
+                if data:
+                    ohlc_results[symbol] = data
+                    ok_count += 1
+                    fail_count -= 1
+                    retry_ok += 1
+
+            logger.info(
+                f"OHLC retry pass recovered {retry_ok}/{len(failed_stocks)} stocks"
+            )
 
         # STEP 4: Cache results for mid-day restarts
         save_ohlc_cache(ohlc_results)

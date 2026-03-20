@@ -108,6 +108,43 @@ def resample_to_15min(ohlc_5min: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def candle_price_confirmation(
+    open_price: float,
+    high_price: float,
+    low_price: float,
+    close_price: float,
+    min_move_pct: float = 0.3,
+    min_body_ratio: float = 0.60,
+) -> bool:
+    """
+    Check if a candle shows real directional conviction.
+
+    Two conditions must be met:
+    1. Price moved at least min_move_pct in one direction (|close - open| / open >= 0.3%)
+    2. Body-to-range ratio >= min_body_ratio (body is >= 60% of total range)
+       A high body ratio means the candle closed near its extreme — strong conviction.
+       A low body ratio (long wicks) means indecision — not a clean move.
+
+    Returns True if candle passes both conditions, False otherwise.
+    """
+    if open_price <= 0 or high_price <= low_price:
+        return False
+
+    # Condition 1: minimum price move
+    move_pct = abs(close_price - open_price) / open_price * 100
+    if move_pct < min_move_pct:
+        return False
+
+    # Condition 2: body-to-range ratio (candle body / total range)
+    body = abs(close_price - open_price)
+    candle_range = high_price - low_price
+    if candle_range <= 0:
+        return False
+
+    body_ratio = body / candle_range
+    return body_ratio >= min_body_ratio
+
+
 def is_atr_expanding(candles: pd.DataFrame, atr_period: int = 14, lookback: int = 5) -> bool:
     """
     Check if ATR is expanding (current ATR > ATR from 'lookback' candles ago).
@@ -147,14 +184,15 @@ def get_current_atr(candles: pd.DataFrame, period: int = 14) -> float:
 def get_current_choppiness(candles: pd.DataFrame, period: int = 14) -> float:
     """
     Get the current Choppiness Index value from candle data.
-    Returns 100.0 (maximally choppy = safe default that blocks signals) if insufficient data.
+    Returns 50.0 (neutral — don't block) if insufficient data.
+    Other filters (volume, score, confluence) still protect during early session.
     """
     if len(candles) < period + 1:
-        return 100.0
+        return 50.0
 
     chop = choppiness_index(candles["High"], candles["Low"], candles["Close"], period=period)
     val = chop.iloc[-1]
-    return round(float(val), 1) if not np.isnan(val) else 100.0
+    return round(float(val), 1) if not np.isnan(val) else 50.0
 
 
 def get_15min_trend(candles_5min: pd.DataFrame, flat_threshold_pct: float = 0.05) -> str:

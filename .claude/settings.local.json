@@ -19,7 +19,9 @@
       "WebFetch(domain:smartapi.angelone.in)",
       "WebFetch(domain:api.angel.co)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:query1.finance.yahoo.com)"
+      "WebFetch(domain:query1.finance.yahoo.com)",
+      "Bash(grep \"EXCEPTIONAL\" \"C:/Users/rshiv/nse-trading-bot/backend/logs/trading_bot_2026-03-12.log\" | sed 's/.*signal: //' | sort -u -t'—' -k1,1 | sed 's/ — / | /g')",
+      "WebSearch"
     ]
   }
 }

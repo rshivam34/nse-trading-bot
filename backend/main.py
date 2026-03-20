@@ -38,6 +38,7 @@ from utils.watchlist import get_watchlist, get_nifty_token, get_banknifty_token,
 from utils.news_sentiment import NewsSentimentFetcher
 from utils.market_regime import MarketRegimeDetector
 from utils.trade_analytics import TradeAnalytics
+from utils.volume_profile import VolumeProfileManager
 from core.broker import BrokerConnection
 from core.data_stream import DataStream
 from core.scanner import PatternScanner
@@ -122,10 +123,11 @@ class TradingBot:
         self.order_manager.set_data_stream(self.data_stream)
         self.firebase = FirebaseSync(config.firebase)
 
-        # New: news sentiment, regime detector, analytics
+        # New: news sentiment, regime detector, analytics, volume profiles
         self.news_fetcher = NewsSentimentFetcher(config.news)
         self.regime_detector = MarketRegimeDetector(config.trading)
         self.analytics = TradeAnalytics(config.trading.csv_log_path)
+        self.volume_profile = VolumeProfileManager(config.trading.volume_profile_path)
 
         # Token IDs for index instruments
         self.watchlist: list[dict] = []
@@ -292,8 +294,15 @@ class TradingBot:
                 f"adopted positions keep existing size, new trades will be reduced 50%"
             )
 
-        # Step 7: Wire scanner to watchlist
+        # Step 7: Wire scanner to watchlist + volume profiles
         self.scanner.set_watchlist(self.watchlist)
+
+        # Load volume profiles (TOD averages + ADV cache from previous days)
+        self.volume_profile.load()
+        self.scanner.set_volume_profile(self.volume_profile)
+
+        # Populate ADV from daily volumes captured in OHLC fetch
+        self._populate_adv_from_ohlc()
 
         # Step 7a: Pre-seed intraday candles (if market already open)
         # Makes all strategies + indicators ready immediately on late starts
@@ -505,11 +514,11 @@ class TradingBot:
         firebase_news = {**news_sentiment, "global_risk_day": self.news_fetcher.is_global_risk_day()}
         self.firebase.push_news_sentiment(firebase_news)
 
-        # If global risk day detected, notify risk manager to reduce position sizes
+        # Flag global risk day for awareness (no size reduction — VIX/ATR handle volatility)
         if self.news_fetcher.is_global_risk_day():
-            logger.warning(
-                "GLOBAL RISK DAY — geopolitical/macro event detected. "
-                "Position sizes will be reduced by 50%."
+            logger.info(
+                "Global risk day flagged (geopolitical keyword in news). "
+                "No size reduction — VIX zones + ATR-based SL handle real volatility."
             )
             self.risk_manager.set_global_risk_day(True)
 
@@ -562,7 +571,8 @@ class TradingBot:
             (ohlc_results, affordable_stocks, ltp_cache)
         """
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=7)
+        # 35 calendar days back to capture ~20 trading days for ADV calculation
+        from_date = to_date - timedelta(days=35)
         from_date_str = from_date.strftime("%Y-%m-%d %H:%M")
         to_date_str = to_date.strftime("%Y-%m-%d %H:%M")
 
@@ -588,6 +598,44 @@ class TradingBot:
         )
 
         return ohlc_results, affordable, ltp_cache
+
+    def _populate_adv_from_ohlc(self):
+        """
+        Populate Average Daily Volume (ADV) from the daily volumes
+        captured during the OHLC fetch (now 35 days back instead of 7).
+
+        The OHLC fetch returns a 'daily_volumes' list for each stock
+        (volume per day for the last ~20 trading days). This is used
+        by the ADV filter to reject illiquid stocks (< 5 lakh shares ADV).
+        """
+        if not hasattr(self, '_affordable_stocks') or not self._affordable_stocks:
+            return
+
+        # The prev_day_levels dict (token-keyed) has daily_volumes from the OHLC fetch
+        prev_day_by_token = self.scanner.prev_day_levels
+        token_to_symbol = {item["token"]: item["symbol"] for item in self.watchlist}
+
+        adv_count = 0
+        for token, levels in prev_day_by_token.items():
+            daily_volumes = levels.get("daily_volumes", [])
+            if not daily_volumes:
+                continue
+
+            symbol = token_to_symbol.get(token)
+            if symbol:
+                self.volume_profile.set_adv_from_daily_volumes(symbol, daily_volumes)
+                adv_count += 1
+
+        if adv_count > 0:
+            logger.info(
+                f"ADV populated for {adv_count} stocks from OHLC daily volumes "
+                f"(min required: {config.trading.min_adv_shares:,} shares)"
+            )
+        else:
+            logger.warning(
+                "No ADV data populated — ADV filter will be skipped "
+                "(no daily volume data in OHLC response)"
+            )
 
     def _fetch_intraday_candles(self):
         """
@@ -736,7 +784,12 @@ class TradingBot:
                         self._vix_ws_received = True  # WebSocket is delivering VIX data
                     self._apply_vix(vix)
                 else:
-                    self.scanner.update_market_context(tick)
+                    # Only NIFTY 50 ticks update market context (direction + choppiness).
+                    # BANKNIFTY ticks must NOT go into the NIFTY choppiness calculation —
+                    # mixing NIFTY (~23K) and BANKNIFTY (~51K) LTP into the same candle
+                    # store creates candles with 27K+ range, making Choppiness = 100 always.
+                    if token == self.nifty_token:
+                        self.scanner.update_market_context(tick)
                     self.regime_detector.update_nifty(tick)
 
                 # Push market context to Firebase — non-critical, wrap separately
@@ -1005,22 +1058,49 @@ class TradingBot:
         """
         Called when a position fully closes (SL hit, target hit, or force exit).
         Logs the trade to CSV and updates Firebase.
+
+        Uses portfolio.trade_log (which has correct P&L from _close_remaining)
+        instead of position.to_dict() (which had mismatched key names causing
+        empty CSV fields and Rs.0.00 on Firebase).
         """
-        trade_data = position.to_dict()
+        # Find this trade's P&L data from portfolio (has correct entry, exit, P&L).
+        # _close_remaining() adds to trade_log with keys: stock, entry, exit,
+        # gross_pnl, net_pnl, charges, reason, strategy_name, score, etc.
+        trade_data = {}
+        for log_entry in reversed(self.portfolio.trade_log):
+            if log_entry.get("stock") == position.signal.stock:
+                trade_data = dict(log_entry)
+                break
+
+        # Fallback: if not found in portfolio log, build from position data
+        if not trade_data:
+            trade_data = position.to_dict()
+            logger.warning(
+                f"Trade for {position.signal.stock} not found in portfolio log — "
+                "using position data (P&L may be missing)"
+            )
 
         # Add market context at time of close for analytics
         trade_data["nifty_direction"] = self.scanner.market_context.get("nifty_direction", "")
         trade_data["regime"] = self.regime_detector.regime if self.regime_determined else "UNKNOWN"
         trade_data["vix"] = self.scanner.market_context.get("vix", 0)
 
-        # Add R-multiple from the last recorded trade in portfolio
-        if self.portfolio.trade_log:
-            last_trade = self.portfolio.trade_log[-1]
-            trade_data["r_multiple"] = last_trade.get("r_multiple", 0)
-            trade_data["planned_r_target"] = last_trade.get("planned_r_target", 0)
-            trade_data["confluence_count"] = last_trade.get("confluence_count", 0)
-            trade_data["confluence_strategies"] = last_trade.get("confluence_strategies", [])
-            trade_data["atr_value"] = last_trade.get("atr_value", 0)
+        # Map key names for CSV compatibility (TRADE_FIELDS expects exact names).
+        # Portfolio uses "entry"/"exit"/"reason" but CSV expects
+        # "entry_price"/"exit_price"/"exit_reason".
+        trade_data["entry_price"] = trade_data.get("entry", position.actual_entry)
+        trade_data["exit_price"] = trade_data.get("exit", position.exit_price)
+        trade_data["hold_time_minutes"] = trade_data.get("hold_time_min", round(position.hold_time_minutes, 1))
+        trade_data["exit_reason"] = trade_data.get("reason", position.exit_reason)
+        trade_data["strategy"] = trade_data.get("strategy_name", position.signal.strategy_name)
+        trade_data.setdefault("volume_ratio", getattr(position.signal, "rvol", 0))
+        trade_data.setdefault("rsi_at_entry", 0)
+        trade_data.setdefault("score", getattr(position.signal, "score", 0))
+
+        # Ensure charges is a float for CSV (portfolio stores as dict from calculate_charges)
+        raw_charges = trade_data.get("charges", 0)
+        if isinstance(raw_charges, dict):
+            trade_data["charges"] = raw_charges.get("total_charges", 0)
 
         # Log to CSV — local file write, keep trading even if this fails
         try:
@@ -1039,9 +1119,10 @@ class TradingBot:
                 "Dashboard may be out of date but trading continues."
             )
 
+        net_pnl = trade_data.get("net_pnl", 0)
         logger.info(
             f"Position closed: {position.signal.stock} "
-            f"Net P&L: Rs.{trade_data.get('net_pnl', 0):+,.2f} | "
+            f"Net P&L: Rs.{net_pnl:+,.2f} | "
             f"Hold: {trade_data.get('hold_time_minutes', 0):.0f} min | "
             f"Exit: {trade_data.get('exit_reason', '?')}"
         )
@@ -1139,17 +1220,44 @@ class TradingBot:
     # End of Day & Shutdown
     # ----------------------------------------------------------------
 
+    def _record_force_closed_positions(self):
+        """Record all force-closed positions to CSV and Firebase.
+
+        Called after exit_all_positions() during end-of-day, kill switch, or shutdown.
+        Without this, force-exited trades would have correct P&L in the portfolio
+        total but NO individual entries in CSV or Firebase.
+        """
+        for pos in self.order_manager.closed_positions:
+            # Skip if already recorded (check by looking in trade_log)
+            already_recorded = False
+            for log_entry in self.portfolio.trade_log:
+                if (log_entry.get("stock") == pos.signal.stock
+                        and log_entry.get("reason") in ("FORCE_EXIT", "KILL_SWITCH")):
+                    # Found matching force-exit record — check if already pushed
+                    if not log_entry.get("_csv_recorded"):
+                        self._on_position_closed(pos)
+                        log_entry["_csv_recorded"] = True
+                    already_recorded = True
+                    break
+            if not already_recorded and pos.exit_reason in ("FORCE_EXIT", "KILL_SWITCH"):
+                self._on_position_closed(pos)
+
     def _end_of_day(self):
-        """End-of-day: close all positions, generate report, push to Firebase."""
+        """End-of-day: close all positions, generate report, save profiles, push to Firebase."""
         logger.info("Running end-of-day routine...")
 
         if not config.trading.suggest_only and not self._positions_exited:
             with self._position_lock:
                 self.order_manager.exit_all_positions()
+            # Record force-closed positions to CSV and Firebase
+            self._record_force_closed_positions()
             self._positions_exited = True
 
         report = self.portfolio.daily_report()
         self._print_report(report)
+
+        # Save today's volume data to rolling 10-day TOD profiles
+        self._save_volume_profiles()
 
         # Push analytics summary (strategy breakdown, score distribution, etc.)
         analytics_summary = self.analytics.get_today_summary()
@@ -1157,6 +1265,28 @@ class TradingBot:
 
         self.firebase.push_daily_report(report)
         self.firebase.push_portfolio(self.portfolio.get_state())
+
+    def _save_volume_profiles(self):
+        """
+        Save today's 5-min candle volumes to the rolling 10-day volume profile.
+
+        Called at end of day. Maps each completed candle to its time-of-day slot
+        (e.g., candle at index 0 with start_slot_index=0 → "09:15") and appends
+        today's volume to the rolling window for that slot.
+
+        After saving, tomorrow's RVOL calculations will include today's data.
+        """
+        try:
+            self.volume_profile.update_end_of_day(
+                candle_store=self.scanner.candle_store,
+                nifty_candle_store=self.scanner.nifty_candle_store,
+                token_to_symbol=self.scanner.token_to_symbol,
+                candle_start_slot_indices=self.scanner._candle_start_slot_index,
+                nifty_start_slot_index=self.scanner._nifty_start_slot_index,
+            )
+            self.volume_profile.save()
+        except Exception as e:
+            logger.warning(f"Volume profile save failed: {e}. Not critical — will retry tomorrow.")
 
     def _print_report(self, report: dict):
         """Print end-of-day report to console logs."""
@@ -1193,6 +1323,7 @@ class TradingBot:
         if not config.trading.suggest_only and not self._positions_exited:
             with self._position_lock:
                 self.order_manager.exit_all_positions()
+            self._record_force_closed_positions()
             self._positions_exited = True
 
         report = self.portfolio.daily_report()
@@ -1210,6 +1341,7 @@ class TradingBot:
         if not config.trading.suggest_only and not self._positions_exited and self.order_manager.open_positions:
             with self._position_lock:
                 self.order_manager.exit_all_positions()
+            self._record_force_closed_positions()
             self._positions_exited = True
 
         self.broker.disconnect()
@@ -1239,7 +1371,7 @@ class TradingBot:
                      f"(floor {config.trading.atr_sl_floor_pct}%, "
                      f"ceiling {config.trading.atr_sl_ceiling_pct}%)")
         logger.info(f"  |- Target: {config.trading.risk_reward_ratio}R from entry")
-        logger.info(f"  |- Volume gate: {config.trading.volume_spike_multiplier}x average minimum")
+        logger.info(f"  |- RVOL: score modifier (<1x=-10, 1-2x=-5, >=3x=+5)")
         logger.info(f"  |- VIX zones: NORMAL <{config.trading.vix_normal_threshold} | "
                      f"ELEVATED {config.trading.vix_normal_threshold}-"
                      f"{config.trading.vix_elevated_threshold} | "
