@@ -308,14 +308,22 @@ class TradingBot:
         # Makes all strategies + indicators ready immediately on late starts
         self._fetch_intraday_candles()
 
-        # Step 8: Set up Firebase listeners
+        # Step 8: Set up Firebase listeners + clear stale data
         if self.firebase.is_connected:
+            # Clear stale positions from previous session (prevents phantom entries on dashboard).
+            # Real positions adopted from Angel One (Step 3) will be re-pushed below.
+            self.firebase.clear_all_positions()
             self.firebase.clear_today_signals()
             self.firebase.reset_kill_switch()
             self.firebase.set_trading_enabled(True)
             self.firebase.set_running()
+            self.firebase.push_portfolio(self.portfolio.get_state())  # Push fresh portfolio state
             self.firebase.listen_for_kill_switch(callback=self._on_kill_switch)
             self.firebase.listen_for_trading_enabled(callback=self._on_trading_enabled_changed)
+
+            # Re-push any adopted positions (from Step 3) to Firebase
+            for pos in self.order_manager.open_positions:
+                self.firebase.push_position(pos.signal.stock, pos.to_dict())
 
         # Step 9: Wire WebSocket reconnect callback
         self.data_stream.on_reconnect = self._on_websocket_reconnect

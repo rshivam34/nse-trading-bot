@@ -228,6 +228,24 @@ class FirebaseSync:
             logger.error(f"Failed to remove position: {e}")
             return False
 
+    def clear_all_positions(self) -> bool:
+        """Delete ALL positions from Firebase on startup.
+
+        Prevents stale phantom positions from showing on the dashboard after
+        a restart. The bot will re-push any REAL positions it adopts from
+        Angel One's getPosition() API.
+        """
+        if not self.is_connected:
+            return False
+
+        try:
+            db.reference("positions").delete()
+            logger.info("Cleared all stale positions from Firebase")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear Firebase positions: {e}")
+            return False
+
     def push_daily_report(self, report: dict) -> bool:
         """
         Push end-of-day performance report.
