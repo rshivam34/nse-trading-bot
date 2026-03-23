@@ -127,6 +127,11 @@ class Backtester:
         self.capital = self.trading_config.initial_capital
         self.start_capital = self.capital
 
+    def set_capital(self, capital: float):
+        """Override starting capital for scenario testing."""
+        self.capital = capital
+        self.start_capital = capital
+
     def run(self, start_date: str, end_date: str, stocks: list[str] = None):
         """Main entry point. Fetch data and simulate day by day."""
         if stocks is None:
@@ -243,8 +248,8 @@ class Backtester:
                     continue
 
                 vix = vix_daily.get(day, 15.0)
-                if vix > 25:
-                    continue  # DANGER — no options
+                if vix >= self.trading_config.vix_caution_threshold:
+                    continue  # VIX >= 18 = CASH — no trades (equity or options)
 
                 # Reset strategy for new day
                 opt_strategy.reset_daily()
@@ -440,14 +445,11 @@ class Backtester:
             hist_trend = "NEUTRAL"
 
         # Determine stance from historical DMA + daily VIX
-        if vix > 25:
+        vix_threshold = self.trading_config.vix_caution_threshold  # 18.0
+        if vix >= vix_threshold:  # VIX >= 18 = CASH (no trades)
             stance = "CASH"
             max_trades = 0
             stance_size_pct = 0.0
-        elif vix > 18:
-            stance = "DEFENSIVE"
-            max_trades = 2
-            stance_size_pct = 50.0
         elif not above_200:
             stance = "DEFENSIVE"
             max_trades = 2
@@ -456,7 +458,7 @@ class Backtester:
             stance = "MODERATE"
             max_trades = 3
             stance_size_pct = 100.0
-        elif vix < 18 and above_50 and above_200:
+        elif vix < vix_threshold and above_50 and above_200:
             stance = "AGGRESSIVE"
             max_trades = 5
             stance_size_pct = 100.0
