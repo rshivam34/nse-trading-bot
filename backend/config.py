@@ -319,6 +319,15 @@ class TradingConfig:
     fair_value_undervalued_bonus: int = 5    # +5 if PE < 0.7x sector average
     earnings_skip_enabled: bool = True       # Hard skip stocks with earnings this week
 
+    # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
+    options_enabled: bool = True
+    options_sl_pct: float = 30.0            # SL at 30% premium loss
+    options_target_pct: float = 50.0        # Target at 50% premium gain
+    options_exit_time: time = time(14, 0)   # Exit by 2 PM (theta decay)
+    options_max_premium: float = 500.0      # Max premium per lot (Rs.)
+    nifty_lot_size: int = 25
+    banknifty_lot_size: int = 15
+
     def __post_init__(self):
         """Validate config values to catch misconfiguration early."""
         assert self.max_trades_per_day > 0, "max_trades_per_day must be > 0"

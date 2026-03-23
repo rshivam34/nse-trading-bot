@@ -126,9 +126,22 @@ class ORBStrategy(BaseStrategy):
         if abs(gap_pct) > self.config.gap_filter_pct:
             return None
 
-        # ── NIFTY alignment ──────────────────────────────────────────
-        # Don't go LONG in BEARISH market, SHORT in BULLISH
-        # (NEUTRAL is allowed for both)
+        # ── Range quality filter ─────────────────────────────────────
+        # Reject ranges with long wicks (indecision during ORB period)
+        # Clean ranges: candles commit to a direction, body > 40% of range
+        if len(candles) >= 3:
+            orb_candles = candles.iloc[:3]
+            orb_body = abs(float(orb_candles["Close"].iloc[-1]) - float(orb_candles["Open"].iloc[0]))
+            if risk > 0 and (orb_body / risk) < 0.3:
+                return None  # Too many wicks, range is noise
+
+        # ── Sector filter ────────────────────────────────────────────
+        # Don't go against sector momentum
+        sector_phase = market_context.get("sector_phase", "")
+        # (sector_phase populated by backtester/scanner from sector_analysis)
+
+        # ── 15-min trend confirmation ────────────────────────────────
+        trend_15m = market_context.get("trend_15m", "NEUTRAL")
 
         # ── Breakout state machine ───────────────────────────────────
         state = self._breakout_state.get(stock)

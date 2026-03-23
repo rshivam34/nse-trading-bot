@@ -106,13 +106,11 @@ class Backtester:
         # 6 candles = 30 minutes (same intent as 60 ticks in live mode)
         self.indicator_config.vwap_trend_min_ticks = 6
 
-        # Strategies — ORB only (VWAP lost Rs.1,200/month in backtest, SR/EMA barely fire)
-        # Re-enable others after ORB is gross-positive
+        # Strategies — ORB only (proven gross-positive at +Rs.206 in Feb backtest)
+        # VWAP disabled: -Rs.1,298 loss even with 2-candle bounce + sector + time filters
+        # EMA/SR disabled: 0-1 trades in Feb, not enough signal
         self.strategies = [
             ORBStrategy(self.trading_config),
-            # VWAPBounceStrategy(self.trading_config, self.indicator_config),  # DISABLED: 22% win rate, -Rs.1,193 gross in Feb
-            # EMACrossoverStrategy(self.trading_config, self.indicator_config),  # DISABLED: 0 trades in Feb
-            # SRBreakoutStrategy(self.trading_config, self.indicator_config),  # DISABLED: 1 trade, 0% win rate
         ]
         self.scorer = SignalScorer()
 
@@ -381,6 +379,31 @@ class Backtester:
                 if len(vol) > 5 and float(vol.iloc[-5:-1].mean()) > 0:
                     vol_ratio = float(vol.iloc[-1]) / float(vol.iloc[-5:-1].mean())
 
+                # 15-min trend: resample 5-min candles to 15-min and check EMA 9/21
+                trend_15m = "NEUTRAL"
+                if len(history) >= 12:  # Need 4+ 15-min candles
+                    try:
+                        h15 = history.resample('15min').agg({
+                            'Open': 'first', 'High': 'max', 'Low': 'min',
+                            'Close': 'last', 'Volume': 'sum'
+                        }).dropna()
+                        if len(h15) >= 4:
+                            ema9_15 = h15["Close"].ewm(span=3, adjust=False).mean()  # ~9 on 5-min scale
+                            ema21_15 = h15["Close"].ewm(span=7, adjust=False).mean()  # ~21 on 5-min scale
+                            if float(ema9_15.iloc[-1]) > float(ema21_15.iloc[-1]) * 1.001:
+                                trend_15m = "BULLISH"
+                            elif float(ema9_15.iloc[-1]) < float(ema21_15.iloc[-1]) * 0.999:
+                                trend_15m = "BEARISH"
+                    except Exception:
+                        pass
+
+                # Sector phase for this stock
+                from utils.sector_analysis import STOCK_SECTOR_MAP
+                stock_sector = STOCK_SECTOR_MAP.get(stock, "")
+                sector_phase = ""
+                if stock_sector and sector_data and stock_sector in sector_data:
+                    sector_phase = sector_data[stock_sector].phase
+
                 market_context = {
                     "nifty_direction": nifty_dir,
                     "vwap": vwap,
@@ -393,6 +416,8 @@ class Backtester:
                     "vix": vix,
                     "gap_pct": 0,
                     "spread_pct": 0.05,
+                    "sector_phase": sector_phase,
+                    "trend_15m": trend_15m,
                 }
 
                 current_tick = {

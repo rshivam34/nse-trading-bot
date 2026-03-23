@@ -72,21 +72,39 @@ class VWAPBounceStrategy(BaseStrategy):
             return None
 
         nifty_dir = market_context.get("nifty_direction", "NEUTRAL")
+        sector_phase = market_context.get("sector_phase", "")
+        trend_15m = market_context.get("trend_15m", "NEUTRAL")
 
-        # EMA trend filter — only bounce in direction of intraday trend
-        # This prevents catching "bounces" that are actually against-trend noise
-        ema_aligned = market_context.get("ema_aligned", None)  # True = EMA9 > EMA21
-
-        # Use COMPLETED candle (iloc[-2]) — last row is incomplete
-        if len(candles) < 3:
+        # Sector filter: only bounce in LEADING/IMPROVING sectors
+        if sector_phase in ("LAGGING", "WEAKENING"):
             return None
 
-        completed = candles.iloc[-2]  # Last COMPLETED 5-min candle
+        # Time limit: VWAP bounces only 9:30-11:30 (afternoon bounces fail)
+        from datetime import timedelta, time as dt_time
+        if len(candles) > 0 and hasattr(candles.index[-1], 'hour'):
+            candle_time = candles.index[-1]
+            if hasattr(candle_time, 'hour') and candle_time.hour < 4:
+                candle_time = candle_time + timedelta(hours=5, minutes=30)
+            ist_t = candle_time.time() if hasattr(candle_time, 'time') else dt_time(12, 0)
+            if ist_t > dt_time(11, 30):
+                return None  # After 11:30 = no new VWAP bounces
+
+        # Need 2 COMPLETED candles for 2-candle bounce confirmation
+        if len(candles) < 4:
+            return None
+
+        # 2-candle bounce: both candles must confirm the bounce direction
+        completed = candles.iloc[-2]   # Latest completed candle
+        prev_completed = candles.iloc[-3]  # Previous completed candle (first bounce)
         candle_close = float(completed["Close"])
         candle_open = float(completed["Open"])
         candle_low = float(completed["Low"])
         candle_high = float(completed["High"])
         candle_vol = float(completed["Volume"])
+        prev_close = float(prev_completed["Close"])
+        prev_open = float(prev_completed["Open"])
+        prev_low = float(prev_completed["Low"])
+        prev_high = float(prev_completed["High"])
 
         # Prevent processing same candle twice
         candle_idx = len(candles)
@@ -105,15 +123,24 @@ class VWAPBounceStrategy(BaseStrategy):
         # Distance from VWAP
         distance_pct = abs(candle_close - vwap) / vwap * 100
 
-        # ── LONG SETUP ───────────────────────────────────────────────
+        # ── LONG SETUP (2-candle bounce confirmation) ──────────────────
+        # Both candles must: touch VWAP zone + close above VWAP + be green
+        prev_is_long_bounce = (
+            prev_low <= vwap * (1 + VWAP_ZONE_PCT / 100)  # First candle touched VWAP
+            and prev_close > vwap                           # Closed above VWAP
+            and prev_close > prev_open                      # Green candle
+        )
+        curr_is_long_confirm = (
+            candle_close > vwap                              # Second candle also above VWAP
+            and candle_close > candle_open                   # Also green (momentum continues)
+        )
         if (
             nifty_dir != "BEARISH"
-            and self._candles_above_vwap.get(token, 0) >= MIN_CANDLES_ABOVE  # Trending above VWAP
-            and candle_low <= vwap * (1 + VWAP_ZONE_PCT / 100)  # Candle touched VWAP zone
-            and candle_close > vwap                               # Closed ABOVE VWAP (bounce!)
-            and candle_close > candle_open                        # Green candle (buyers won)
-            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)    # Volume 1.5× average (was 1.2× — too permissive)
-            and self._rsi_not_overbought(candles)                 # Not chasing exhausted move
+            and (trend_15m != "BEARISH")                      # 15-min trend not against us
+            and self._candles_above_vwap.get(token, 0) >= MIN_CANDLES_ABOVE
+            and prev_is_long_bounce and curr_is_long_confirm  # 2-candle bounce confirmed
+            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)
+            and self._rsi_not_overbought(candles)
         ):
             entry = round(candle_close, 2)
             sl = round(vwap * (1 - SL_BEYOND_VWAP_PCT / 100), 2)
@@ -142,14 +169,22 @@ class VWAPBounceStrategy(BaseStrategy):
                 ),
             )
 
-        # ── SHORT SETUP ──────────────────────────────────────────────
+        # ── SHORT SETUP (2-candle bounce confirmation) ────────────────
+        prev_is_short_bounce = (
+            prev_high >= vwap * (1 - VWAP_ZONE_PCT / 100)
+            and prev_close < vwap
+            and prev_close < prev_open  # Red candle
+        )
+        curr_is_short_confirm = (
+            candle_close < vwap
+            and candle_close < candle_open  # Also red
+        )
         if (
             nifty_dir != "BULLISH"
+            and (trend_15m != "BULLISH")
             and self._candles_below_vwap.get(token, 0) >= MIN_CANDLES_ABOVE
-            and candle_high >= vwap * (1 - VWAP_ZONE_PCT / 100)  # Candle touched VWAP zone
-            and candle_close < vwap                                # Closed BELOW VWAP (rejection!)
-            and candle_close < candle_open                         # Red candle (sellers won)
-            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)    # Volume 1.5× average
+            and prev_is_short_bounce and curr_is_short_confirm
+            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)
             and self._rsi_not_oversold(candles)
         ):
             entry = round(candle_close, 2)
