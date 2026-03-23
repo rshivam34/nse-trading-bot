@@ -46,6 +46,9 @@ from core.risk_manager import RiskManager
 from core.order_manager import OrderManager
 from core.portfolio import Portfolio
 from utils.firebase_sync import FirebaseSync
+from utils.macro_analysis import MacroAnalyzer
+from utils.sector_analysis import SectorAnalyzer, STOCK_SECTOR_MAP
+from utils.fundamental_filter import FundamentalFilter
 
 
 logger = logging.getLogger(__name__)
@@ -304,7 +307,30 @@ class TradingBot:
         # Populate ADV from daily volumes captured in OHLC fetch
         self._populate_adv_from_ohlc()
 
-        # Step 7a: Pre-seed intraday candles (if market already open)
+        # Step 7b: Fundamental filter (earnings skip + red flags + fair value)
+        if config.trading.fundamental_filter_enabled:
+            logger.info("Running fundamental analysis (earnings, red flags, fair value)...")
+            try:
+                fundamental_filter = FundamentalFilter(
+                    cache_path=config.trading.fundamental_cache_path,
+                    cache_expiry_days=config.trading.fundamental_cache_expiry_days,
+                )
+                symbols = [s["symbol"] for s in self.watchlist]
+                fundamental_data = fundamental_filter.analyze(
+                    watchlist_symbols=symbols,
+                    sector_map=STOCK_SECTOR_MAP,
+                )
+                self.scanner.set_fundamental_data(fundamental_data)
+                if config.trading.earnings_skip_enabled:
+                    self.scanner.set_earnings_skip(fundamental_filter.earnings_skip_set)
+                logger.info(
+                    f"Fundamental analysis complete: {len(fundamental_data)} stocks, "
+                    f"{len(fundamental_filter.earnings_skip_set)} skipped (earnings this week)"
+                )
+            except Exception as e:
+                logger.warning(f"Fundamental analysis failed: {e}. Fundamental filter disabled for today.")
+
+        # Step 7c: Pre-seed intraday candles (if market already open)
         # Makes all strategies + indicators ready immediately on late starts
         self._fetch_intraday_candles()
 
@@ -535,7 +561,45 @@ class TradingBot:
             f"Global risk day: {self.news_fetcher.is_global_risk_day()}"
         )
 
-        # Check 5: Previous day OHLC (with capital-aware filter + caching)
+        # Check 5a: Macro analysis (NIFTY 50/200 DMA + Market Stance)
+        if config.trading.macro_analysis_enabled:
+            logger.info("Running macro analysis (NIFTY 50/200 DMA)...")
+            try:
+                macro_analyzer = MacroAnalyzer()
+                # Get current VIX for stance (may be 0 if no data yet)
+                vix_for_stance = 0.0
+                try:
+                    vix_for_stance = self.broker.get_vix() or 0.0
+                except Exception:
+                    pass
+                macro_data = macro_analyzer.analyze(vix=vix_for_stance)
+                self.scanner.set_macro_data(macro_data)
+                self.risk_manager.set_market_stance(
+                    stance=macro_data.market_stance,
+                    max_trades=macro_data.stance_max_trades,
+                    size_pct=macro_data.stance_size_pct,
+                )
+                status["macro_stance"] = macro_data.market_stance
+                status["nifty_trend"] = macro_data.nifty_trend
+                logger.info(
+                    f"Macro analysis complete: {macro_data.reason}"
+                )
+            except Exception as e:
+                logger.warning(f"Macro analysis failed: {e}. Using defaults (MODERATE stance).")
+
+        # Check 5b: Sector analysis (relative strength vs NIFTY)
+        if config.trading.sector_analysis_enabled:
+            logger.info("Running sector analysis (9 sector indices)...")
+            try:
+                sector_analyzer = SectorAnalyzer()
+                sector_data = sector_analyzer.analyze()
+                self.scanner.set_sector_data(sector_data)
+                status["sectors_analyzed"] = len(sector_data)
+                logger.info(f"Sector analysis complete: {len(sector_data)} sectors classified")
+            except Exception as e:
+                logger.warning(f"Sector analysis failed: {e}. Sector filter disabled for today.")
+
+        # Check 6: Previous day OHLC (with capital-aware filter + caching)
         ohlc_results, affordable, ltp_cache = self._fetch_prev_day_levels()
         self._affordable_stocks = affordable
         self._ltp_cache = ltp_cache
@@ -1393,13 +1457,8 @@ class TradingBot:
         logger.info(f"  |- Candle close confirmation: ON (breakout strategies)")
         logger.info(f"  |- Active hours: "
                      f"{config.trading.trading_window_1_start.strftime('%H:%M')}-"
-                     f"{config.trading.trading_window_1_end.strftime('%H:%M')}, "
-                     f"{config.trading.trading_window_2_start.strftime('%H:%M')}-"
-                     f"{config.trading.trading_window_2_end.strftime('%H:%M')}")
-        logger.info(f"  |- Lunch block: "
-                     f"{config.trading.lunch_block_start.strftime('%H:%M')}-"
-                     f"{config.trading.lunch_block_end.strftime('%H:%M')} "
-                     f"(no new trades)")
+                     f"{config.trading.trading_window_2_end.strftime('%H:%M')} (continuous)")
+        logger.info(f"  |- Lunch block: OFF (flag only, no blocking)")
         logger.info(f"  |- Pre-flight checklist: 17 checks (14 active + 3 pre-verified)")
         logger.info("=" * 60)
 

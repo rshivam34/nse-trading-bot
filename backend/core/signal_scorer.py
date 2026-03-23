@@ -43,6 +43,9 @@ class SignalScorer:
         signal,                  # Signal dataclass from base_strategy.py
         market_context: dict,    # Enriched context from scanner._build_stock_context()
         news_sentiment: dict,    # {symbol: {sentiment, score, skip_today}}
+        macro_data=None,         # MacroData from macro_analysis.py (optional)
+        sector_data=None,        # {sector_name: SectorStrength} (optional)
+        fundamental_data=None,   # {stock: StockFundamentals} (optional)
     ) -> tuple[int, dict]:
         """
         Score a signal from 0-100.
@@ -172,6 +175,53 @@ class SignalScorer:
             breakdown["vix_low"] = 3  # No VIX data — assume normal, partial credit
         else:
             breakdown["vix_low"] = 0
+
+        # ── MACRO ALIGNMENT (NIFTY DMA trend) ─────────────────────────────
+        # +10 if signal direction aligns with NIFTY macro trend, -10 if against
+        if macro_data is not None and hasattr(macro_data, 'nifty_trend'):
+            nifty_trend = macro_data.nifty_trend
+            if (direction == "LONG" and nifty_trend == "BULLISH") or \
+               (direction == "SHORT" and nifty_trend == "BEARISH"):
+                breakdown["macro_aligned"] = 10
+            elif nifty_trend == "NEUTRAL":
+                breakdown["macro_aligned"] = 0
+            else:
+                breakdown["macro_aligned"] = -10
+        else:
+            breakdown["macro_aligned"] = 0
+
+        # ── SECTOR ALIGNMENT ──────────────────────────────────────────────
+        # +5 for LEADING/IMPROVING sectors, -5 for WEAKENING/LAGGING
+        if sector_data:
+            from utils.sector_analysis import STOCK_SECTOR_MAP
+            sector_name = STOCK_SECTOR_MAP.get(signal.stock, "")
+            if sector_name and sector_name in sector_data:
+                phase = sector_data[sector_name].phase
+                if phase in ("LEADING", "IMPROVING"):
+                    breakdown["sector_aligned"] = 5
+                elif phase in ("WEAKENING", "LAGGING"):
+                    breakdown["sector_aligned"] = -5
+                else:
+                    breakdown["sector_aligned"] = 0
+            else:
+                breakdown["sector_aligned"] = 0
+        else:
+            breakdown["sector_aligned"] = 0
+
+        # ── FUNDAMENTAL QUALITY (red flags + fair value) ──────────────────
+        # -10 for red flags (ROE<10%, D/E>2, EPS<0), ±5 for PE vs sector avg
+        if fundamental_data:
+            stock_fund = fundamental_data.get(signal.stock)
+            if stock_fund:
+                fund_score = 0
+                if stock_fund.has_red_flag:
+                    fund_score -= 10
+                fund_score += stock_fund.fair_value_modifier
+                breakdown["fundamental_quality"] = fund_score
+            else:
+                breakdown["fundamental_quality"] = 0
+        else:
+            breakdown["fundamental_quality"] = 0
 
         # ── COMPUTE TOTAL ─────────────────────────────────────────────────
         total = sum(breakdown.values())

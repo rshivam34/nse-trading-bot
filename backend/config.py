@@ -51,12 +51,12 @@ class TradingConfig:
     max_losses_per_day: int = 3              # 3 total losing trades = stop for the day
     daily_loss_limit_pct: float = 3.0        # Bot stops for the day if hit (Rs. amount)
     max_capital_deployed_pct: float = 80.0   # Max 80% of broker margin deployed at once
-    risk_reward_ratio: float = 2.5           # R-multiple target (2.5R reward-to-risk)
+    risk_reward_ratio: float = 1.5           # R-multiple target (2.0R = 2% move = full daily range on large caps = never hit. 1.5R = 1.5% move = achievable on trending days. Breakeven win rate = 40%)
 
     # ── Market hours ─────────────────────────────────────────────────
     market_open: time = time(9, 15)
     orb_end: time = time(9, 30)             # Opening range observation ends
-    no_new_trades_after: time = time(14, 30) # 2:30 PM hard cutoff
+    no_new_trades_after: time = time(13, 0)  # 1:00 PM hard cutoff (afternoon entries don't have enough time for 1.5R target before 3:15 force exit)
     force_exit_time: time = time(15, 15)    # 3:15 PM — force-exit all positions
     market_close: time = time(15, 30)
 
@@ -64,22 +64,23 @@ class TradingConfig:
     trading_window_1_start: time = time(9, 30)
     trading_window_1_end: time = time(11, 30)
     trading_window_2_start: time = time(13, 0)
-    trading_window_2_end: time = time(14, 30)
+    trading_window_2_end: time = time(13, 0)
 
     # ── Lunch block — NO new trades during 11:30-13:00 (relaxed from 11:00-13:30) ──
     lunch_block_start: time = time(11, 30)
     lunch_block_end: time = time(13, 0)
 
     # ── Signal scoring — only trade if score >= threshold ─────────────
-    # Option C: confluence removed. Score >= 75 is the primary gate.
-    # ~8 out of 11 scoring factors must confirm. All other filters still apply
-    # (volume 3×, choppiness, candle close, ATR, 17-point pre-flight).
-    min_score_to_trade: int = 75
+    # 14 scoring factors (11 original + 3 new: macro, sector, fundamental).
+    # New bonus factors (macro +10, sector +5, fundamental +5) inflate scores,
+    # so threshold raised from 75 to 80 to compensate.
+    # Score 80 = strong signal with good macro/sector alignment.
+    min_score_to_trade: int = 80
 
     # ── ORB-specific settings ─────────────────────────────────────────
-    orb_min_range_pct: float = 0.3          # Skip if opening range < 0.3%
+    orb_min_range_pct: float = 0.5          # Skip if opening range < 0.5% (was 0.3% — noise, just spread on Rs.1000 stock)
     orb_max_range_pct: float = 2.0          # Skip if opening range > 2%
-    breakout_buffer_pct: float = 0.05       # Confirmation buffer above/below range
+    breakout_buffer_pct: float = 0.15       # Confirmation buffer above/below range (was 0.05% — caught tail-end reversals, not real breakouts)
 
     # ── Gap filter ───────────────────────────────────────────────────
     gap_filter_pct: float = 1.5
@@ -130,29 +131,33 @@ class TradingConfig:
 
     # ── Smart partial exit ────────────────────────────────────────────
     partial_exit_enabled: bool = True
-    partial_exit_rr: float = 1.0            # First exit at 1x RR
-    final_exit_rr: float = 2.5             # Final exit at 2.5x RR (sniper mode)
+    partial_exit_rr: float = 1.0            # First exit at 1.0x RR
+    final_exit_rr: float = 1.5             # Final exit at 1.5x RR (aligned with risk_reward_ratio)
 
     # ── Multi-strategy confluence (DEPRECATED — Option C removed this gate)
     # Kept for pre-flight check backwards compatibility. Not used as a filter.
     min_confluence_count: int = 1           # No longer enforced (was 2)
     single_strategy_exception_score: int = 75  # No longer used (score gate in min_score_to_trade)
 
-    # ── VIX 4-zone graduated response ──────────────────────────────────
-    # India VIX 52-week range: 8.7–24.5. Normal range: 15–35 (per NSE).
-    # VIX 20-25 is a typical Indian market day — should NOT penalize sizing.
-    # NORMAL:   VIX < 25  → 100% size, 1.5× ATR SL. Covers 90%+ of trading days.
-    # ELEVATED: VIX 25-30 → 75% size, 1.75× ATR SL. Real events (elections, tensions).
-    # CAUTION:  VIX 30-35 → 50% size, 2× ATR SL. Genuine danger, few times a year.
-    # DANGER:   VIX > 35  → 0% size, no new trades. Panic/crash territory.
-    vix_normal_threshold: float = 25.0      # VIX < 25 = NORMAL (100% size)
-    vix_elevated_threshold: float = 30.0    # VIX 25-30 = ELEVATED (75% size)
-    vix_caution_threshold: float = 35.0     # VIX 30-35 = CAUTION (50% size)
-    # VIX > 35 = DANGER: no new trades at all
-    vix_elevated_size_pct: float = 75.0     # Position size in ELEVATED mode
-    vix_elevated_risk_pct: float = 1.125    # Risk per trade in ELEVATED (75% of 1.5%)
+    # ── VIX 3-zone response (Indian market calibrated) ────────────────
+    # India VIX typical range: 10-25. Normal: 12-18. Median ~15.
+    # NORMAL:  VIX < 18  → 100% size, 1.5× ATR SL. Standard conditions.
+    # CAUTION: VIX 18-25 → 50% size, 2× ATR SL. Volatility rising, reduce exposure.
+    # DANGER:  VIX > 25  → 0% size, no new trades. Extreme fear, whipsaws too violent.
+    # Note: ELEVATED zone removed — 75% was never meaningful. Either trade full or half.
+    vix_normal_threshold: float = 18.0      # VIX < 18 = NORMAL (100% size)
+    vix_elevated_threshold: float = 18.0    # Set same as normal (effectively disabled — ELEVATED zone collapsed into CAUTION)
+    vix_caution_threshold: float = 25.0     # VIX 18-25 = CAUTION (50% size), VIX > 25 = DANGER
+    vix_elevated_size_pct: float = 50.0     # Same as CAUTION (ELEVATED zone disabled)
+    vix_elevated_risk_pct: float = 0.75     # Same as CAUTION (ELEVATED zone disabled)
     vix_caution_size_pct: float = 50.0      # Position size in CAUTION mode
     vix_caution_risk_pct: float = 0.75      # Risk per trade in CAUTION (50% of 1.5%)
+
+    # ── Strategy-specific VIX adjustments ───────────────────────────
+    # VWAP bounces depend on orderly institutional flow at VWAP.
+    # In VIX > 22, price whipsaws through VWAP repeatedly — "bounces" are noise.
+    vwap_bounce_vix_penalty_threshold: float = 18.0   # VIX above this → penalize VWAP_BOUNCE (aligns with VIX NORMAL/CAUTION boundary — VWAP bounces degrade above VIX 18 as directional strategies take over)
+    vwap_bounce_vix_penalty: int = 15                  # Score penalty for VWAP_BOUNCE at high VIX
 
     # ── Choppiness Index filter (sniper mode) ─────────────────────────
     chop_threshold: float = 70.0            # CHOP > 70 = choppy market, reject signal (61.8 was for daily candles; 70 is appropriate for 5-min intraday candles where moderate trends show CHOP ~60-65)
@@ -167,22 +172,22 @@ class TradingConfig:
     atr_compression_penalty: int = 10       # Score penalty if ATR is compressing
 
     # ── Trailing stop-loss (improved profit management) ───────────────
-    # Step 1: At 1% profit → move SL to breakeven (entry + charges)
-    # Step 2: At 1.5R profit → trail SL at 1× ATR below peak (longs) / above trough (shorts)
+    # Step 1: At 0.7% profit → move SL to breakeven (entry price)
+    # Step 2: At 1.0R → partial exit 50%, trail remaining at 1.5× ATR from peak/trough
     trailing_sl_enabled: bool = True
-    breakeven_profit_pct: float = 1.0       # Move SL to breakeven at 1% profit
+    breakeven_profit_pct: float = 0.5       # Move SL to breakeven at 0.5% profit
     trailing_activation_pct: float = 2.0    # Fallback pct (overridden by R-multiple in sniper mode)
-    trailing_activation_r: float = 1.5      # Start trailing at 1.5R profit (sniper mode)
+    trailing_activation_r: float = 1.5      # Start trailing at 1.5R profit (safety net for non-partial path; partial exit at 1.0R activates trailing directly)
     trailing_distance_pct: float = 1.0      # Fallback trail distance (overridden by ATR in sniper mode)
     trailing_sl_pct: float = 0.3           # Legacy — used as fallback
-    trailing_sl_atr_multiplier: float = 1.0 # Trail at 1× ATR from peak/trough (sniper mode)
+    trailing_sl_atr_multiplier: float = 1.5 # Trail at 1.5× ATR from peak/trough (was 1×, too tight — winners stopped at 0.5R)
 
     # ── ATR-based dynamic stop-loss (sniper mode) ─────────────────────
-    atr_sl_multiplier_normal: float = 1.5    # SL = 1.5× ATR (VIX < 25, NORMAL)
-    atr_sl_multiplier_elevated: float = 2.0  # SL = 2.0× ATR (VIX 25-30, ELEVATED — wider SL for real volatility)
-    atr_sl_multiplier_caution: float = 2.5  # SL = 2.5× ATR (VIX 30-35, CAUTION — widest SL for dangerous conditions)
-    atr_sl_floor_pct: float = 0.5           # SL never tighter than 0.5% from entry
-    atr_sl_ceiling_pct: float = 3.0         # SL never wider than 3% from entry
+    atr_sl_multiplier_normal: float = 1.5    # SL = 1.5× ATR (VIX < 18, NORMAL — 2.0× gave 2-3% SL which is too wide for intraday targets)
+    atr_sl_multiplier_elevated: float = 2.0 # Same as CAUTION (ELEVATED zone disabled)
+    atr_sl_multiplier_caution: float = 2.0  # SL = 2.0× ATR (VIX 18-25, CAUTION)
+    atr_sl_floor_pct: float = 1.0           # SL never tighter than 1.0% from entry
+    atr_sl_ceiling_pct: float = 1.5         # SL never wider than 1.5% from entry (was 3% — too wide for intraday. With 1.5R target, 3% SL = 4.5% target = impossible)
     adopted_sl_fallback_pct: float = 2.5    # Fallback SL for adopted positions (if no ATR data)
 
     # ── Win zone exit (70% of target reversal protection) ──────────────
@@ -193,15 +198,17 @@ class TradingConfig:
     late_session_sl_pct: float = 1.0        # Tighten SL to 1% after 2:30 PM
     profit_exit_time: time = time(15, 0)    # Exit any in-profit position after 3:00 PM
 
-    # ── Re-entry prevention ────────────────────────────────────────────
-    reentry_cooldown_minutes: int = 30      # Block re-entry for 30 min after exiting a stock
+    # ── Entry spacing & re-entry prevention ─────────────────────────────
+    min_entry_spacing_minutes: int = 10     # Minimum 10 min between ANY two entries (prevents correlated bets — e.g., 2 SHORTs in 19 seconds)
+    reentry_cooldown_minutes: int = 15      # Cooldown after exiting a stock (was 5 — too short, catches same failing setup. 15 min lets the setup fully reset)
 
     # ── Broker-side SL orders ──────────────────────────────────────────
-    sl_order_price_buffer: float = 0.50     # Rs. buffer between trigger and limit price
+    sl_order_price_buffer: float = 0.50     # Rs. MINIMUM buffer between trigger and limit price
+    sl_order_price_buffer_pct: float = 0.1  # 0.1% of price as buffer (used if > flat Rs.0.50 — protects expensive stocks like HAL Rs.3647 where Rs.0.50 = 0.014%)
 
     # ── Consecutive loss circuit breaker ─────────────────────────────
     consecutive_loss_limit: int = 2
-    consecutive_loss_cooldown_minutes: int = 60  # Pause trading for 60 min
+    consecutive_loss_cooldown_minutes: int = 15  # Brief pause after consecutive losses (was 60 — arbitrary; max_losses_per_day already handles daily limits)
 
     # ── Filters ──────────────────────────────────────────────────────
     min_volume_threshold: int = 50000      # Minimum volume for a valid tick
@@ -217,7 +224,7 @@ class TradingConfig:
 
     # NSE intraday charges (both legs combined):
     stt_pct: float = 0.025          # STT: 0.025% of sell-side value
-    exchange_charges_pct: float = 0.00345  # Exchange charges: 0.00345% of turnover
+    exchange_charges_pct: float = 0.00297  # Exchange charges: 0.00297% of turnover (NSE equity, verified Mar 2026)
     gst_pct: float = 18.0           # GST: 18% on (brokerage + exchange charges)
     sebi_charges_pct: float = 0.0001  # SEBI: 0.0001% of turnover
     stamp_duty_pct: float = 0.003   # Stamp duty: 0.003% on buy-side value
@@ -249,7 +256,7 @@ class TradingConfig:
     gap_day_nifty_threshold_pct: float = 0.7     # >0.7% gap = gap day
     trending_nifty_move_pct: float = 0.5         # >0.5% move = trending
     range_bound_nifty_pct: float = 0.3           # <0.3% move = range bound
-    volatile_vix_threshold: float = 20.0         # VIX > 20 = volatile regime
+    volatile_vix_threshold: float = 18.0         # VIX > 18 = volatile regime (aligned with VIX zones: NORMAL < 18)
     volatile_nifty_range_pct: float = 1.5        # NIFTY range > 1.5% = volatile
     gap_day_wait_until: time = time(10, 0)       # On gap day, wait until 10 AM
 
@@ -274,6 +281,13 @@ class TradingConfig:
     ltp_rate_per_sec: float = float(os.getenv("LTP_RATE_PER_SEC", "5.0"))
     ltp_rate_per_min: int = int(os.getenv("LTP_RATE_PER_MIN", "200"))
 
+    # ── Intraday leverage ─────────────────────────────────────────────────
+    # Angel One applies MIS leverage at order time (not as a balance).
+    # When the RMS API returns availableintradaypayin=0 (common), we estimate
+    # buying power as cash × this multiplier. Conservative 4x (most NIFTY 200
+    # stocks get 4-5x). The broker will reject if actual margin is insufficient.
+    intraday_leverage_multiplier: float = 4.0
+
     # ── Capital filter ─────────────────────────────────────────────────────
     min_net_profit: float = float(os.getenv("MIN_NET_PROFIT", "10.0"))
     max_required_move_pct: float = float(os.getenv("MAX_REQUIRED_MOVE_PCT", "3.0"))
@@ -282,6 +296,28 @@ class TradingConfig:
     ohlc_batch_size: int = int(os.getenv("OHLC_BATCH_SIZE", "5"))
     ohlc_batch_gap: float = float(os.getenv("OHLC_BATCH_GAP", "2.0"))
     ohlc_max_retries: int = int(os.getenv("OHLC_MAX_RETRIES", "2"))
+
+    # ── Macro Analysis (NIFTY DMA + Market Stance) ─────────────────────
+    macro_analysis_enabled: bool = True
+    macro_score_modifier: int = 10        # +10 if aligned with NIFTY DMA, -10 if against
+
+    # ── Market Stance (controls max trades + sizing) ────────────────────
+    stance_aggressive_max_trades: int = 5   # VIX < 18 + above both DMAs
+    stance_moderate_max_trades: int = 3     # VIX < 18 + below 50 DMA but above 200
+    stance_defensive_max_trades: int = 2    # VIX 18-25 OR below 200 DMA
+
+    # ── Sector Analysis ─────────────────────────────────────────────────
+    sector_analysis_enabled: bool = True
+    sector_score_modifier: int = 5        # +5 for LEADING/IMPROVING, -5 for WEAKENING/LAGGING
+
+    # ── Fundamental Filter ──────────────────────────────────────────────
+    fundamental_filter_enabled: bool = True
+    fundamental_cache_path: str = "logs/fundamental_cache.json"
+    fundamental_cache_expiry_days: int = 7
+    red_flag_penalty: int = 10            # -10 for any red flag (ROE<10%, D/E>2, EPS<0)
+    fair_value_overvalued_penalty: int = 5   # -5 if PE > 2x sector average
+    fair_value_undervalued_bonus: int = 5    # +5 if PE < 0.7x sector average
+    earnings_skip_enabled: bool = True       # Hard skip stocks with earnings this week
 
     def __post_init__(self):
         """Validate config values to catch misconfiguration early."""

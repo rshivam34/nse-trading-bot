@@ -166,7 +166,7 @@ class MarketRegimeDetector:
             self.regime_description = (
                 f"VOLATILE: VIX={self.vix_value:.1f}, "
                 f"NIFTY range={nifty_range_pct:.1f}%. "
-                "SL widened +20%, position sizes reduced -30%."
+                "SL widened +20%. VIX zones handle position sizing."
             )
             logger.info(f"Market regime: {self.regime_description}")
             return
@@ -218,14 +218,12 @@ class MarketRegimeDetector:
     def get_size_multiplier(self) -> float:
         """
         Position size multiplier based on regime.
-        - TRENDING: slightly larger (1.1×) — momentum is clear
-        - VOLATILE: smaller (0.7×) — protect capital in choppy conditions
-        - Others: normal (1.0×)
+
+        All regimes return 1.0 — position sizing is handled entirely by
+        VIX zones (NORMAL/ELEVATED/CAUTION/DANGER) which already adapt
+        to volatility. Regime-based sizing was removed to avoid double-
+        penalizing when VIX zones and regime both reduce size.
         """
-        if self.regime == VOLATILE:
-            return 0.7   # Reduce by 30%
-        if self.regime == TRENDING:
-            return 1.1   # Increase by 10%
         return 1.0
 
     def get_sl_multiplier(self) -> float:
@@ -241,12 +239,10 @@ class MarketRegimeDetector:
     def get_min_score_override(self) -> int:
         """
         Override minimum score threshold based on regime.
-        - VOLATILE: require higher confidence (80 instead of 70)
-        - Others: use config default
+        Returns 0 = use config default (75). No regime-based override —
+        the score threshold + all filters are sufficient quality gates.
         """
-        if self.regime == VOLATILE:
-            return 80  # Only take the best setups in volatile markets
-        return 0  # 0 = use config default
+        return 0  # Always use config default
 
     def should_wait_for_gap_fill(self) -> bool:
         """

@@ -336,7 +336,10 @@ class OrderManager:
         Returns the SL order ID, or empty string on failure.
         """
         try:
-            buffer = self.config.sl_order_price_buffer
+            # Use percentage-based buffer (0.1% of price) or flat Rs.0.50, whichever is larger
+            # Prevents tiny buffer on expensive stocks (e.g., HAL Rs.3647 → Rs.0.50 = 0.014%)
+            pct_buffer = pos.effective_sl * (self.config.sl_order_price_buffer_pct / 100)
+            buffer = max(self.config.sl_order_price_buffer, round(pct_buffer, 2))
             sl_order_id = self.broker.place_sl_order(
                 stock=pos.signal.stock,
                 token=pos.signal.token,
@@ -370,7 +373,8 @@ class OrderManager:
             return False
 
         try:
-            buffer = self.config.sl_order_price_buffer
+            pct_buffer = new_sl_price * (self.config.sl_order_price_buffer_pct / 100)
+            buffer = max(self.config.sl_order_price_buffer, round(pct_buffer, 2))
             success = self.broker.modify_sl_order(
                 order_id=pos.sl_order_id,
                 stock=pos.signal.stock,
@@ -455,10 +459,10 @@ class OrderManager:
         ok = vix <= self.config.vix_caution_threshold if vix > 0 else True
         checks.append(("VIX not DANGER", ok, f"VIX={vix:.1f}"))
 
-        # Check 5: Not in lunch block
+        # Check 5: Lunch block — flag only (other filters handle lunch quality)
         in_lunch = (self.config.lunch_block_start <= now <= self.config.lunch_block_end)
-        ok = not in_lunch
-        checks.append(("Not in lunch block", ok, f"time={now.strftime('%H:%M')}"))
+        ok = True  # Not a gate — choppiness, RVOL, VIX filters handle bad conditions
+        checks.append(("Lunch block (flag)", ok, f"time={now.strftime('%H:%M')}, lunch={'YES' if in_lunch else 'NO'}"))
 
         # Check 6: Daily trade count within limit
         ok = self.risk_manager.trades_today < self.config.max_trades_per_day
@@ -517,11 +521,10 @@ class OrderManager:
              datetime.now() >= self.risk_manager._reentry_blocked_until.get(signal.stock, datetime.min)
         checks.append(("No re-entry cooldown", ok, f"stock={signal.stock}"))
 
-        # Check 16: Time in active window
-        in_w1 = self.config.trading_window_1_start <= now <= self.config.trading_window_1_end
-        in_w2 = self.config.trading_window_2_start <= now <= self.config.trading_window_2_end
-        ok = in_w1 or in_w2
-        checks.append(("In active window", ok, f"time={now.strftime('%H:%M')}"))
+        # Check 16: Time in active window (9:30-14:30 continuous, lunch not blocked)
+        in_window = self.config.trading_window_1_start <= now <= self.config.trading_window_2_end
+        ok = in_window
+        checks.append(("In active window (9:30-14:30)", ok, f"time={now.strftime('%H:%M')}"))
 
         # Check 17: Estimated net profit positive
         from utils.brokerage import is_trade_viable
@@ -575,7 +578,12 @@ class OrderManager:
                 return 0.0
             intraday = float(funds.get("availableintradaypayin", 0) or 0)
             cash = float(funds.get("availablecash", 0) or 0)
-            return intraday if intraday > 0 else cash
+            if intraday > 0:
+                return intraday
+            # Angel One applies MIS leverage at order time, not as a balance.
+            # Estimate buying power as cash × leverage multiplier.
+            leverage = self.config.intraday_leverage_multiplier
+            return cash * leverage
         except Exception as e:
             logger.debug(f"Margin check unavailable: {e}")
             return 0.0
@@ -938,36 +946,11 @@ class OrderManager:
                 newly_closed.append(pos)
                 continue
 
-            # Check 4: Win zone reversal (70% of target reached, then 0.5% reversal)
-            win_zone_price = pos.win_zone_price
-            if direction == "LONG":
-                if not pos.in_win_zone and ltp >= win_zone_price:
-                    pos.in_win_zone = True
-                    pos.peak_since_win_zone = ltp
-                    logger.info(
-                        f"Win zone entered: {pos.signal.stock} at Rs.{ltp:.2f} "
-                        f"(70% of target Rs.{pos.signal.target:.2f})"
-                    )
-                if pos.in_win_zone and pos.peak_since_win_zone > 0:
-                    reversal_pct = ((pos.peak_since_win_zone - ltp) / pos.peak_since_win_zone) * 100
-                    if reversal_pct >= self.config.win_zone_reversal_pct:
-                        self._close_remaining(pos, ltp, "WIN_ZONE_REVERSAL")
-                        newly_closed.append(pos)
-                        continue
-            else:  # SHORT
-                if not pos.in_win_zone and ltp <= win_zone_price:
-                    pos.in_win_zone = True
-                    pos.peak_since_win_zone = ltp
-                    logger.info(
-                        f"Win zone entered: {pos.signal.stock} at Rs.{ltp:.2f} "
-                        f"(70% of target Rs.{pos.signal.target:.2f})"
-                    )
-                if pos.in_win_zone and pos.peak_since_win_zone > 0:
-                    reversal_pct = ((ltp - pos.peak_since_win_zone) / pos.peak_since_win_zone) * 100
-                    if reversal_pct >= self.config.win_zone_reversal_pct:
-                        self._close_remaining(pos, ltp, "WIN_ZONE_REVERSAL")
-                        newly_closed.append(pos)
-                        continue
+            # Check 4: Win zone reversal — REMOVED
+            # Was: exit if price reached 70% of target then reversed 0.5%.
+            # With 1.5R target, win zone = 1.05R which is barely past the partial
+            # exit at 1.0R — the rule was protecting almost nothing. Trailing SL
+            # handles profit protection better (data-driven via ATR, not arbitrary %).
 
             # Check 5: Partial exit at target1 (1x RR)
             if self.config.partial_exit_enabled and not pos.partial_exit_done:

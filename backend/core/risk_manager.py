@@ -52,6 +52,9 @@ class RiskManager:
         # Duplicate prevention: set of stock symbols currently in a trade
         self._active_stocks: set[str] = set()
 
+        # Entry spacing: minimum time between ANY two entries (prevents correlated bets)
+        self._last_entry_time: Optional[datetime] = None
+
         # Re-entry prevention (FIX 3d): stock -> earliest allowed re-entry time
         self._reentry_blocked_until: dict[str, datetime] = {}
 
@@ -68,6 +71,11 @@ class RiskManager:
         # VIX value for position sizing decisions
         self._current_vix: float = 0.0
 
+        # Market stance (from macro analysis — overrides daily limits)
+        self._market_stance: str = "MODERATE"
+        self._stance_max_trades: int = trading_config.max_trades_per_day
+        self._stance_size_pct: float = 100.0
+
         # Global risk day flag — set when geopolitical/macro events detected in news
         # Reduces ALL position sizes by 50% (same effect as VIX CAUTION)
         self._global_risk_day: bool = False
@@ -80,6 +88,7 @@ class RiskManager:
         self.consecutive_losses = 0
         self._cooldown_until = None
         self._active_stocks.clear()
+        self._last_entry_time = None
         self._reentry_blocked_until.clear()
         self._deployed_capital = 0.0
         self._deployed_by_stock.clear()
@@ -95,6 +104,15 @@ class RiskManager:
     def update_vix(self, vix: float):
         """Update current VIX value for position sizing decisions."""
         self._current_vix = vix
+
+    def set_market_stance(self, stance: str, max_trades: int, size_pct: float):
+        """Set market stance from macro analysis (called at startup)."""
+        self._market_stance = stance
+        self._stance_max_trades = max_trades
+        self._stance_size_pct = size_pct
+        logger.info(
+            f"Market stance: {stance} — max trades: {max_trades}, size: {size_pct:.0f}%"
+        )
 
     def set_global_risk_day(self, is_risk_day: bool):
         """Flag global risk day for awareness — NO size reduction.
@@ -132,11 +150,20 @@ class RiskManager:
         try:
             funds = self._broker.get_funds()
             if funds:
-                # availableintradaypayin = cash × intraday leverage (~5×)
+                # availableintradaypayin should include leverage, but Angel One
+                # often returns 0 for this field. In that case, estimate buying
+                # power as cash × intraday leverage multiplier (4x conservative).
                 intraday = float(funds.get("availableintradaypayin", 0) or 0)
                 cash = float(funds.get("availablecash", 0) or 0)
-                self._cached_margin = intraday if intraday > 0 else cash
-                logger.debug(f"Margin refreshed: Rs.{self._cached_margin:,.0f}")
+                if intraday > 0:
+                    self._cached_margin = intraday
+                else:
+                    leverage = self.config.intraday_leverage_multiplier
+                    self._cached_margin = cash * leverage
+                    logger.info(
+                        f"Margin: intraday=0, using cash Rs.{cash:,.0f} x {leverage}x = "
+                        f"Rs.{self._cached_margin:,.0f} estimated buying power"
+                    )
         except Exception as e:
             logger.debug(f"Margin refresh failed: {e}")
 
@@ -176,11 +203,12 @@ class RiskManager:
         Gate every potential trade through all safety rules.
         Sets signal.reason if blocked. Returns True only if ALL checks pass.
         """
-        # Rule 1: HARD cap on total trades (sniper mode: 3/day max)
-        if self.trades_today >= self.config.max_trades_per_day:
+        # Rule 1: HARD cap on total trades (min of config cap and stance limit)
+        effective_max_trades = min(self.config.max_trades_per_day, self._stance_max_trades)
+        if self.trades_today >= effective_max_trades:
             signal.reason = (
-                f"Daily trade limit reached ({self.trades_today}/{self.config.max_trades_per_day}). "
-                "Monitor-only mode for rest of day."
+                f"Daily trade limit reached ({self.trades_today}/{effective_max_trades}, "
+                f"stance={self._market_stance}). Monitor-only mode for rest of day."
             )
             signal.status = "SKIPPED-DAILY-LIMIT"
             return False
@@ -223,6 +251,19 @@ class RiskManager:
                 f"Consecutive loss cooldown — {remaining} min remaining"
             )
             return False
+
+        # Rule 6b: Entry spacing — minimum time between ANY two entries
+        # Prevents correlated bets (e.g., 2 SHORTs in 19 seconds on different stocks)
+        if self._last_entry_time is not None:
+            spacing = self.config.min_entry_spacing_minutes
+            elapsed = (datetime.now() - self._last_entry_time).total_seconds() / 60
+            if elapsed < spacing:
+                remaining = int(spacing - elapsed)
+                signal.reason = (
+                    f"Entry spacing: {remaining} min remaining "
+                    f"(min {spacing} min between entries)"
+                )
+                return False
 
         # Rule 7: Duplicate order prevention
         if signal.stock in self._active_stocks:
@@ -321,6 +362,7 @@ class RiskManager:
         """
         self.trades_today += 1
         self._active_stocks.add(stock)
+        self._last_entry_time = datetime.now()
 
         # Track deployed capital for this stock
         deployed = entry_price * quantity
@@ -410,10 +452,9 @@ class RiskManager:
         """
         Position sizing with VIX 4-zone scaling, time-based, and regime scaling.
 
-        VIX zones:
-        - VIX < 15 (NORMAL):    100% risk (1.5% of capital), 1.5× ATR SL
-        - VIX 15-20 (ELEVATED): 75% risk (1.125% of capital), 1.75× ATR SL
-        - VIX 20-25 (CAUTION):  50% risk (0.75% of capital), 2× ATR SL
+        VIX zones (3-zone, Indian market calibrated):
+        - VIX < 18 (NORMAL):    100% risk (1.5% of capital), 1.5× ATR SL
+        - VIX 18-25 (CAUTION):  50% risk (0.75% of capital), 2× ATR SL
         - VIX > 25 (DANGER):    blocked before reaching this point
 
         Base formula: quantity = (capital x risk%) / risk_per_share
@@ -460,6 +501,10 @@ class RiskManager:
         if self._global_risk_day:
             logger.info("Global risk day flagged (no size reduction — VIX/ATR handle volatility)")
 
+        # Apply market stance size scaling
+        if self._stance_size_pct < 100.0:
+            scaled_qty = int(scaled_qty * self._stance_size_pct / 100)
+
         # Apply regime scaling
         regime_qty = int(scaled_qty * self.regime_size_multiplier)
 
@@ -469,38 +514,21 @@ class RiskManager:
         """
         Position size % based on time of day.
 
-        Sniper mode:
-        9:30-11:30:  100% — morning momentum, highest quality signals
-        11:30-13:00: 0%   — BLOCKED (lunch block, no new trades)
-        13:00-14:30: 100% — afternoon momentum
+        Full trading: 9:30-14:30 at 100%.
+        Lunch block removed — choppiness filter + RVOL score modifier
+        already handle low-quality lunch-hour conditions.
         """
-        w1_start = self.config.trading_window_1_start
-        w1_end = self.config.trading_window_1_end
-        w2_start = self.config.trading_window_2_start
-        w2_end = self.config.trading_window_2_end
-
-        if w1_start <= now <= w1_end:
-            return 100.0   # Morning momentum window
-        elif w2_start <= now <= w2_end:
-            return 100.0   # Afternoon momentum window
-        elif w1_end < now < w2_start:
-            return 0.0     # Lunch block — no new trades
-        else:
-            return 100.0  # Default (outside normal windows but before cutoff)
+        return 100.0  # Full size during all active hours
 
     # ──────────────────────────────────────────────────────────
     # Helper Checks
     # ──────────────────────────────────────────────────────────
 
     def _in_trading_window(self, now) -> bool:
-        """Check if current time falls in an active trading window."""
-        in_w1 = (
-            self.config.trading_window_1_start <= now <= self.config.trading_window_1_end
+        """Check if current time falls in active trading hours (9:30-14:30 continuous)."""
+        return (
+            self.config.trading_window_1_start <= now <= self.config.trading_window_2_end
         )
-        in_w2 = (
-            self.config.trading_window_2_start <= now <= self.config.trading_window_2_end
-        )
-        return in_w1 or in_w2
 
     def _is_in_cooldown(self) -> bool:
         """Check if we're in the post-consecutive-loss cooldown period."""

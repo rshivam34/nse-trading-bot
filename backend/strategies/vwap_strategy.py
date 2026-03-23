@@ -1,30 +1,29 @@
 """
-VWAP Bounce Strategy — Full Production Implementation
-======================================================
-Trades pullbacks to VWAP in stocks that have been trending above/below it.
+VWAP Bounce Strategy — Completed Candle Confirmation Version.
+=============================================================
 
-What is a VWAP Bounce?
-When a stock has been trading above VWAP for 30+ minutes (institutional support),
-a pullback to VWAP and a recovery (green candle forming) is a high-probability
-long entry. Institutions often add to positions at VWAP.
+The old VWAP bounce entered on LTP touching VWAP → caught noise, not bounces.
+The new version requires a COMPLETED 5-min candle bounce:
 
 LONG Setup:
-1. Stock must have been above VWAP for at least 60 ticks (~30 min at NSE tick frequency)
-2. Price pulls back to within 0.2% of VWAP from ABOVE
-3. The most recent candle's close must be ABOVE the open (green candle = recovery)
-4. Volume is not below average (no selling into the bounce)
-5. NIFTY direction is BULLISH or NEUTRAL
-6. RSI is not overbought (< 70)
-Entry: Close of the bounce candle
-SL: 0.3% below VWAP (if it breaks VWAP cleanly, setup is invalid)
-Target: Previous swing high above current price (or 1.5× risk minimum)
+1. Stock has been above VWAP for 6+ candles (30 min institutional support)
+2. Price pulls back to VWAP (candle Low touches VWAP zone)
+3. The COMPLETED candle closes ABOVE VWAP (bounce confirmed, not just a wick)
+4. The bounce candle is GREEN (close > open = buyers stepping in)
+5. Volume on bounce candle is above average (institutional defense)
+6. NIFTY direction is not BEARISH
 
-SHORT Setup: Mirror image — below VWAP, bounce UP to VWAP, red candle at VWAP.
+SHORT Setup: Mirror of LONG (below VWAP, red candle, etc.)
+
+Why completed candle matters: A tick touching VWAP is meaningless — it could
+be a wick that immediately reverses. A completed candle that touches VWAP
+and closes AWAY from it means the full 5-minute period confirmed the bounce.
 """
 
 import logging
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy, Signal
@@ -32,16 +31,14 @@ from utils.indicators import calculate_rsi
 
 logger = logging.getLogger(__name__)
 
-MIN_CANDLES_NEEDED = 6   # Need 6+ five-minute candles (30 min of data)
-SL_BUFFER_PCT = 0.3      # 0.3% SL below/above VWAP
-BOUNCE_THRESHOLD_PCT = 0.2  # Price must be within 0.2% of VWAP
+MIN_CANDLES_NEEDED = 8   # Need 8+ candles (40 min of data for VWAP stability)
+VWAP_ZONE_PCT = 0.3      # Price must touch within 0.3% of VWAP to count as "at VWAP"
+SL_BEYOND_VWAP_PCT = 0.4 # SL placed 0.4% beyond VWAP (structural level)
+MIN_CANDLES_ABOVE = 6    # Must be above/below VWAP for 6+ candles (~30 min)
 
 
 class VWAPBounceStrategy(BaseStrategy):
-    """
-    VWAP bounce: buy dips to VWAP in uptrending stocks.
-    Full production implementation with candle confirmation and trend requirement.
-    """
+    """VWAP bounce with completed candle confirmation."""
 
     def __init__(self, trading_config, indicator_config):
         super().__init__(name="VWAP_BOUNCE")
@@ -49,10 +46,11 @@ class VWAPBounceStrategy(BaseStrategy):
         self.indicator_config = indicator_config
         self.is_active = True
 
-        # Track how long each stock has been above/below VWAP
-        # {token: count_of_ticks_above_vwap}
-        self._ticks_above_vwap: dict[str, int] = {}
-        self._ticks_below_vwap: dict[str, int] = {}
+        # Track consecutive candles above/below VWAP per stock
+        self._candles_above_vwap: dict[str, int] = {}
+        self._candles_below_vwap: dict[str, int] = {}
+        # Track last candle index processed per stock (prevent double-counting)
+        self._last_candle_idx: dict[str, int] = {}
 
     def check_signal(
         self,
@@ -62,106 +60,120 @@ class VWAPBounceStrategy(BaseStrategy):
         current_tick: dict,
         market_context: dict,
     ) -> Optional[Signal]:
-        """Check for VWAP bounce pattern with full production conditions."""
+        """Check for VWAP bounce with completed candle confirmation."""
 
         if len(candles) < MIN_CANDLES_NEEDED:
             return None
 
-        # VWAP is pre-computed by scanner and passed in context
         vwap = market_context.get("vwap", 0)
         if vwap <= 0:
-            # Fallback: compute it ourselves
             vwap = self._calculate_vwap(candles)
         if vwap <= 0:
             return None
 
-        ltp = current_tick.get("ltp", 0)
-        if ltp <= 0:
+        nifty_dir = market_context.get("nifty_direction", "NEUTRAL")
+
+        # EMA trend filter — only bounce in direction of intraday trend
+        # This prevents catching "bounces" that are actually against-trend noise
+        ema_aligned = market_context.get("ema_aligned", None)  # True = EMA9 > EMA21
+
+        # Use COMPLETED candle (iloc[-2]) — last row is incomplete
+        if len(candles) < 3:
             return None
 
-        nifty_dir = market_context.get("nifty_direction", "NEUTRAL")
-        distance_pct = abs(ltp - vwap) / vwap * 100
+        completed = candles.iloc[-2]  # Last COMPLETED 5-min candle
+        candle_close = float(completed["Close"])
+        candle_open = float(completed["Open"])
+        candle_low = float(completed["Low"])
+        candle_high = float(completed["High"])
+        candle_vol = float(completed["Volume"])
 
-        # Update VWAP trend counter for this stock
-        self._update_vwap_position(token, ltp, vwap)
+        # Prevent processing same candle twice
+        candle_idx = len(candles)
+        if self._last_candle_idx.get(token, -1) == candle_idx:
+            return None
+        self._last_candle_idx[token] = candle_idx
 
-        # ── LONG SETUP ───────────────────────────────────────────────────
+        # Update candle-based VWAP position tracking
+        # (uses completed candle close, not tick LTP)
+        self._update_vwap_position(token, candle_close, vwap)
+
+        # Average volume for comparison (last 10 completed candles, excluding current)
+        vol_history = candles["Volume"].iloc[-12:-2] if len(candles) >= 12 else candles["Volume"].iloc[:-2]
+        avg_vol = float(vol_history.mean()) if len(vol_history) > 0 else 0
+
+        # Distance from VWAP
+        distance_pct = abs(candle_close - vwap) / vwap * 100
+
+        # ── LONG SETUP ───────────────────────────────────────────────
         if (
             nifty_dir != "BEARISH"
-            and distance_pct <= BOUNCE_THRESHOLD_PCT  # Price near VWAP
-            and ltp >= vwap                            # Price still at or above VWAP
-            and self._has_been_above_vwap_long_enough(token)  # Trending above 30+ min
-            and self._is_green_candle(candles)                # Bounce confirmation
-            and self._rsi_not_overbought(candles)             # RSI check
-            and self._volume_adequate(candles)                 # Not weak volume
+            and self._candles_above_vwap.get(token, 0) >= MIN_CANDLES_ABOVE  # Trending above VWAP
+            and candle_low <= vwap * (1 + VWAP_ZONE_PCT / 100)  # Candle touched VWAP zone
+            and candle_close > vwap                               # Closed ABOVE VWAP (bounce!)
+            and candle_close > candle_open                        # Green candle (buyers won)
+            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)    # Volume 1.5× average (was 1.2× — too permissive)
+            and self._rsi_not_overbought(candles)                 # Not chasing exhausted move
         ):
-            entry = round(ltp, 2)
-            sl = round(vwap * (1 - SL_BUFFER_PCT / 100), 2)
+            entry = round(candle_close, 2)
+            sl = round(vwap * (1 - SL_BEYOND_VWAP_PCT / 100), 2)
             risk = entry - sl
 
             if risk <= 0:
                 return None
 
-            # Target: previous swing high or 1.5× risk minimum
-            swing_high = float(candles["High"].iloc[-30:].max())
+            # Target: previous swing high or 2× risk
+            swing_high = float(candles["High"].iloc[-20:-2].max()) if len(candles) >= 22 else float(candles["High"].max())
             target = max(
                 round(swing_high, 2) if swing_high > entry else 0,
                 round(entry + risk * self.config.risk_reward_ratio, 2),
             )
 
             return Signal(
-                stock=stock,
-                token=token,
-                direction="LONG",
-                entry_price=entry,
-                stop_loss=sl,
-                target=target,
+                stock=stock, token=token, direction="LONG",
+                entry_price=entry, stop_loss=sl, target=target,
                 strategy_name=self.name,
-                confidence=self._calc_confidence(distance_pct, nifty_dir, "LONG"),
+                confidence=self._calc_confidence(distance_pct, nifty_dir, "LONG", candle_vol, avg_vol),
                 reason=(
-                    f"VWAP Bounce LONG: {stock} ({ltp:.2f}) pulled back to VWAP "
-                    f"({vwap:.2f}), green candle recovery. "
-                    f"Above VWAP for {self._ticks_above_vwap.get(token, 0)} ticks. "
+                    f"VWAP Bounce LONG: {stock} ({entry:.2f}) completed candle bounced off "
+                    f"VWAP ({vwap:.2f}), green candle, vol {candle_vol:.0f} vs avg {avg_vol:.0f}. "
+                    f"Above VWAP for {self._candles_above_vwap.get(token, 0)} candles. "
                     f"NIFTY: {nifty_dir}"
                 ),
             )
 
-        # ── SHORT SETUP ──────────────────────────────────────────────────
+        # ── SHORT SETUP ──────────────────────────────────────────────
         if (
             nifty_dir != "BULLISH"
-            and distance_pct <= BOUNCE_THRESHOLD_PCT  # Price near VWAP
-            and ltp <= vwap                            # Price at or below VWAP
-            and self._has_been_below_vwap_long_enough(token)  # Trending below 30+ min
-            and self._is_red_candle(candles)                   # Rejection confirmation
-            and self._rsi_not_oversold(candles)                # RSI check
-            and self._volume_adequate(candles)
+            and self._candles_below_vwap.get(token, 0) >= MIN_CANDLES_ABOVE
+            and candle_high >= vwap * (1 - VWAP_ZONE_PCT / 100)  # Candle touched VWAP zone
+            and candle_close < vwap                                # Closed BELOW VWAP (rejection!)
+            and candle_close < candle_open                         # Red candle (sellers won)
+            and (avg_vol <= 0 or candle_vol >= avg_vol * 1.5)    # Volume 1.5× average
+            and self._rsi_not_oversold(candles)
         ):
-            entry = round(ltp, 2)
-            sl = round(vwap * (1 + SL_BUFFER_PCT / 100), 2)
+            entry = round(candle_close, 2)
+            sl = round(vwap * (1 + SL_BEYOND_VWAP_PCT / 100), 2)
             risk = sl - entry
 
             if risk <= 0:
                 return None
 
-            swing_low = float(candles["Low"].iloc[-30:].min())
+            swing_low = float(candles["Low"].iloc[-20:-2].min()) if len(candles) >= 22 else float(candles["Low"].min())
             target = min(
                 round(swing_low, 2) if swing_low < entry else float("inf"),
                 round(entry - risk * self.config.risk_reward_ratio, 2),
             )
 
             return Signal(
-                stock=stock,
-                token=token,
-                direction="SHORT",
-                entry_price=entry,
-                stop_loss=sl,
-                target=target,
+                stock=stock, token=token, direction="SHORT",
+                entry_price=entry, stop_loss=sl, target=target,
                 strategy_name=self.name,
-                confidence=self._calc_confidence(distance_pct, nifty_dir, "SHORT"),
+                confidence=self._calc_confidence(distance_pct, nifty_dir, "SHORT", candle_vol, avg_vol),
                 reason=(
-                    f"VWAP Bounce SHORT: {stock} ({ltp:.2f}) bounced UP to VWAP "
-                    f"({vwap:.2f}), red candle rejection. "
-                    f"Below VWAP for {self._ticks_below_vwap.get(token, 0)} ticks. "
+                    f"VWAP Bounce SHORT: {stock} ({entry:.2f}) completed candle rejected at "
+                    f"VWAP ({vwap:.2f}), red candle, vol {candle_vol:.0f} vs avg {avg_vol:.0f}. "
+                    f"Below VWAP for {self._candles_below_vwap.get(token, 0)} candles. "
                     f"NIFTY: {nifty_dir}"
                 ),
             )
@@ -169,98 +181,40 @@ class VWAPBounceStrategy(BaseStrategy):
         return None
 
     # ──────────────────────────────────────────────────────────
-    # Trend duration tracking
+    # VWAP position tracking (candle-based, not tick-based)
     # ──────────────────────────────────────────────────────────
 
-    def _update_vwap_position(self, token: str, ltp: float, vwap: float):
-        """
-        Track how many consecutive ticks this stock has been above/below VWAP.
-
-        Why: We only trade a VWAP bounce if the stock has been above VWAP
-        for at least 30 minutes (config.vwap_trend_min_ticks = 60 ticks).
-        A stock that just crossed VWAP isn't "trending" — it's just fluctuating.
-        """
-        if ltp > vwap:
-            self._ticks_above_vwap[token] = self._ticks_above_vwap.get(token, 0) + 1
-            self._ticks_below_vwap[token] = 0   # Reset below counter
-        elif ltp < vwap:
-            self._ticks_below_vwap[token] = self._ticks_below_vwap.get(token, 0) + 1
-            self._ticks_above_vwap[token] = 0   # Reset above counter
-
-    def _has_been_above_vwap_long_enough(self, token: str) -> bool:
-        """True if stock has been above VWAP for enough ticks (~30 min)."""
-        min_ticks = self.indicator_config.vwap_trend_min_ticks
-        return self._ticks_above_vwap.get(token, 0) >= min_ticks
-
-    def _has_been_below_vwap_long_enough(self, token: str) -> bool:
-        """True if stock has been below VWAP for enough ticks (~30 min)."""
-        min_ticks = self.indicator_config.vwap_trend_min_ticks
-        return self._ticks_below_vwap.get(token, 0) >= min_ticks
+    def _update_vwap_position(self, token: str, candle_close: float, vwap: float):
+        """Track consecutive COMPLETED candles above/below VWAP."""
+        if candle_close > vwap:
+            self._candles_above_vwap[token] = self._candles_above_vwap.get(token, 0) + 1
+            self._candles_below_vwap[token] = 0
+        elif candle_close < vwap:
+            self._candles_below_vwap[token] = self._candles_below_vwap.get(token, 0) + 1
+            self._candles_above_vwap[token] = 0
 
     # ──────────────────────────────────────────────────────────
-    # Candle analysis
+    # Filters
     # ──────────────────────────────────────────────────────────
-
-    def _is_green_candle(self, candles: pd.DataFrame) -> bool:
-        """
-        Check if the most recent "candle" is green (close > open).
-        A green candle at VWAP = buyers are stepping in = bounce confirmation.
-
-        With tick data we use: latest close > earliest close in last 5 ticks.
-        """
-        try:
-            if len(candles) < 5:
-                return False
-            recent_close = float(candles["Close"].iloc[-1])
-            candle_open = float(candles["Open"].iloc[-1])
-            return recent_close > candle_open
-        except Exception:
-            return False
-
-    def _is_red_candle(self, candles: pd.DataFrame) -> bool:
-        """Check if the most recent candle is red (close < open)."""
-        try:
-            if len(candles) < 5:
-                return False
-            recent_close = float(candles["Close"].iloc[-1])
-            candle_open = float(candles["Open"].iloc[-1])
-            return recent_close < candle_open
-        except Exception:
-            return False
 
     def _rsi_not_overbought(self, candles: pd.DataFrame, threshold: float = None) -> bool:
-        """True if RSI is not overbought — don't enter long if already stretched."""
         if threshold is None:
-            threshold = self.config.rsi_overbought_entry  # 75.0 from config
+            threshold = self.config.rsi_overbought_entry
         rsi = self._calc_rsi(candles["Close"])
         return rsi is None or rsi <= threshold
 
     def _rsi_not_oversold(self, candles: pd.DataFrame, threshold: float = None) -> bool:
-        """True if RSI is not oversold — don't enter short if already stretched."""
         if threshold is None:
-            threshold = self.config.rsi_oversold_entry  # 25.0 from config
+            threshold = self.config.rsi_oversold_entry
         rsi = self._calc_rsi(candles["Close"])
         return rsi is None or rsi >= threshold
 
     def _calc_rsi(self, closes: pd.Series, period: int = 14) -> Optional[float]:
-        """Calculate RSI using shared indicator function. Returns None if insufficient data."""
         if len(closes) < period + 1:
             return None
         rsi_series = calculate_rsi(closes, period=period)
         val = float(rsi_series.iloc[-1])
         return round(val, 1)
-
-    def _volume_adequate(self, candles: pd.DataFrame) -> bool:
-        """True if current volume is not significantly below average (not a dead market)."""
-        lookback = self.config.volume_lookback
-        if len(candles) < lookback + 1:
-            return True
-        vol = candles["Volume"]
-        current = vol.iloc[-1]
-        avg = vol.iloc[-(lookback + 1):-1].mean()
-        if avg <= 0:
-            return True
-        return current >= avg * 0.5   # Volume must be at least 50% of average
 
     def _calculate_vwap(self, candles: pd.DataFrame) -> float:
         """Fallback VWAP calculation from candle data."""
@@ -276,27 +230,32 @@ class VWAPBounceStrategy(BaseStrategy):
         except Exception:
             return 0.0
 
-    def _calc_confidence(self, distance_pct: float, nifty_dir: str, direction: str) -> float:
-        """Score 0.0-1.0 for the bounce quality."""
-        score = 0.4  # Base (all conditions passed = minimum 0.4, matches other strategies)
+    def _calc_confidence(self, distance_pct: float, nifty_dir: str,
+                         direction: str, candle_vol: float, avg_vol: float) -> float:
+        """Confidence score based on bounce quality."""
+        score = 0.5  # Base: completed candle bounce = already confirmed
 
-        if distance_pct < 0.05:    # Within 0.05% of VWAP = very precise bounce
-            score += 0.3
-        elif distance_pct < 0.1:   # Within 0.1% = good
+        # Closer to VWAP = more precise bounce
+        if distance_pct < 0.1:
             score += 0.2
-        else:
+        elif distance_pct < 0.2:
             score += 0.1
 
-        if direction == "LONG" and nifty_dir == "BULLISH":
-            score += 0.2
-        elif direction == "SHORT" and nifty_dir == "BEARISH":
+        # NIFTY alignment
+        if (direction == "LONG" and nifty_dir == "BULLISH") or \
+           (direction == "SHORT" and nifty_dir == "BEARISH"):
             score += 0.2
         elif nifty_dir == "NEUTRAL":
             score += 0.1
 
-        return min(score, 1.0)
+        # Volume strength on bounce
+        if avg_vol > 0 and candle_vol >= avg_vol * 2.0:
+            score += 0.1  # Strong institutional defense
+
+        return min(round(score, 2), 1.0)
 
     def reset_daily(self):
         """Reset per-stock tracking at start of new trading day."""
-        self._ticks_above_vwap.clear()
-        self._ticks_below_vwap.clear()
+        self._candles_above_vwap.clear()
+        self._candles_below_vwap.clear()
+        self._last_candle_idx.clear()

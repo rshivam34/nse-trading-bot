@@ -37,8 +37,8 @@ from utils.indicators import calculate_rsi
 
 logger = logging.getLogger(__name__)
 
-MIN_CANDLES_NEEDED = 22          # Need 22+ five-minute candles for meaningful 21-EMA
-MIN_EMA_SEPARATION_PCT = 0.05   # EMAs must be at least 0.05% apart to count as crossover
+MIN_CANDLES_NEEDED = 15          # Need 15+ five-minute candles (fires at 10:30 AM instead of 11:05; EMA21 still meaningful with pre-seeded data)
+MIN_EMA_SEPARATION_PCT = 0.15   # EMAs must be at least 0.15% apart (was 0.05% — micro-wiggles, not real trends)
 
 
 class EMACrossoverStrategy(BaseStrategy):
@@ -50,10 +50,6 @@ class EMACrossoverStrategy(BaseStrategy):
         self.indicator_config = indicator_config
         self.is_active = True
 
-        # Store previous EMA values per stock to detect crossovers
-        self._prev_ema_fast: dict[str, float] = {}
-        self._prev_ema_slow: dict[str, float] = {}
-
     def check_signal(
         self,
         stock: str,
@@ -62,57 +58,55 @@ class EMACrossoverStrategy(BaseStrategy):
         current_tick: dict,
         market_context: dict,
     ) -> Optional[Signal]:
-        """Check if EMA9 just crossed EMA21 with all production confirmations."""
+        """Check if EMA9 just crossed EMA21 on completed candles with confirmations."""
 
-        if len(candles) < MIN_CANDLES_NEEDED:
+        # Use completed candles only (exclude last row = incomplete candle).
+        # This prevents detecting false crossovers from tick-level noise in
+        # the incomplete candle, and fixes the volume bug (incomplete candle
+        # has partial volume that almost always fails the average check).
+        if len(candles) < MIN_CANDLES_NEEDED + 1:  # +1 for incomplete candle
             return None
 
-        closes = candles["Close"]
+        completed = candles.iloc[:-1]  # All completed 5-min candles
+        closes = completed["Close"]
 
-        ema_fast = self._ema(closes, self.indicator_config.ema_fast)
-        ema_slow = self._ema(closes, self.indicator_config.ema_slow)
+        # Compute EMA on completed candles — crossover between last two
+        ema_fast_series = closes.ewm(span=self.indicator_config.ema_fast, adjust=False).mean()
+        ema_slow_series = closes.ewm(span=self.indicator_config.ema_slow, adjust=False).mean()
 
-        if ema_fast is None or ema_slow is None:
-            return None
-
-        # Detect crossover: compare current vs previous
-        prev_fast = self._prev_ema_fast.get(token, ema_fast)
-        prev_slow = self._prev_ema_slow.get(token, ema_slow)
-
-        self._prev_ema_fast[token] = ema_fast
-        self._prev_ema_slow[token] = ema_slow
+        curr_fast = float(ema_fast_series.iloc[-1])
+        curr_slow = float(ema_slow_series.iloc[-1])
+        prev_fast = float(ema_fast_series.iloc[-2])
+        prev_slow = float(ema_slow_series.iloc[-2])
 
         ltp = current_tick.get("ltp", 0)
         if ltp <= 0:
             return None
 
         nifty_dir = market_context.get("nifty_direction", "NEUTRAL")
-        is_above_vwap = market_context.get("is_above_vwap", True)
         vwap = market_context.get("vwap", 0)
 
-        # ── Pre-checks that apply to both directions ──────────────────────
         # EMA separation must be meaningful (not just noise)
-        if ema_slow == 0:
-            return None  # Prevent division by zero on zero-valued EMA
-        separation_pct = abs(ema_fast - ema_slow) / ema_slow * 100
+        if curr_slow == 0:
+            return None
+        separation_pct = abs(curr_fast - curr_slow) / curr_slow * 100
         if separation_pct < MIN_EMA_SEPARATION_PCT:
-            return None  # EMAs too close — crossover signal is noise
-
-        # Volume confirmation
-        if not self._volume_above_average(candles):
             return None
 
-        # ── BULLISH CROSSOVER ─────────────────────────────────────────────
+        # Volume confirmation on last COMPLETED candle
+        if not self._volume_above_average(completed):
+            return None
+
+        # ── BULLISH CROSSOVER (on completed candles) ──────────────────────
         if (
-            prev_fast <= prev_slow    # Was below (or equal)
-            and ema_fast > ema_slow   # Now above — just crossed!
+            prev_fast <= prev_slow      # Previous completed candle: below
+            and curr_fast > curr_slow   # Latest completed candle: above = crossed!
             and nifty_dir != "BEARISH"
-            and self._rsi_ok(candles, "LONG")
-            and (not vwap or ltp > vwap)  # Above VWAP if we have it
+            and self._rsi_ok(completed, "LONG")
+            and (not vwap or ltp > vwap)
         ):
-            # SL: below recent swing low
-            recent_low = float(candles["Low"].iloc[-10:].min())
-            sl = round(recent_low * 0.998, 2)  # 0.2% buffer below swing low
+            recent_low = float(completed["Low"].iloc[-10:].min())
+            sl = round(recent_low * 0.998, 2)
             entry = round(ltp, 2)
             risk = entry - sl
 
@@ -120,41 +114,33 @@ class EMACrossoverStrategy(BaseStrategy):
                 return None
 
             target = round(entry + risk * self.config.risk_reward_ratio, 2)
-
-            separation_str = f"{separation_pct:.3f}%"
-            confidence = self._calc_confidence(ema_fast, ema_slow, nifty_dir, "LONG")
+            confidence = self._calc_confidence(curr_fast, curr_slow, nifty_dir, "LONG")
 
             logger.info(
-                f"EMA crossover LONG: {stock} | EMA9={ema_fast:.2f}, EMA21={ema_slow:.2f} | "
-                f"Sep: {separation_str} | NIFTY: {nifty_dir}"
+                f"EMA crossover LONG: {stock} | EMA9={curr_fast:.2f}, EMA21={curr_slow:.2f} | "
+                f"Sep: {separation_pct:.3f}% | NIFTY: {nifty_dir}"
             )
 
             return Signal(
-                stock=stock,
-                token=token,
-                direction="LONG",
-                entry_price=entry,
-                stop_loss=sl,
-                target=target,
-                strategy_name=self.name,
-                confidence=confidence,
+                stock=stock, token=token, direction="LONG",
+                entry_price=entry, stop_loss=sl, target=target,
+                strategy_name=self.name, confidence=confidence,
                 reason=(
-                    f"EMA9 ({ema_fast:.2f}) crossed above EMA21 ({ema_slow:.2f}). "
-                    f"Separation: {separation_str}. Volume confirmed. "
-                    f"NIFTY: {nifty_dir}."
+                    f"EMA9 ({curr_fast:.2f}) crossed above EMA21 ({curr_slow:.2f}). "
+                    f"Separation: {separation_pct:.3f}%. Volume confirmed. NIFTY: {nifty_dir}."
                 ),
             )
 
-        # ── BEARISH CROSSOVER ─────────────────────────────────────────────
+        # ── BEARISH CROSSOVER (on completed candles) ──────────────────────
         if (
-            prev_fast >= prev_slow    # Was above (or equal)
-            and ema_fast < ema_slow   # Now below — just crossed!
+            prev_fast >= prev_slow
+            and curr_fast < curr_slow
             and nifty_dir != "BULLISH"
-            and self._rsi_ok(candles, "SHORT")
+            and self._rsi_ok(completed, "SHORT")
             and (not vwap or ltp < vwap)
         ):
-            recent_high = float(candles["High"].iloc[-10:].max())
-            sl = round(recent_high * 1.002, 2)  # 0.2% buffer above swing high
+            recent_high = float(completed["High"].iloc[-10:].max())
+            sl = round(recent_high * 1.002, 2)
             entry = round(ltp, 2)
             risk = sl - entry
 
@@ -162,26 +148,20 @@ class EMACrossoverStrategy(BaseStrategy):
                 return None
 
             target = round(entry - risk * self.config.risk_reward_ratio, 2)
-            confidence = self._calc_confidence(ema_fast, ema_slow, nifty_dir, "SHORT")
+            confidence = self._calc_confidence(curr_fast, curr_slow, nifty_dir, "SHORT")
 
             logger.info(
-                f"EMA crossover SHORT: {stock} | EMA9={ema_fast:.2f}, EMA21={ema_slow:.2f} | "
+                f"EMA crossover SHORT: {stock} | EMA9={curr_fast:.2f}, EMA21={curr_slow:.2f} | "
                 f"Sep: {separation_pct:.3f}% | NIFTY: {nifty_dir}"
             )
 
             return Signal(
-                stock=stock,
-                token=token,
-                direction="SHORT",
-                entry_price=entry,
-                stop_loss=sl,
-                target=target,
-                strategy_name=self.name,
-                confidence=confidence,
+                stock=stock, token=token, direction="SHORT",
+                entry_price=entry, stop_loss=sl, target=target,
+                strategy_name=self.name, confidence=confidence,
                 reason=(
-                    f"EMA9 ({ema_fast:.2f}) crossed below EMA21 ({ema_slow:.2f}). "
-                    f"Separation: {separation_pct:.3f}%. Volume confirmed. "
-                    f"NIFTY: {nifty_dir}."
+                    f"EMA9 ({curr_fast:.2f}) crossed below EMA21 ({curr_slow:.2f}). "
+                    f"Separation: {separation_pct:.3f}%. Volume confirmed. NIFTY: {nifty_dir}."
                 ),
             )
 

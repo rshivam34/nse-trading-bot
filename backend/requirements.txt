@@ -26,5 +26,8 @@ pyotp>=2.9.0
 # HTTP requests (Marketaux news API, Angel One instrument master)
 requests>=2.31.0
 
+# Market data (NIFTY DMA, sector indices, fundamentals, earnings calendar)
+yfinance>=0.2.36
+
 # Utilities
 tabulate>=0.9.0

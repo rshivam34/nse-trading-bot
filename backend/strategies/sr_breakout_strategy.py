@@ -43,7 +43,7 @@ from strategies.base_strategy import BaseStrategy, Signal
 logger = logging.getLogger(__name__)
 
 MIN_CANDLES_NEEDED = 5  # Need 5+ five-minute candles — main logic uses prev-day levels
-VOLUME_SPIKE_MULTIPLIER = 3.0    # Higher bar for S/R breakout confirmation
+VOLUME_SPIKE_MULTIPLIER = 2.0    # Was 3.0 — only achievable 10-15 min/day. 2.0× still above average, fires throughout the day.
 LEVEL_BUFFER_PCT = 0.1            # 0.1% buffer to confirm a genuine break
 
 
@@ -235,14 +235,19 @@ class SRBreakoutStrategy(BaseStrategy):
         return levels
 
     def _calc_volume_ratio(self, candles: pd.DataFrame) -> float:
-        """Volume ratio: latest candle vs N-candle average (uses config.volume_lookback)."""
+        """Volume ratio: last COMPLETED candle vs N-candle average.
+
+        Uses iloc[-2] (last completed candle), not iloc[-1] (incomplete candle).
+        The incomplete candle has partial volume (e.g., 1 min into a 5-min window
+        = ~20% of final volume), which would make the ratio artificially low.
+        """
         lookback = self.config.volume_lookback
-        if len(candles) < lookback + 1:
+        if len(candles) < lookback + 2:  # +2 because -1 is incomplete, -2 is measured
             return 1.0
 
         vol_series = candles["Volume"]
-        current_vol = vol_series.iloc[-1]
-        avg_vol = vol_series.iloc[-(lookback + 1):-1].mean()
+        current_vol = vol_series.iloc[-2]  # Last COMPLETED candle
+        avg_vol = vol_series.iloc[-(lookback + 2):-2].mean()  # Average of candles before it
 
         if avg_vol <= 0:
             return 1.0

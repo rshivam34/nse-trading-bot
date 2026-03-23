@@ -125,6 +125,12 @@ class PatternScanner:
         # Volume profile manager (set via set_volume_profile)
         self.volume_profile = None
 
+        # Pre-market analysis data (set via setter methods at startup)
+        self._macro_data = None         # MacroData from macro_analysis.py
+        self._sector_data = None        # {sector_name: SectorStrength}
+        self._fundamental_data = None   # {stock: StockFundamentals}
+        self._earnings_skip: set = set()  # Stocks to hard-skip (earnings this week)
+
         # Track starting slot index per token for end-of-day profile save
         # 0 = candle_store starts from 09:15 (pre-seeded), higher for late starts
         self._candle_start_slot_index: dict[str, int] = {}
@@ -157,6 +163,27 @@ class PatternScanner:
         """Set volume profile manager for TOD RVOL calculations."""
         self.volume_profile = volume_profile
         logger.info("Volume profile manager connected to scanner")
+
+    def set_macro_data(self, macro_data):
+        """Set macro analysis results from MacroAnalyzer (called at startup)."""
+        self._macro_data = macro_data
+        logger.info(f"Macro data set: trend={macro_data.nifty_trend}, stance={macro_data.market_stance}")
+
+    def set_sector_data(self, sector_data: dict):
+        """Set sector strength data from SectorAnalyzer (called at startup)."""
+        self._sector_data = sector_data
+        logger.info(f"Sector data set for {len(sector_data)} sectors")
+
+    def set_fundamental_data(self, fundamental_data: dict):
+        """Set fundamental analysis cache from FundamentalFilter (called at startup)."""
+        self._fundamental_data = fundamental_data
+        logger.info(f"Fundamental data set for {len(fundamental_data)} stocks")
+
+    def set_earnings_skip(self, earnings_skip: set):
+        """Set stocks to skip due to earnings this week (called at startup)."""
+        self._earnings_skip = earnings_skip
+        if earnings_skip:
+            logger.info(f"Earnings skip: {', '.join(sorted(earnings_skip))} ({len(earnings_skip)} stocks)")
 
     def seed_candles(self, token: str, candles: list[dict]):
         """
@@ -313,6 +340,10 @@ class PatternScanner:
         if stock_sentiment.get("skip_today", False):
             return []
 
+        # Skip stocks with quarterly earnings this week (hard skip)
+        if stock in self._earnings_skip:
+            return []
+
         # Build tick buffer (tag with arrival time for 5-min candle building)
         tick["_time"] = time.time()
         if token not in self.tick_buffer:
@@ -390,22 +421,16 @@ class PatternScanner:
         confluent_signal.choppiness = chop_value
         confluent_signal.trend_15m = trend_15m
 
-        # ── Step 3a: Lunch block check ─────────────────────────────────
+        # ── Step 3a: Lunch block — FLAG ONLY (not a gate) ──────────────
+        # Choppiness, RVOL, and VIX filters handle the underlying conditions
+        # that make lunch bad (low volume, whipsaw). No hard block needed.
         now = datetime.now().time()
-        if self.trading_config.lunch_block_start <= now <= self.trading_config.lunch_block_end:
-            confluent_signal.status = "SKIPPED-LUNCH-BLOCK"
-            confluent_signal.skip_reason = (
-                f"Lunch block {self.trading_config.lunch_block_start.strftime('%H:%M')}"
-                f"-{self.trading_config.lunch_block_end.strftime('%H:%M')}"
+        is_lunch = self.trading_config.lunch_block_start <= now <= self.trading_config.lunch_block_end
+        if is_lunch:
+            logger.debug(
+                f"LUNCH-FLAG: {stock} {confluent_signal.direction} — "
+                f"during lunch hour (proceeding, filters handle quality)"
             )
-            self._all_signals_today.append(confluent_signal)
-            logger.info(
-                f"SKIPPED-LUNCH-BLOCK: {stock} {confluent_signal.direction} — "
-                f"{' + '.join(confluence_strategies)} confluence ({confluence_count}/4), "
-                f"blocked during {self.trading_config.lunch_block_start.strftime('%H:%M')}"
-                f"-{self.trading_config.lunch_block_end.strftime('%H:%M')}"
-            )
-            return []
 
         # ── Step 3b: VIX gate ──────────────────────────────────────────
         vix = self.market_context.get("vix", 0)
@@ -512,16 +537,35 @@ class PatternScanner:
             signal=confluent_signal,
             market_context=stock_context,
             news_sentiment=self.news_sentiment,
+            macro_data=self._macro_data,
+            sector_data=self._sector_data,
+            fundamental_data=self._fundamental_data,
         )
 
-        # ── Step 4a: ATR expansion check (penalty for breakouts) ───────
-        if is_breakout:
-            atr_expanding = is_atr_expanding(
-                candles,
-                atr_period=self.indicator_config.atr_period,
-                lookback=self.trading_config.atr_expansion_lookback,
-            )
-            if not atr_expanding:
+        # ── Step 4a: ATR expansion check ───────────────────────────────
+        # Breakout strategies (ORB, SR_BREAKOUT) REQUIRE expanding ATR.
+        # Breakouts in compressing volatility fail — hard reject.
+        # Momentum strategies (VWAP_BOUNCE, EMA_CROSSOVER) get a soft penalty.
+        atr_expanding = is_atr_expanding(
+            candles,
+            atr_period=self.indicator_config.atr_period,
+            lookback=self.trading_config.atr_expansion_lookback,
+        )
+        if not atr_expanding:
+            if is_breakout:
+                # Hard reject for breakout strategies — can't break out in compression
+                confluent_signal.status = "SKIPPED-ATR-COMPRESSING"
+                confluent_signal.skip_reason = (
+                    f"ATR compressing — hard reject for {confluent_signal.strategy_name}"
+                )
+                self._all_signals_today.append(confluent_signal)
+                logger.info(
+                    f"SKIPPED-ATR-COMPRESSING: {stock} {confluent_signal.strategy_name} — "
+                    f"breakouts in compressing ATR fail"
+                )
+                return []
+            else:
+                # Soft penalty for momentum strategies
                 penalty = self.trading_config.atr_compression_penalty
                 score -= penalty
                 breakdown["atr_compression_penalty"] = -penalty
@@ -549,6 +593,76 @@ class PatternScanner:
             breakdown["rvol_bonus"] = rvol_adj
             logger.debug(f"{stock} — RVOL {rvol:.1f}× (high): +{rvol_adj} score bonus")
 
+        # ── Step 4b2: VWAP_BOUNCE VIX penalty ──────────────────────────
+        # VWAP bounces rely on orderly institutional flow. High VIX means
+        # price whipsaws through VWAP — "bounces" are noise, not signal.
+        if confluent_signal.strategy_name == "VWAP_BOUNCE" and vix > 0:
+            vwap_vix_threshold = self.trading_config.vwap_bounce_vix_penalty_threshold
+            if vix > vwap_vix_threshold:
+                vwap_penalty = self.trading_config.vwap_bounce_vix_penalty
+                score -= vwap_penalty
+                breakdown["vwap_high_vix_penalty"] = -vwap_penalty
+                logger.info(
+                    f"{stock} — VWAP_BOUNCE at VIX {vix:.1f} > {vwap_vix_threshold}: "
+                    f"-{vwap_penalty} penalty (score now {score})"
+                )
+
+        # ── Step 4c: Momentum exhaustion penalty ─────────────────────
+        # If NIFTY gave back 40%+ of its peak intraday gains, momentum is
+        # dying. Afternoon LONG signals into an exhausting market fail often.
+        # Only applies after 12:00 PM (morning is always "active momentum").
+        momentum_exhausted = False
+        if now >= datetime.strptime("12:00", "%H:%M").time():
+            nifty_open_price = self.market_context.get("nifty_open", 0)
+            nifty_ltp = self.market_context.get("nifty_ltp", 0)
+            nifty_high = self.market_context.get("nifty_day_high", 0)
+            nifty_low = self.market_context.get("nifty_day_low", 0)
+
+            if nifty_open_price > 0 and nifty_ltp > 0:
+                # Check bullish exhaustion (for LONG signals)
+                peak_up_pct = ((nifty_high - nifty_open_price) / nifty_open_price * 100) if nifty_high > nifty_open_price else 0
+                current_pct = (nifty_ltp - nifty_open_price) / nifty_open_price * 100
+
+                if peak_up_pct > 0.3 and confluent_signal.direction == "LONG":
+                    giveback = 1 - (current_pct / peak_up_pct) if peak_up_pct > 0 else 0
+                    if giveback > 0.4:
+                        momentum_exhausted = True
+                        score -= 15
+                        breakdown["momentum_exhaustion"] = -15
+                        logger.info(
+                            f"{stock} — Momentum exhaustion: NIFTY peak +{peak_up_pct:.1f}%, "
+                            f"now +{current_pct:.1f}% (gave back {giveback*100:.0f}%). "
+                            f"LONG penalized -15"
+                        )
+
+                # Check bearish exhaustion (for SHORT signals)
+                peak_down_pct = ((nifty_open_price - nifty_low) / nifty_open_price * 100) if nifty_low < nifty_open_price else 0
+                current_loss_pct = -current_pct  # Positive when NIFTY is below open
+
+                if peak_down_pct > 0.3 and confluent_signal.direction == "SHORT":
+                    if current_loss_pct >= 0:
+                        recovery = 1 - (current_loss_pct / peak_down_pct) if peak_down_pct > 0 else 0
+                    else:
+                        recovery = 1.0  # NIFTY went positive = full recovery
+                    if recovery > 0.4:
+                        momentum_exhausted = True
+                        score -= 15
+                        breakdown["momentum_exhaustion"] = -15
+                        logger.info(
+                            f"{stock} — Momentum exhaustion: NIFTY peak -{peak_down_pct:.1f}%, "
+                            f"now {current_pct:+.1f}% (recovered {recovery*100:.0f}%). "
+                            f"SHORT penalized -15"
+                        )
+
+        # ── Step 4d: Time-of-day penalty (very mild) ─────────────────
+        # Only after 14:00 — just 45 min left for trade to play out.
+        # Momentum exhaustion is the real protection for bad afternoons.
+        # No penalty before 14:00 — preserves good afternoon trades like CANBK.
+        if now >= datetime.strptime("14:00", "%H:%M").time():
+            score -= 5
+            breakdown["late_afternoon_penalty"] = -5
+            logger.debug(f"{stock} — Late afternoon (after 14:00): -5 score")
+
         # Attach score to signal
         confluent_signal.score = score
         confluent_signal.score_breakdown = breakdown
@@ -556,6 +670,7 @@ class PatternScanner:
             f"[Score: {score}/100] {confluent_signal.reason} | "
             f"Confluence: {' + '.join(confluence_strategies)} ({confluence_count}/4) | "
             f"RVOL: {rvol:.1f}× ({rvol_source})"
+            f"{' | MOMENTUM-EXHAUSTED' if momentum_exhausted else ''}"
         )
 
         # ── Step 5: Score threshold check ──────────────────────────────
@@ -991,6 +1106,13 @@ class PatternScanner:
 
             self.market_context["nifty_ltp"] = ltp
             self.market_context["nifty_change_pct"] = round(change_pct, 2)
+            self.market_context["nifty_open"] = open_price
+
+            # Track day high/low for momentum exhaustion check
+            day_high = nifty_tick.get("high", ltp)
+            day_low = nifty_tick.get("low", ltp)
+            self.market_context["nifty_day_high"] = day_high
+            self.market_context["nifty_day_low"] = day_low
 
         # Track NIFTY ticks for choppiness calculation (tag with arrival time)
         nifty_tick["_time"] = time.time()

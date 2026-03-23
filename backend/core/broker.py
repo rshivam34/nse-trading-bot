@@ -75,7 +75,8 @@ class BrokerConnection:
                 return False
 
             # Step 1: Create the SmartConnect session object
-            self.session = SmartConnect(api_key=self.config.api_key)
+            # Default timeout is 7s which is too short when Angel One is slow
+            self.session = SmartConnect(api_key=self.config.api_key, timeout=30)
 
             # Step 2: Generate TOTP (6-digit rotating code, like Google Authenticator)
             totp = pyotp.TOTP(self.config.totp_secret).now()
@@ -145,14 +146,17 @@ class BrokerConnection:
             self.is_connected = False
             self.session = None
 
-    def retry_connect(self, max_attempts: int = 3) -> bool:
-        """Try to connect multiple times with 5-second delay between attempts."""
+    def retry_connect(self, max_attempts: int = 5) -> bool:
+        """Try to connect multiple times with increasing delay between attempts."""
         for attempt in range(1, max_attempts + 1):
             logger.info(f"Connection attempt {attempt}/{max_attempts}...")
             if self.connect():
                 return True
             if attempt < max_attempts:
-                time_module.sleep(5)
+                # Exponential backoff: 5s, 10s, 20s, 30s
+                delay = min(5 * (2 ** (attempt - 1)), 30)
+                logger.info(f"Retrying in {delay}s...")
+                time_module.sleep(delay)
         return False
 
     # ──────────────────────────────────────────────────────────
