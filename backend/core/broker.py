@@ -289,6 +289,128 @@ class BrokerConnection:
             logger.error(f"Order placement failed: {error}")
             return None
 
+    def place_option_order(
+        self,
+        option_symbol: str,   # e.g., "NIFTY27MAR25500CE"
+        token: str,           # Instrument token from NFO segment
+        transaction: str,     # "BUY" or "SELL"
+        quantity: int,        # Number of lots × lot_size (e.g., 25 for 1 lot NIFTY)
+        price: float,         # Premium price
+        order_type: str = "LIMIT",
+    ) -> Optional[str]:
+        """
+        Place a NIFTY/BANKNIFTY option order on Angel One.
+
+        Key differences from equity:
+        - exchange: "NFO" (not "NSE")
+        - producttype: "MIS" (intraday F&O) — auto squared-off at 3:15
+        - tradingsymbol: "NIFTY27MAR25500CE" (no -EQ suffix)
+        - quantity: in lots × lot_size (NIFTY = 25, BANKNIFTY = 15)
+        """
+        if not self._check_connected():
+            return None
+
+        order_params = {
+            "variety": "NORMAL",
+            "tradingsymbol": option_symbol,
+            "symboltoken": token,
+            "transactiontype": transaction,
+            "exchange": "NFO",
+            "ordertype": "LIMIT" if order_type == "LIMIT" else "MARKET",
+            "producttype": "MIS",
+            "duration": "DAY",
+            "price": str(round(price, 2)),
+            "quantity": str(quantity),
+            "squareoff": "0",
+            "stoploss": "0",
+        }
+
+        response = self._api_with_retry(self.session.placeOrder, order_params)
+
+        if isinstance(response, str) and response:
+            logger.info(
+                f"Option order placed: {transaction} {quantity}x {option_symbol} "
+                f"@ Rs.{price:.2f} | Order ID: {response}"
+            )
+            return response
+        elif isinstance(response, dict) and response.get("status"):
+            order_id = response.get("data", {}).get("orderid", "")
+            logger.info(
+                f"Option order placed: {transaction} {quantity}x {option_symbol} "
+                f"@ Rs.{price:.2f} | Order ID: {order_id}"
+            )
+            return order_id
+        else:
+            error = response.get("message", "Unknown") if isinstance(response, dict) else str(response or "No response")
+            logger.error(f"Option order failed: {error}")
+            return None
+
+    def get_option_ltp(self, option_symbol: str, token: str) -> float:
+        """Get current LTP (premium) of an option from Angel One."""
+        if not self._check_connected():
+            return 0.0
+        try:
+            response = self._api_with_retry(
+                self.session.ltpData, "NFO", option_symbol, token
+            )
+            if isinstance(response, dict) and response.get("data"):
+                return float(response["data"].get("ltp", 0))
+        except Exception as e:
+            logger.warning(f"Option LTP fetch failed for {option_symbol}: {e}")
+        return 0.0
+
+    def get_option_chain_strikes(
+        self,
+        index: str,      # "NIFTY" or "BANKNIFTY"
+        spot_price: float,
+        expiry_str: str,  # "27MAR2026" format
+        num_strikes: int = 5,  # 5 strikes above + 5 below ATM
+    ) -> list[dict]:
+        """
+        Get option chain (CE + PE) for strikes around the spot price.
+
+        Returns list of dicts with: symbol, token, strike, type (CE/PE), ltp
+        Uses the instrument master cache to find tokens, then fetches LTP.
+        """
+        if not self._check_connected():
+            return []
+
+        results = []
+        # Determine strike interval (NIFTY = 50, BANKNIFTY = 100)
+        strike_interval = 50 if index == "NIFTY" else 100
+        atm_strike = round(spot_price / strike_interval) * strike_interval
+
+        # Generate strikes to check
+        strikes = [atm_strike + (i * strike_interval) for i in range(-num_strikes, num_strikes + 1)]
+
+        for strike in strikes:
+            for opt_type in ["CE", "PE"]:
+                symbol = f"{index}{expiry_str}{int(strike)}{opt_type}"
+                token = self._lookup_option_token(symbol)
+                if token:
+                    ltp = self.get_option_ltp(symbol, token)
+                    results.append({
+                        "symbol": symbol,
+                        "token": token,
+                        "strike": strike,
+                        "type": opt_type,
+                        "ltp": ltp,
+                    })
+
+        return results
+
+    def _lookup_option_token(self, option_symbol: str) -> Optional[str]:
+        """Look up instrument token for an option from the cached instrument master."""
+        try:
+            from utils.watchlist import get_instrument_master
+            master = get_instrument_master()
+            for entry in master:
+                if entry.get("symbol") == option_symbol and entry.get("exch_seg") == "NFO":
+                    return str(entry.get("token", ""))
+        except Exception as e:
+            logger.debug(f"Option token lookup failed for {option_symbol}: {e}")
+        return None
+
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:
         """Cancel a pending order."""
         if not self._check_connected():

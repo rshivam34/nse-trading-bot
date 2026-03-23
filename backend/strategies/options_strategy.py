@@ -71,8 +71,10 @@ class NiftyOptionsStrategy:
             # Buy the option, track by premium
     """
 
-    def __init__(self, config):
+    def __init__(self, config, min_range_pct: float = 0.2, max_range_pct: float = 2.0):
         self.config = config
+        self._min_range_pct = min_range_pct
+        self._max_range_pct = max_range_pct
         self.orb_high: float = 0
         self.orb_low: float = 0
         self.orb_range_set: bool = False
@@ -120,8 +122,10 @@ class NiftyOptionsStrategy:
         mid = (self.orb_high + self.orb_low) / 2
         range_pct = (orb_range / mid) * 100
 
-        # Range size filter (0.3-1.5% for NIFTY)
-        if range_pct < 0.3 or range_pct > 1.5:
+        # Range size filter (index-specific — BANKNIFTY is more volatile)
+        min_range = self._min_range_pct
+        max_range = self._max_range_pct
+        if range_pct < min_range or range_pct > max_range:
             return None
 
         buffer = mid * 0.001  # 0.1% buffer for NIFTY (tighter than equity)

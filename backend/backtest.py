@@ -215,28 +215,29 @@ class Backtester:
         self._run_options_backtest(trading_days, nifty_5m, banknifty_5m, vix_daily)
 
     def _run_options_backtest(self, trading_days, nifty_5m, banknifty_5m, vix_daily):
-        """Simulate NIFTY/BANKNIFTY ORB options trades."""
+        """Simulate NIFTY/BANKNIFTY ORB options trades with improved premium model."""
         from strategies.options_strategy import NiftyOptionsStrategy
 
         print(f"\n{'='*70}")
         print(f"  F&O OPTIONS BACKTEST (NIFTY/BANKNIFTY ORB)")
         print(f"{'='*70}\n")
 
-        opt_strategy = NiftyOptionsStrategy(self.trading_config)
         option_trades = []
-        ATM_DELTA = 0.5
         NIFTY_LOT = 25
         BANKNIFTY_LOT = 15
 
-        # Simulate on both NIFTY and BANKNIFTY
-        for index_name, index_data, lot_size in [
-            ("NIFTY", nifty_5m, NIFTY_LOT),
-            ("BANKNIFTY", banknifty_5m, BANKNIFTY_LOT),
+        # Simulate on both NIFTY and BANKNIFTY (separate strategy instances)
+        for index_name, index_data, lot_size, strike_interval, atm_delta in [
+            ("NIFTY", nifty_5m, NIFTY_LOT, 50, 0.50),
+            ("BANKNIFTY", banknifty_5m, BANKNIFTY_LOT, 100, 0.55),  # BANKNIFTY options have higher delta due to volatility
         ]:
             if index_data is None or len(index_data) == 0:
                 continue
 
             for day in trading_days:
+                # NIFTY: tighter range (0.2-1.5%), BANKNIFTY: wider range (0.2-3.0%)
+                max_rng = 1.5 if index_name == "NIFTY" else 3.0
+                opt_strategy = NiftyOptionsStrategy(self.trading_config, min_range_pct=0.2, max_range_pct=max_rng)
                 day_candles = index_data[index_data.index.date == day]
                 if len(day_candles) < 10:
                     continue
@@ -271,12 +272,21 @@ class Backtester:
 
                         signal = opt_strategy.check_signal(day_candles.iloc[:i+1], vix=vix)
                         if signal:
-                            # Estimate premium: ATM option premium ≈ index_range × delta × 2
-                            # More volatile = higher premium
-                            est_premium = max(50, orb_range * ATM_DELTA * 1.5)
+                            # Improved premium estimation using Black-Scholes approximation:
+                            # ATM premium ≈ spot × sigma × sqrt(T) × 0.4 (simplified)
+                            # where sigma = VIX/100 (annualized), T = days_to_expiry/365
+                            # For weekly options: T ≈ 3/365 (avg 3 days to expiry)
+                            spot = ltp
+                            sigma = max(vix, 12) / 100  # Annual vol from VIX
+                            days_to_expiry = 3  # Weekly options avg
+                            time_factor = (days_to_expiry / 365) ** 0.5
+                            est_premium = round(spot * sigma * time_factor * 0.4, 1)
+                            est_premium = max(30, min(est_premium, 500))  # Clamp to realistic range
+
+                            strike = round(ltp / strike_interval) * strike_interval
                             option_pos = {
                                 "index": index_name,
-                                "type": signal.direction,  # CALL or PUT
+                                "type": signal.direction,
                                 "entry_premium": est_premium,
                                 "entry_index": ltp,
                                 "sl_premium": est_premium * 0.7,  # 30% loss
@@ -292,7 +302,7 @@ class Backtester:
                             index_move = -index_move  # PUT profits when index falls
 
                         # Premium change ≈ index_move × delta
-                        premium_change = index_move * ATM_DELTA
+                        premium_change = index_move * atm_delta
                         current_premium = option_pos["entry_premium"] + premium_change
 
                         # SL hit (premium dropped 30%)
@@ -361,7 +371,7 @@ class Backtester:
                     index_move = last_ltp - option_pos["entry_index"]
                     if option_pos["type"] == "PUT":
                         index_move = -index_move
-                    premium_change = index_move * ATM_DELTA
+                    premium_change = index_move * atm_delta
                     current_premium = option_pos["entry_premium"] + premium_change
                     gross = (current_premium - option_pos["entry_premium"]) * lot_size
                     charges = lot_size * option_pos["entry_premium"] * 0.001
