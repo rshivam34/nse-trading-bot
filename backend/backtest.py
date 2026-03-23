@@ -26,6 +26,7 @@ import numpy as np
 # Reuse existing bot components
 from config import config
 from strategies.vwap_strategy import VWAPBounceStrategy
+from strategies.vwap_reversion_strategy import VWAPReversionStrategy
 from strategies.ema_strategy import EMACrossoverStrategy
 from strategies.sr_breakout_strategy import SRBreakoutStrategy
 from strategies.orb_strategy import ORBStrategy
@@ -106,11 +107,13 @@ class Backtester:
         # 6 candles = 30 minutes (same intent as 60 ticks in live mode)
         self.indicator_config.vwap_trend_min_ticks = 6
 
-        # Strategies — ORB only (proven gross-positive at +Rs.206 in Feb backtest)
-        # VWAP disabled: -Rs.1,298 loss even with 2-candle bounce + sector + time filters
-        # EMA/SR disabled: 0-1 trades in Feb, not enough signal
+        # Strategies — ORB + VWAP Mean Reversion
+        # ORB: proven gross-positive (retest confirmation)
+        # VWAP Reversion: NEW — fade overextended moves (opposite of old VWAP bounce)
+        # Old VWAP Bounce: DISABLED (-Rs.1,298 loss)
         self.strategies = [
             ORBStrategy(self.trading_config),
+            VWAPReversionStrategy(self.trading_config, self.indicator_config),
         ]
         self.scorer = SignalScorer()
 
@@ -152,10 +155,14 @@ class Backtester:
         vix_daily = self._fetch_vix_daily(start_date, end_date)
         print(f"  VIX data: {len(vix_daily)} days\n")
 
-        # Step 4: Fetch NIFTY 5-min candles
-        print("Fetching NIFTY 5-min candles...")
+        # Step 4: Fetch NIFTY + BANKNIFTY 5-min candles
+        print("Fetching NIFTY + BANKNIFTY 5-min candles...")
         nifty_5m = self._fetch_5m_candles("^NSEI", start_date, end_date)
-        print(f"  NIFTY candles: {len(nifty_5m)} rows\n")
+        banknifty_5m = self._fetch_5m_candles("^NSEBANK", start_date, end_date)
+        print(f"  NIFTY candles: {len(nifty_5m) if nifty_5m is not None else 0} rows")
+        print(f"  BANKNIFTY candles: {len(banknifty_5m) if banknifty_5m is not None else 0} rows\n")
+
+        # BANKNIFTY will be added to stock_data after it's initialized below
 
         # Step 5: Fetch stock 5-min candles
         print(f"Fetching 5-min candles for {len(stocks)} stocks...")
@@ -167,6 +174,10 @@ class Backtester:
                 sys.stdout.write(f"\r  {i+1}/{len(stocks)} fetched ({stock})   ")
                 sys.stdout.flush()
             time_module.sleep(0.3)  # Rate limit
+        # Add BANKNIFTY as a tradeable instrument
+        if banknifty_5m is not None and len(banknifty_5m) > 50:
+            stock_data["BANKNIFTY"] = banknifty_5m
+
         print(f"\n  Loaded: {len(stock_data)} stocks with data\n")
 
         # Step 6: Fetch daily OHLC for prev-day levels

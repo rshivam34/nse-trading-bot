@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ORB only fires 9:30-10:30 IST (first hour after opening range).
 # After 10:30, the ORB momentum is exhausted — other strategies take over.
-ORB_SIGNAL_CUTOFF = time(10, 30)
+ORB_SIGNAL_CUTOFF = time(10, 15)
 
 # Minimum candles before ORB can fire (need some price action after breakout)
 MIN_CANDLES_AFTER_ORB = 4  # At least 4 candles after 9:30 (= 20 min)
