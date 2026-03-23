@@ -142,16 +142,17 @@ class TradingConfig:
     # ── VIX 3-zone response (Indian market calibrated) ────────────────
     # India VIX typical range: 10-25. Normal: 12-18. Median ~15.
     # NORMAL:  VIX < 18  → 100% size, 1.5× ATR SL. Standard conditions.
-    # CAUTION: VIX 18-25 → 50% size, 2× ATR SL. Volatility rising, reduce exposure.
-    # DANGER:  VIX > 25  → 0% size, no new trades. Extreme fear, whipsaws too violent.
-    # Note: ELEVATED zone removed — 75% was never meaningful. Either trade full or half.
+    # DANGER:  VIX >= 18 → 0% size, no new trades. ALL elevated VIX = sit out.
+    # Why: VIX > 18 has only occurred during wars/tariffs/crises (Apr 2025, May 2025, Mar 2026).
+    #       These are NOT normal conditions. The bot makes money in VIX 10-18 (90% of trading days).
+    #       Trading during VIX 18+ adds risk without proportional reward.
     vix_normal_threshold: float = 18.0      # VIX < 18 = NORMAL (100% size)
-    vix_elevated_threshold: float = 18.0    # Set same as normal (effectively disabled — ELEVATED zone collapsed into CAUTION)
-    vix_caution_threshold: float = 25.0     # VIX 18-25 = CAUTION (50% size), VIX > 25 = DANGER
-    vix_elevated_size_pct: float = 50.0     # Same as CAUTION (ELEVATED zone disabled)
-    vix_elevated_risk_pct: float = 0.75     # Same as CAUTION (ELEVATED zone disabled)
-    vix_caution_size_pct: float = 50.0      # Position size in CAUTION mode
-    vix_caution_risk_pct: float = 0.75      # Risk per trade in CAUTION (50% of 1.5%)
+    vix_elevated_threshold: float = 18.0    # Same as DANGER (no intermediate zone)
+    vix_caution_threshold: float = 18.0     # VIX >= 18 = DANGER (all trades blocked — equity AND F&O)
+    vix_elevated_size_pct: float = 0.0      # All zones above NORMAL = blocked (0% size)
+    vix_elevated_risk_pct: float = 0.0      # No risk allowed above VIX 18
+    vix_caution_size_pct: float = 0.0       # No trades above VIX 18
+    vix_caution_risk_pct: float = 0.0       # No trades above VIX 18
 
     # ── Strategy-specific VIX adjustments ───────────────────────────
     # VWAP bounces depend on orderly institutional flow at VWAP.

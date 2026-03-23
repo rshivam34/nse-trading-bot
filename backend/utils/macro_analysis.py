@@ -131,28 +131,22 @@ class MacroAnalyzer:
         """
         Combine VIX zone + NIFTY DMA trend into a single market stance.
 
-        Stance rules (aligned with 3-zone VIX: NORMAL < 18, CAUTION 18-25, DANGER > 25):
+        Stance rules (VIX >= 18 = CASH, no intermediate zones):
         - AGGRESSIVE: VIX < 18 AND above both DMAs → 5 trades, 100% size
         - MODERATE:   VIX < 18 AND below 50 DMA but above 200 → 3 trades, 100% size
-        - DEFENSIVE:  VIX 18-25 OR below 200 DMA → 2 trades, 50% size
-        - CASH:       VIX > 25 → 0 trades, 0% size
+        - DEFENSIVE:  VIX < 18 AND below 200 DMA → 2 trades, 50% size
+        - CASH:       VIX >= 18 → 0 trades, 0% size (wars/tariffs/crises only)
         """
         reasons = []
 
-        # VIX-based stance (takes priority for extreme values)
-        if vix > 25:
+        # VIX >= 18 = CASH (no trades at all)
+        # VIX > 18 only happens during crises (Apr 2025 tariffs, May 2025 India-Pak, Mar 2026 US-Iran)
+        if vix >= 18:
             data.market_stance = "CASH"
             data.stance_max_trades = 0
             data.stance_size_pct = 0.0
-            data.reason = f"CASH: VIX {vix:.1f} > 25 (DANGER zone — no trades)"
+            data.reason = f"CASH: VIX {vix:.1f} >= 18 (crisis conditions — no trades)"
             return
-
-        if vix > 18:
-            # VIX 18-25 = at least DEFENSIVE (CAUTION zone)
-            reasons.append(f"VIX {vix:.1f} (18-25 CAUTION range)")
-            data.market_stance = "DEFENSIVE"
-            data.stance_max_trades = 2
-            data.stance_size_pct = 50.0
         else:
             # VIX < 18 = NORMAL zone, could be AGGRESSIVE or MODERATE
             if vix > 0:
