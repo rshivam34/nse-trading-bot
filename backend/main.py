@@ -44,6 +44,7 @@ from core.data_stream import DataStream
 from core.scanner import PatternScanner
 from core.risk_manager import RiskManager
 from core.order_manager import OrderManager
+from core.options_manager import OptionsManager
 from core.portfolio import Portfolio
 from utils.firebase_sync import FirebaseSync
 from utils.macro_analysis import MacroAnalyzer
@@ -125,6 +126,9 @@ class TradingBot:
         self.data_stream = DataStream(self.broker)
         self.order_manager.set_data_stream(self.data_stream)
         self.firebase = FirebaseSync(config.firebase)
+
+        # F&O Options Manager (NIFTY/BANKNIFTY ORB-based option buying)
+        self.options_manager = OptionsManager(config.trading, broker=self.broker) if config.trading.options_enabled else None
 
         # New: news sentiment, regime detector, analytics, volume profiles
         self.news_fetcher = NewsSentimentFetcher(config.news)
@@ -871,6 +875,32 @@ class TradingBot:
                     logger.debug(f"Firebase market context push failed: {fe}")
             except Exception as e:
                 logger.warning(f"Index tick processing error: {e}")
+
+            # ── F&O: Track NIFTY/BANKNIFTY for options ────────────────────
+            if self.options_manager and token != self.vix_token:
+                ltp = tick.get("ltp", 0)
+                high = tick.get("high", ltp)
+                low = tick.get("low", ltp)
+                index_name = "NIFTY" if token == self.nifty_token else "BANKNIFTY"
+
+                if now < config.trading.orb_end:
+                    # ORB period: track range for options
+                    self.options_manager.update_orb_range(index_name, ltp, high, low)
+                elif now <= time(10, 15) and not config.trading.suggest_only:
+                    # After ORB, check for option signals (10:15 cutoff)
+                    vix = self.scanner.market_context.get("vix", 0)
+                    signal = self.options_manager.check_for_signal(index_name, ltp, vix=vix)
+                    if signal:
+                        logger.info(f"F&O SIGNAL: {signal['index']} {signal['strike']}{signal['option_type']}")
+                        pos = self.options_manager.execute_option_signal(signal, vix=vix)
+                        if pos:
+                            try:
+                                self.firebase.push_market_context({
+                                    "options_trade": f"{pos.symbol} @ Rs.{pos.entry_premium:.2f}"
+                                })
+                            except Exception:
+                                pass
+
             return
 
         # ── ORB OBSERVATION PERIOD (9:15 AM - 9:30 AM) ─────────────────
@@ -1281,6 +1311,15 @@ class TradingBot:
                         # Update the position in Firebase with new SL/remaining qty
                         self.firebase.push_open_position(pos.to_dict())
 
+                # Monitor F&O option positions (SL/target/time exit on premium)
+                if self.options_manager and self.options_manager.open_positions:
+                    try:
+                        closed_opts = self.options_manager.monitor_positions()
+                        for opt in closed_opts:
+                            logger.info(f"Option closed: {opt.symbol} | Net: Rs.{opt.pnl:+.2f}")
+                    except Exception as e:
+                        logger.warning(f"Options monitoring error: {e}")
+
                 time.sleep(1)
 
         except KeyboardInterrupt:
@@ -1321,6 +1360,10 @@ class TradingBot:
         if not config.trading.suggest_only and not self._positions_exited:
             with self._position_lock:
                 self.order_manager.exit_all_positions()
+                # Exit F&O option positions too
+                if self.options_manager and self.options_manager.open_positions:
+                    logger.info("Closing open option positions...")
+                    self.options_manager.exit_all_positions()
             # Record force-closed positions to CSV and Firebase
             self._record_force_closed_positions()
             self._positions_exited = True
