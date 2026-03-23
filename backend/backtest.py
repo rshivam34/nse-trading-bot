@@ -211,6 +211,204 @@ class Backtester:
         print("-" * 80)
         self._print_report()
 
+        # ── OPTIONS BACKTEST (NIFTY + BANKNIFTY) ───────────────────────
+        self._run_options_backtest(trading_days, nifty_5m, banknifty_5m, vix_daily)
+
+    def _run_options_backtest(self, trading_days, nifty_5m, banknifty_5m, vix_daily):
+        """Simulate NIFTY/BANKNIFTY ORB options trades."""
+        from strategies.options_strategy import NiftyOptionsStrategy
+
+        print(f"\n{'='*70}")
+        print(f"  F&O OPTIONS BACKTEST (NIFTY/BANKNIFTY ORB)")
+        print(f"{'='*70}\n")
+
+        opt_strategy = NiftyOptionsStrategy(self.trading_config)
+        option_trades = []
+        ATM_DELTA = 0.5
+        NIFTY_LOT = 25
+        BANKNIFTY_LOT = 15
+
+        # Simulate on both NIFTY and BANKNIFTY
+        for index_name, index_data, lot_size in [
+            ("NIFTY", nifty_5m, NIFTY_LOT),
+            ("BANKNIFTY", banknifty_5m, BANKNIFTY_LOT),
+        ]:
+            if index_data is None or len(index_data) == 0:
+                continue
+
+            for day in trading_days:
+                day_candles = index_data[index_data.index.date == day]
+                if len(day_candles) < 10:
+                    continue
+
+                vix = vix_daily.get(day, 15.0)
+                if vix > 25:
+                    continue  # DANGER — no options
+
+                # Reset strategy for new day
+                opt_strategy.reset_daily()
+
+                # ORB range from first 3 candles (9:15-9:30)
+                orb_candles = day_candles.iloc[:3]
+                orb_high = float(orb_candles["High"].max())
+                orb_low = float(orb_candles["Low"].min())
+                orb_range = orb_high - orb_low
+                opt_strategy.set_orb_range(orb_high, orb_low)
+
+                # Track option position
+                option_pos = None  # {type, entry_premium, sl, target, entry_idx}
+
+                for i in range(3, len(day_candles)):
+                    candle = day_candles.iloc[i]
+                    ist_time = (day_candles.index[i] + timedelta(hours=5, minutes=30)).time()
+                    ltp = float(candle["Close"])
+
+                    # Check for signal (only if no position yet)
+                    if option_pos is None:
+                        # Only during ORB window
+                        if ist_time > time(10, 15):
+                            continue
+
+                        signal = opt_strategy.check_signal(day_candles.iloc[:i+1], vix=vix)
+                        if signal:
+                            # Estimate premium: ATM option premium ≈ index_range × delta × 2
+                            # More volatile = higher premium
+                            est_premium = max(50, orb_range * ATM_DELTA * 1.5)
+                            option_pos = {
+                                "index": index_name,
+                                "type": signal.direction,  # CALL or PUT
+                                "entry_premium": est_premium,
+                                "entry_index": ltp,
+                                "sl_premium": est_premium * 0.7,  # 30% loss
+                                "target_premium": est_premium * 1.5,  # 50% gain
+                                "entry_idx": i,
+                                "lot_size": lot_size,
+                                "strike": signal.strike,
+                            }
+                    else:
+                        # Monitor option position
+                        index_move = ltp - option_pos["entry_index"]
+                        if option_pos["type"] == "PUT":
+                            index_move = -index_move  # PUT profits when index falls
+
+                        # Premium change ≈ index_move × delta
+                        premium_change = index_move * ATM_DELTA
+                        current_premium = option_pos["entry_premium"] + premium_change
+
+                        # SL hit (premium dropped 30%)
+                        if current_premium <= option_pos["sl_premium"]:
+                            gross = (option_pos["sl_premium"] - option_pos["entry_premium"]) * lot_size
+                            charges = lot_size * option_pos["entry_premium"] * 0.001  # ~0.1% for options
+                            option_trades.append({
+                                "date": day.strftime("%Y-%m-%d"),
+                                "index": index_name,
+                                "type": option_pos["type"],
+                                "strike": option_pos["strike"],
+                                "entry_prem": round(option_pos["entry_premium"], 1),
+                                "exit_prem": round(option_pos["sl_premium"], 1),
+                                "gross": round(gross, 2),
+                                "charges": round(charges, 2),
+                                "net": round(gross - charges, 2),
+                                "exit": "SL",
+                                "lot": lot_size,
+                            })
+                            option_pos = None
+                            continue
+
+                        # Target hit (premium gained 50%)
+                        if current_premium >= option_pos["target_premium"]:
+                            gross = (option_pos["target_premium"] - option_pos["entry_premium"]) * lot_size
+                            charges = lot_size * option_pos["entry_premium"] * 0.001
+                            option_trades.append({
+                                "date": day.strftime("%Y-%m-%d"),
+                                "index": index_name,
+                                "type": option_pos["type"],
+                                "strike": option_pos["strike"],
+                                "entry_prem": round(option_pos["entry_premium"], 1),
+                                "exit_prem": round(option_pos["target_premium"], 1),
+                                "gross": round(gross, 2),
+                                "charges": round(charges, 2),
+                                "net": round(gross - charges, 2),
+                                "exit": "TARGET",
+                                "lot": lot_size,
+                            })
+                            option_pos = None
+                            continue
+
+                        # Time exit at 2 PM
+                        if ist_time >= time(14, 0):
+                            gross = (current_premium - option_pos["entry_premium"]) * lot_size
+                            charges = lot_size * option_pos["entry_premium"] * 0.001
+                            option_trades.append({
+                                "date": day.strftime("%Y-%m-%d"),
+                                "index": index_name,
+                                "type": option_pos["type"],
+                                "strike": option_pos["strike"],
+                                "entry_prem": round(option_pos["entry_premium"], 1),
+                                "exit_prem": round(current_premium, 1),
+                                "gross": round(gross, 2),
+                                "charges": round(charges, 2),
+                                "net": round(gross - charges, 2),
+                                "exit": "TIME_EXIT",
+                                "lot": lot_size,
+                            })
+                            option_pos = None
+                            break
+
+                # Force close at end of day
+                if option_pos is not None:
+                    last_ltp = float(day_candles["Close"].iloc[-1])
+                    index_move = last_ltp - option_pos["entry_index"]
+                    if option_pos["type"] == "PUT":
+                        index_move = -index_move
+                    premium_change = index_move * ATM_DELTA
+                    current_premium = option_pos["entry_premium"] + premium_change
+                    gross = (current_premium - option_pos["entry_premium"]) * lot_size
+                    charges = lot_size * option_pos["entry_premium"] * 0.001
+                    option_trades.append({
+                        "date": day.strftime("%Y-%m-%d"),
+                        "index": index_name,
+                        "type": option_pos["type"],
+                        "strike": option_pos["strike"],
+                        "entry_prem": round(option_pos["entry_premium"], 1),
+                        "exit_prem": round(current_premium, 1),
+                        "gross": round(gross, 2),
+                        "charges": round(charges, 2),
+                        "net": round(gross - charges, 2),
+                        "exit": "FORCE_EXIT",
+                        "lot": lot_size,
+                    })
+
+        # Print F&O results
+        if not option_trades:
+            print("  No F&O trades generated in this period.\n")
+            return
+
+        total_gross = sum(t["gross"] for t in option_trades)
+        total_charges = sum(t["charges"] for t in option_trades)
+        total_net = sum(t["net"] for t in option_trades)
+        wins = sum(1 for t in option_trades if t["net"] > 0)
+        losses = len(option_trades) - wins
+
+        print(f"  {'#':<3} {'Date':<12} {'Index':<10} {'Type':<6} {'Strike':>8} {'Entry':>8} {'Exit':>8} {'Gross':>10} {'Net':>10} {'Exit':<10}")
+        print("  " + "-" * 95)
+        for i, t in enumerate(option_trades, 1):
+            print(f"  {i:<3} {t['date']:<12} {t['index']:<10} {t['type']:<6} {t['strike']:>8.0f} {t['entry_prem']:>8.1f} {t['exit_prem']:>8.1f} {t['gross']:>+10.2f} {t['net']:>+10.2f} {t['exit']:<10}")
+
+        print("  " + "-" * 95)
+        print(f"\n  F&O SUMMARY:")
+        print(f"  Total trades:  {len(option_trades)}")
+        print(f"  Wins:          {wins} ({wins*100//max(len(option_trades),1)}%)")
+        print(f"  Losses:        {losses}")
+        print(f"  Gross P&L:     Rs.{total_gross:+,.2f}")
+        print(f"  Charges:       Rs.{total_charges:,.2f}")
+        print(f"  Net P&L:       Rs.{total_net:+,.2f}")
+
+        avg_premium = sum(t["entry_prem"] for t in option_trades) / len(option_trades)
+        avg_lot = sum(t["lot"] for t in option_trades) / len(option_trades)
+        print(f"  Avg premium:   Rs.{avg_premium:.0f} × {avg_lot:.0f} lot = Rs.{avg_premium*avg_lot:,.0f} per trade")
+        print(f"  Capital used:  ~Rs.{avg_premium*avg_lot:,.0f} per trade (limited risk)\n")
+
     def _simulate_day(self, day, stock_data, nifty_5m, daily_data,
                       vix_daily, macro_data, sector_data, nifty_dma_by_day=None):
         """Simulate one full trading day."""
