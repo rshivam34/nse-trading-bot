@@ -220,6 +220,20 @@ class DataStream:
                 self._sws.on_error = self._on_error
                 self._sws.on_close = self._on_close
 
+                # Fix Angel One library bug: SmartWebSocketV2._on_close() doesn't
+                # accept the extra args that websocket-client passes (close_status, msg).
+                # Monkey-patch the library's internal handler to accept *args.
+                try:
+                    original_lib_close = self._sws._on_close
+                    def _patched_on_close(*args, **kwargs):
+                        try:
+                            original_lib_close(args[0] if args else None)
+                        except TypeError:
+                            pass  # Suppress if still fails
+                    self._sws._on_close = _patched_on_close
+                except AttributeError:
+                    pass  # Library version doesn't have _on_close
+
                 logger.info("Connecting to Angel One WebSocket...")
                 self._sws.connect()  # This blocks until connection closes
 
