@@ -886,7 +886,7 @@ class TradingBot:
                 if now < config.trading.orb_end:
                     # ORB period: track range for options
                     self.options_manager.update_orb_range(index_name, ltp, high, low)
-                elif now <= time(10, 15) and not config.trading.suggest_only:
+                elif now <= datetime.strptime("10:15", "%H:%M").time() and not config.trading.suggest_only:
                     # After ORB, check for option signals (10:15 cutoff)
                     vix = self.scanner.market_context.get("vix", 0)
                     signal = self.options_manager.check_for_signal(index_name, ltp, vix=vix)
