@@ -4,7 +4,40 @@
 
 ---
 
-## REWORK 2026-05-02 (F&O-ONLY MODE)
+## LAUNCH 2026-05-02 — Manual Live F&O Trading at Rs.30K
+
+User decided to launch live with manual control rather than auto-scheduling.
+
+**Final operational setup:**
+- **Capital: Rs.30,000** (starting smaller, may scale to Rs.50K-Rs.1L after live validation)
+- **Mode: F&O-only LIVE** (`PAPER_TRADING=False`, `equity_enabled=False`)
+- **Auto-scaling lots: enabled** — 25% of capital per position
+- **Scheduled task: REMOVED** (user prefers manual control)
+- **Desktop launcher: `C:\Users\rshiv\OneDrive\Desktop\NSE-Bot-Launch.bat`**
+- **First live trading day: Monday May 4, 2026** (when user double-clicks the launcher)
+
+**Important — IP whitelist gotcha:**
+Angel One whitelists by IP for ALL endpoints (auth, orders, market data, WebSocket).
+Current Primary IP: `49.32.238.63` (Jio mobile, dynamic — will change).
+When AG8004 errors appear in future logs, update Primary IP at https://smartapi.angelone.in/.
+For office/home dual-use, add Secondary Static IP.
+
+**12-month validated backtest results (Apr 2025 - Apr 2026 with real Angel One 5-min data):**
+
+| Capital | Trades | Win % | Net P&L | Return | PF |
+|---|---|---|---|---|---|
+| Rs.30K | 48 | 58% | +Rs.23,768* | ~+79% | 1.70 |
+| Rs.50K | 48 | 58% | +Rs.39,613 | +79.23% | 1.70 |
+| Rs.75K | 48 | 58% | +Rs.60,949 | +81.26% | 1.68 |
+| Rs.1L | 48 | 58% | +Rs.83,727 | +83.73% | 1.67 |
+
+*Rs.30K projection from Rs.50K data (60% scaled — 1-2 lots fewer per trade)
+
+**Mar/Apr 2026 (war/crisis): 0 F&O trades — VIX > 18 on 95% of days. Bot correctly stayed in cash.**
+
+Realistic real-world expectation (after slippage haircut): **+30-50% annualized** at Rs.30K.
+
+## Previous: REWORK 2026-05-02 (F&O-ONLY MODE)
 
 After backtesting both systems and the delivery bot at Rs.30K/Rs.50K/Rs.1L, decided to:
 1. **Disable equity scanner entirely** (`equity_enabled = False`)

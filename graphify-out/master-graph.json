@@ -14,7 +14,7 @@
       "contributor": null,
       "kind": "trading",
       "id": "p_nse_trading_bot",
-      "community": 1,
+      "community": 2,
       "norm_label": "nse-trading-bot (intraday)"
     },
     {
@@ -28,7 +28,7 @@
       "contributor": null,
       "kind": "trading",
       "id": "p_nse_delivery_bot",
-      "community": 2,
+      "community": 1,
       "norm_label": "nse-delivery-bot (swing)"
     },
     {
@@ -154,7 +154,7 @@
       "contributor": null,
       "kind": "external",
       "id": "ext_angel_one",
-      "community": 2,
+      "community": 1,
       "norm_label": "angel one (nse broker api)"
     },
     {
@@ -168,7 +168,7 @@
       "contributor": null,
       "kind": "external",
       "id": "ext_firebase",
-      "community": 1,
+      "community": 2,
       "norm_label": "firebase"
     },
     {

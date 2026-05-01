@@ -327,7 +327,7 @@ class TradingConfig:
     #   - Decision: disable equity entirely, allocate full capital to F&O
     # To re-enable equity: set equity_enabled = True
     equity_enabled: bool = False             # F&O-ONLY MODE — equity scanner disabled
-    options_capital_allocation: float = 50000.0  # Full Rs.50K to F&O (user moved from delivery to all-intraday)
+    options_capital_allocation: float = 30000.0  # Starting at Rs.30K initially (will scale up after live validation)
     equity_capital_allocation: float = 0.0       # Equity disabled
 
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────

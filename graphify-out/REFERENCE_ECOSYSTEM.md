@@ -1,4 +1,4 @@
-# Graph Report - .  (2026-05-01)
+# Graph Report - .  (2026-05-02)
 
 ## Corpus Check
 - 13 files · ~0 words
@@ -20,7 +20,7 @@
 
 ## Surprising Connections (you probably didn't know these)
 - `nse-trading-bot (intraday)` --uses_broker_api--> `Angel One (NSE broker API)`  [EXTRACTED]
-  nse-trading-bot/ → (external)  _Bridges community 1 → community 2_
+  nse-trading-bot/ → (external)  _Bridges community 2 → community 1_
 
 ## Communities
 
@@ -30,11 +30,11 @@ Nodes (1): Notion API
 
 ### Community 1 - "Cluster 1"
 Cohesion: 1.0
-Nodes (2): Firebase, nse-trading-bot (intraday)
+Nodes (2): Angel One (NSE broker API), nse-delivery-bot (swing)
 
 ### Community 2 - "Cluster 2"
 Cohesion: 1.0
-Nodes (2): Angel One (NSE broker API), nse-delivery-bot (swing)
+Nodes (2): Firebase, nse-trading-bot (intraday)
 
 ### Community 3 - "Cluster 3"
 Cohesion: 1.0
@@ -47,9 +47,9 @@ Nodes (1): voice-to-text (utility)
 ## Knowledge Gaps
 - **Thin community `Cluster 0`** (2 nodes): `Notion API`, `notion-mcp-server`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Cluster 1`** (2 nodes): `Firebase`, `nse-trading-bot (intraday)`
+- **Thin community `Cluster 1`** (2 nodes): `Angel One (NSE broker API)`, `nse-delivery-bot (swing)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Cluster 2`** (2 nodes): `Angel One (NSE broker API)`, `nse-delivery-bot (swing)`
+- **Thin community `Cluster 2`** (2 nodes): `Firebase`, `nse-trading-bot (intraday)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Cluster 3`** (1 nodes): `study-timer (Pomodoro / Flutter)`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
