@@ -64,7 +64,9 @@ class OptionsManager:
 
         # Daily counters
         self.trades_today = 0
-        self.max_options_per_day = 2  # Max 1 NIFTY + 1 BANKNIFTY
+        # REWORK 2026-05-01: Read max trades from config (was hardcoded 2)
+        # Allows up to 4 F&O trades/day in options-primary mode.
+        self.max_options_per_day = getattr(trading_config, "options_max_trades_per_day", 2)
 
     def update_orb_range(self, index: str, ltp: float, high: float, low: float):
         """Called during 9:15-9:30 to track index ORB range."""
@@ -247,14 +249,18 @@ class OptionsManager:
             logger.info(f"Option premium Rs.{premium:.2f} > max Rs.{max_premium:.2f}. Skipping.")
             return None
 
-        # Calculate quantity (how many lots we can afford)
-        capital_for_options = min(5000, self.config.initial_capital * 0.3)  # Max 30% of capital or Rs.5000
+        # REWORK 2026-05-01: Use options_capital_allocation from config (was min(5000, 30%))
+        # In options-primary mode, larger allocation (Rs.21K of Rs.30K) allows more lots.
+        capital_for_options = getattr(self.config, "options_capital_allocation", min(5000, self.config.initial_capital * 0.3))
         max_lots = int(capital_for_options / (premium * lot_size))
         if max_lots <= 0:
             logger.warning(f"Cannot afford even 1 lot of {symbol} at Rs.{premium:.2f}")
             return None
 
-        quantity = lot_size  # Start with 1 lot
+        # Use config-defined lots per trade (default 1)
+        lots = getattr(self.config, "options_lots_per_trade", 1)
+        lots = min(lots, max_lots)
+        quantity = lot_size * lots
 
         # Place order
         order_id = self.broker.place_option_order(

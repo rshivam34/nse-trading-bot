@@ -1,691 +1,558 @@
 # NSE Intraday Trading Bot — Project Context
 
+> Last updated: 2026-05-01 (rework session). This file is rewritten directly from the live code (`config.py`, `scanner.py`, `risk_manager.py`, `order_manager.py`, `options_manager.py`, all 4 active strategy files) to replace stale Sniper Mode V1/V2 sections that no longer matched the codebase.
+
+---
+
+## REWORK 2026-05-01 (most recent)
+
+Session goals: rework toward options-primary at Rs.30K capital, fix F&O execution bug, set up Windows Task Scheduler for daily auto-paper-trading.
+
+### What changed
+
+1. **Capital raised to Rs.30K** (`.env: INITIAL_CAPITAL=30000`)
+2. **Mode flipped to PAPER by default** (`.env: PAPER_TRADING=True`) — REAL orders disabled until you flip back
+3. **Options-primary capital split**: F&O Rs.21K (70%), Equity Rs.9K (30%)
+4. **Equity-disable toggle added**: `config.equity_enabled` — set False to run options-only
+5. **F&O daily limit raised**: 2 → 4 trades (was hardcoded in `options_manager.py`, now reads `config.options_max_trades_per_day`)
+6. **F&O premium cap raised**: Rs.500 → Rs.700 (BANKNIFTY needs higher)
+7. **CRITICAL F&O BUG FIXED**: `broker._lookup_option_token` was importing a non-existent function `get_instrument_master` from `utils.watchlist` — every options token lookup raised ImportError silently swallowed by try/except, so NO F&O trade ever placed an order despite `options_enabled=True`. Fixed to read instrument master JSON directly from `logs/scrip_master.json` cache (downloads if missing). User confirmed: F&O was never tested live, only via backtest, so this is a forward fix not a regression.
+8. **Windows Task Scheduler set up**: Daily 8:55 AM auto-launch in paper mode. Task name: `NSE-IntradayBot-Paper`. Uses `start_bot_paper.bat` wrapper.
+9. **GitHub backup**: `origin = git@github-studytimer:rshivam34/nse-trading-bot.git`. All rework commits pushed.
+
+### Why options-primary
+
+Empirical evidence:
+- 2-week relaxed-VIX backtest: equity -Rs.4 (2 trades), options +Rs.633 (1 trade)
+- 12 March 2026 live equity trades: ~-Rs.700 net (charges + losses)
+- F&O bug meant zero options trades fired live (hidden zero) — but backtest shows the strategy *would* work
+- At Rs.15K-30K capital, equity per-trade max gain (~Rs.225) is ~2× round-trip charges (Rs.30-50). F&O premium movement is asymmetric — same effort, much better R/R
+
+### Why VIX cutoff stays at 18
+
+User's deliberate choice. 6-month VIX history (Nov 2025 - Apr 2026):
+- Nov-Feb: VIX 9-15 → 80 of 80 days tradeable
+- Mar-Apr: VIX 17-28 (war/crisis) → 5 of 39 days tradeable
+- Total: 85 of 119 days (71%) at VIX < 18
+
+The Mar-Apr crisis is the OUTLIER, not the rule. Cutoff at 18 protects from crisis whipsaw (March's 12 live trades = -Rs.700 net) while not blocking normal markets. Historical March 2026 SHORTs at VIX 22-26 were unanimously losers; user is correct to stay out.
+
+### How to start trading
+
+**Paper mode (auto-runs daily at 8:55 AM via Task Scheduler):**
+```powershell
+# Already set up. Verify with:
+Get-ScheduledTask -TaskName "NSE-IntradayBot-Paper"
+```
+The bot self-skips weekends and NSE holidays. Logs go to `backend/logs/trading_bot_YYYY-MM-DD.log`.
+
+**Manual run:**
+```powershell
+cd C:\Users\rshiv\nse-trading-bot\backend
+python main.py --paper       # paper mode (default in .env)
+python main.py --live        # LIVE — REAL money
+```
+
+**Options-only mode:** edit `config.py` line ~325 → `equity_enabled: bool = False`
+
+**Disable Task Scheduler auto-run:**
+```powershell
+Unregister-ScheduledTask -TaskName "NSE-IntradayBot-Paper" -Confirm:$false
+```
+
+---
+
+---
+
 ## What This Project Is
 
-An automated intraday trading system for the Indian stock market (NSE).
-It has two parts:
+An automated intraday trading system for the Indian stock market (NSE). It actually contains **TWO independent trading systems running inside one bot process**:
 
-1. **Python Backend** (`/backend`) — Runs on the user's laptop during market hours (9:15 AM – 3:30 PM IST). Connects to Angel One SmartAPI, streams real-time price data, detects technical patterns, manages risk, and places/exits trades automatically.
+| System | What it trades | Manager class |
+|---|---|---|
+| **A. Equity Intraday** | NIFTY 200 stocks, MIS leveraged | `core/order_manager.py` |
+| **B. Index Options (F&O)** | NIFTY + BANKNIFTY weekly ATM options | `core/options_manager.py` |
 
-2. **React Dashboard** (`/dashboard`) — Hosted on GitHub Pages. The user's control panel — shows live signals, open positions, P&L, and trade history. Reads real-time data from Firebase (the backend pushes updates there).
+Both share the same Angel One auth, kill switch, force-exit timer (3:15 PM), and VIX gate — but their entry pipelines, position sizing, exits, and trade-count limits are completely separate.
 
-## Architecture Overview
+**Two parts:**
+1. **Python Backend** (`/backend`) — Runs on user's laptop during market hours. Angel One SmartAPI for orders, WebSocket for live ticks, REST polling for VIX (Yahoo Finance fallback).
+2. **React Dashboard** (`/dashboard`) — GitHub Pages, reads real-time data from Firebase. Shows signals, positions, P&L, trade history. Has kill switch + trading enable/disable toggle.
+
+## Architecture
 
 ```
-Angel One SmartAPI (broker)
-        │
-        ▼
-┌──────────────────────┐
-│   Python Backend     │  ← Runs on user's laptop
-│   (pattern engine,   │
-│    risk manager,     │
-│    order executor)   │
-└──────┬───────────────┘
-       │ pushes updates
-       ▼
-┌──────────────────────┐
-│   Firebase Realtime  │  ← Free tier, acts as data bridge
-│   Database           │
-└──────┬───────────────┘
-       │ reads in real-time
-       ▼
-┌──────────────────────┐
-│   React Dashboard    │  ← GitHub Pages (static site)
-│   (user interface)   │
-└──────────────────────┘
+Angel One SmartAPI ──► Python Backend ──► Firebase Realtime DB ──► React Dashboard
+  (broker)              (this bot)         (data bridge)            (GitHub Pages)
 ```
 
-## Current Phase
+---
 
-All three phases are implemented and running live:
+## Capital & Mode
 
-**Phase 1 — Foundation** (DONE)
-- [x] Dashboard UI (React, GitHub Pages)
-- [x] Pattern engine with 4 strategies
-- [x] Firebase integration (all paths wired)
+- **Initial capital:** Rs.15,000 (set in `.env: INITIAL_CAPITAL`, default 15000)
+- **Effective buying power:** ~Rs.60,000 (cash × 4× MIS leverage estimate)
+- **Mode toggles** (in `.env`):
+  - `PAPER_TRADING=True/False` — paper vs live
+  - `SUGGEST_ONLY=True/False` — log signals without executing
+- **CLI overrides:** `python main.py --live` or `--paper`
 
-**Phase 2 — Live Data** (DONE)
-- [x] Angel One SmartAPI connection with TOTP auth
-- [x] Real-time WebSocket streaming (NIFTY + BANKNIFTY + VIX + 200 stocks)
-- [x] Live pattern detection with signal scoring (0-100)
+---
 
-**Phase 3 — Auto-Execution** (DONE)
-- [x] Order placement via API (with margin check, partial fill detection)
-- [x] Broker-side SL orders (STOPLOSS-LIMIT on exchange — survives bot crash)
-- [x] Stop-loss and target monitoring (breakeven → trailing → win zone → time exits)
-- [x] Kill switch and safety limits (dashboard red button, daily loss limit, cooldowns)
-- [x] Position adoption on startup (crash recovery via getPosition API)
+## SYSTEM A: Equity Intraday (4 active strategies)
 
-## Sniper Mode V2 (Active)
+### Active strategies (loaded in `scanner.py:71-76`)
+1. **ORB** (`orb_strategy.py`) — Opening Range Breakout with retest confirmation
+2. **VWAP_BOUNCE** (`vwap_strategy.py`) — VWAP support/resistance bounce
+3. **EMA_CROSS** (`ema_strategy.py`) — 9/21 EMA crossover on completed candles
+4. **SR_BREAKOUT** (`sr_breakout_strategy.py`) — Prev day H/L/C + 5-day swing breakouts
 
-Philosophy: "Fewer, higher-quality trades." Instead of taking every decent signal, the bot now applies 10+ independent filters before executing. Max 3 trades/day, each with strong multi-strategy confluence.
+> The folder also contains `vwap_reversion_strategy.py` and `options_strategy.py` — these are **NOT loaded by the live scanner**. The first is used only by the backtest; the second is referenced by `options_manager.py` indirectly (the options manager reimplements its own ORB-retest state machine for live trading).
 
-### Filter Layers (signal must pass ALL):
-1. **Score >= 80** (was 85, originally 70) — ~8/11 scoring factors must confirm
-2. **2+ strategy confluence OR score >= 90** — at least 2 of 4 strategies agree, OR single strategy with EXCEPTIONAL score
-3. **Volume >= 3× average** — hard gate, reject below
-4. **Choppiness Index < 61.8** — both stock AND NIFTY must not be choppy
-5. **15-min trend aligned** — 9/21 EMA on 15-min must match signal direction
-6. **Candle close confirmation** — breakout strategies require completed candle above/below level
-7. **ATR expansion** — -10 score penalty if ATR is compressing (breakout strategies)
-8. **VIX < 20** — no new trades in DANGER zone (VIX > 20)
-9. **Not in lunch block** — 11:30-13:00 fully blocked
-10. **17-point pre-flight checklist** — all safety/risk checks in one place
+### Each strategy's exact entry rules
 
-### Sniper Mode Config Summary:
-| Setting | Value |
-|---------|-------|
-| min_signal_score | 80 (was 85) |
-| max_trades_per_day | 3 (hard cap) |
-| max_losing_trades | 2 |
-| Risk per trade | 1.5% of capital |
-| Stop-loss | 1.5× ATR (floor 0.5%, ceiling 3%) |
-| Target | 2.5R from entry |
-| Trailing SL | 1× ATR from peak (activates at 1.5R) |
-| Volume minimum | 3× average (hard gate) |
-| VIX NORMAL | < 18 (full size, 1.5× ATR) |
-| VIX CAUTION | 18-20 (50% size, 2× ATR) |
-| VIX DANGER | > 20 (no new trades) |
-| Lunch block | 11:30-13:00 (was 11:00-13:30) |
-| Single-strategy exception | Score ≥ 90 bypasses confluence |
-| Choppiness gate | > 61.8 = reject |
-| Capital | ₹15,000 |
+| Strategy | Trigger | SL | Target | Time window |
+|---|---|---|---|---|
+| **ORB** | 9:15-9:30 range size 0.5%-2% → previous **completed candle close** past range + 0.15% buffer (state: BREAKOUT) → price pulls back within 0.2% of broken edge (state: RETESTING) → next completed candle closes back past edge as green/red with ≥1.5× volume | Opposite ORB edge | 1.5× range width | **9:30 – 10:15 only** |
+| **VWAP_BOUNCE** | Stock above (or below) VWAP for ≥6 completed candles → 2-candle bounce: prev candle touched within 0.3% of VWAP and closed across as green/red, current candle confirms same direction → volume ≥ 1.5× avg → RSI not >75 (LONG) / <25 (SHORT) → sector not LAGGING/WEAKENING | 0.4% beyond VWAP | max(swing high/low, 1.5R) | **9:30 – 11:30 only** |
+| **EMA_CROSS** | EMA9 crosses EMA21 on completed candles (not ticks) → separation ≥ 0.15% (filters noise) → volume ≥ 20-candle avg → RSI 30-70 → price on correct side of VWAP | Recent 10-candle low/high × 0.998 (LONG) / 1.002 (SHORT) | 1.5R | No cutoff |
+| **SR_BREAKOUT** | Price > 0.1% past prev day H/L/C or 5-day swing → volume ≥ 2.0× last completed candle vs 20-candle avg → NIFTY direction not opposite → on correct side of VWAP | 1% inside broken level | next key level OR 1.5R, whichever further | No cutoff (only 1× per stock per level per day) |
 
-## User Profile
+All four require: NIFTY direction not opposite, gap < 1.5%, no signal yet on this stock today.
 
-- **Experience**: Beginner in both Python and trading
-- **Capital**: ₹15,000 (with ~5× intraday margin = ₹75,000 buying power)
-- **Broker**: Angel One (SmartAPI — free API access)
-- **Hosting**: Laptop for backend, GitHub Pages for dashboard
-- **Goal**: Learn algorithmic trading with real but minimal risk
-- **Trading philosophy**: Sniper mode — fewer, higher-quality trades. Wait for confluence, take only the best 2-3 setups per day, protect capital above all else.
+### The full equity scan pipeline (`scanner.py:scan` line 317)
 
-## Tech Stack
+For every stock tick after 9:30 AM:
 
-### Backend (`/backend`)
-- Python 3.10+
-- `smartapi-python` — Angel One broker API
-- `websocket-client` — real-time price streaming
-- `pandas`, `numpy` — data manipulation
-- `pandas-ta` — technical indicators (EMA, RSI, VWAP, etc.)
-- `firebase-admin` — push data to Firebase
-- `python-dotenv` — environment variable management
-- `pyotp` — TOTP generation for Angel One auth
+```
+1. Skip if already signaled this stock today
+2. Skip if news flagged stock (skip_today)
+3. Skip if earnings this week
+4. Build 5-min candles from ticks (OHLCV)
+5. Build context (VWAP, RSI, EMA9/21, RVOL, ADV, gap%)
+6. Run ALL 4 strategies → collect raw signals
+7. Pick highest-confidence signal (NO confluence requirement — Option C)
+8. Compute ATR(14), Choppiness, 15m trend
 
-### Dashboard (`/dashboard`)
-- React 18 (Vite build)
-- Firebase Realtime Database SDK
-- Tailwind CSS for styling
-- Recharts for charts
-- Hosted on GitHub Pages via `gh-pages` package
+   FILTER CHAIN — any failure = REJECT:
+9.  VIX > 18 .................. SKIPPED-VIX-GATE
+10. Stock Choppiness > 70 ...... SKIPPED-CHOPPY
+11. NIFTY Choppiness > 70 ...... SKIPPED-CHOPPY
+12. 15-min trend opposite ...... DISABLED in config (trend_15m_enabled=False)
+13. Breakout candle didn't close
+    past level (ORB/SR only) ... SKIPPED-NO-CANDLE-CLOSE
 
-### Data Bridge
-- Firebase Realtime Database (free Spark plan)
-- Backend WRITES → Firebase ← Dashboard READS
+14. Score the signal (signal_scorer.py — 14 factors, see below)
 
-## Key Design Decisions
+    SCORE MODIFIERS:
+15. ATR compressing? → -10 OR HARD REJECT for ORB/SR_BREAKOUT
+16. RVOL <1×: -10  |  1-2×: -5  |  ≥3×: +5
+17. VWAP_BOUNCE at VIX > 18: -15 (rarely fires — VIX>18 already blocks)
+18. After 12:00, NIFTY exhausted (40%+ giveback): -15
+19. After 14:00: -5
 
-1. **Rule-based strategies, NOT machine learning.** Strategies are explicit if/else logic based on proven technical patterns. No training data needed. ML is overkill for this stage and more likely to lose money.
+20. Score < 80? → SKIPPED-LOW-SCORE
+21. Recalculate SL/target using ATR (overrides what strategy set)
+22. Mark signal QUALIFIED → main.py executes pipeline
+```
 
-2. **Broker-side SL orders for crash safety.** After every entry, a STOPLOSS-LIMIT order is placed on the exchange via Angel One. If the bot crashes, the exchange still has the SL. When trailing, the SL order is modified. Before manual exits, the SL order is cancelled to prevent double-exit.
+### Risk manager gate (`risk_manager.py:can_trade` line 201)
 
-3. **Risk management is non-negotiable.** Every trade MUST have a stop-loss. Max 1.5% capital risk per trade. Daily loss limit of 3%. Capital deployment limit of 80% of margin. Max 2 losing trades per day. 30-min re-entry cooldown per stock. ATR-based dynamic SL (1.5× ATR, bounded 0.5%-3%).
+After scanner returns a qualified signal, this runs before the order is placed:
 
-4. **Commissions matter.** The bot factors in full NSE charges (brokerage + STT + exchange + GST + SEBI + stamp duty). Skips trades where expected net profit doesn't justify the round-trip cost.
+```
+Rule 1:  trades_today < min(5, stance_max_trades)            # HARD daily cap
+Rule 2:  losses_today < 3                                     # max losses today
+Rule 3:  daily_pnl > -3% of starting capital                  # daily loss limit
+Rule 4:  current time <= 13:00                                # no_new_trades_after
+Rule 5:  in trading window (9:30-13:00)
+Rule 6:  not in 15-min consecutive-loss cooldown (after 2 in a row)
+Rule 6b: ≥10 min since last entry (entry spacing — prevents correlated bets)
+Rule 7:  not already in position on this stock
+Rule 7b: not in 15-min re-entry cooldown for this stock
+Rule 8:  signal has stop-loss
+Rule 9:  signal RR ≥ 1.0
+Rule 10: position size > 0 after VIX/stance/regime scaling
+Rule 11: capital deployed < 80% of broker margin
+Rule 12: expected net profit > Rs.15 (or Rs.8/Rs.12 if capital < Rs.5K/2K)
+```
 
-5. **Market context awareness.** Never go long when NIFTY is falling hard. Never go short when NIFTY is rallying. Market regime detection at 10:30 AM adjusts position sizing and score thresholds.
+### Pre-flight checklist (`order_manager.py:pre_flight_check` line 426)
 
-6. **Crash recovery via position adoption.** On every startup, the bot calls getPosition() to find orphaned positions, adopts them with SL/target, and places broker-side SL orders. No position is ever left unmonitored.
+After risk manager passes, this 17-point check runs:
 
-7. **Sniper mode over quantity.** The bot intentionally rejects most signals. A signal must pass 10+ independent filters (confluence, choppiness, VIX, volume, trend alignment, ATR expansion, candle confirmation, pre-flight checklist) before executing. Missing a good trade is acceptable; taking a bad trade is not. The goal is 2-3 high-conviction trades per day, not 10 mediocre ones.
+| # | Check | Source |
+|---|---|---|
+| 1 | Score ≥ 80 | config.min_score_to_trade |
+| 2 | Scanner pipeline passed (informational) | always pass — confluence removed |
+| 3 | RVOL informational | always pass — score modifier handles it |
+| 4 | VIX ≤ 18 | re-check at order time |
+| 5 | Lunch flag (informational) | always pass |
+| 6 | trades_today < 5 | risk manager |
+| 7 | losses_today < 3 | risk manager |
+| 8 | Stock CHOP ≤ 70 | scanner-set on signal |
+| 9 | NIFTY CHOP ≤ 70 | scanner market context |
+| 10 | 15m trend aligned | DISABLED (trend_15m_enabled=False) |
+| 11 | Candle close confirmed | pre-verified in scanner |
+| 12 | SL distance 1.0%-1.5% | ATR floor/ceiling |
+| 13 | Risk within limits | always pass |
+| 14 | Capital deployed < 80% | risk manager |
+| 15 | Not in re-entry cooldown | risk manager |
+| 16 | Time 9:30-13:00 | window check |
+| 17 | Estimated net profit > Rs.15 | brokerage calculator |
 
-## Coding Conventions
+### Scoring breakdown (`signal_scorer.py`)
 
-- **Python**: Use type hints everywhere. Dataclasses for data structures. Logging (not print) for all output. Config via `.env` file and `config.py`.
-- **React**: Functional components with hooks. Tailwind for styling. No localStorage (not supported in artifacts). Keep components small and focused.
-- **Error handling**: Every API call wrapped in try/except. Every WebSocket message validated. Graceful degradation — if Firebase is down, bot still trades; if broker API hiccups, bot retries 3x then skips. If broker SL order fails, fall back to software-only SL.
-- **Security**: API keys NEVER in code. Always in `.env` (gitignored). Firebase security rules restrict write access.
-- **Angel One specifics**: Trading symbols need `-EQ` suffix (e.g., `RELIANCE-EQ`). WebSocket prices are in paise (divide by 100). Instrument token cache must refresh daily.
+A signal must score **≥80/100** to execute. 14 factors:
 
-## File Structure
+| Factor | Max | Trigger |
+|---|---|---|
+| ORB strategy | +15 | strategy_name == "ORB" |
+| VWAP aligned | +15 | LONG above VWAP / SHORT below |
+| Volume spike | +20 (≥5×) or +10 (≥2×) | RVOL |
+| RSI 30-70 | +10 | not extreme |
+| NIFTY aligned | +15 (or +8 if NEUTRAL) | direction matches |
+| EMA aligned | +10 | EMA9 vs EMA21 matches direction |
+| vs prev close | +5 | LONG above / SHORT below |
+| News sentiment | +10 (or +4 if neutral) | matches direction |
+| Away from prev levels | +5 | not within 0.3% of prev H/L/C |
+| Time bonus | +5 | 9:30-11:30 or 13:00-14:30 |
+| Low VIX | +5 (or +3 if no data) | VIX < 15 |
+| **Macro aligned** | +10 / -10 | NIFTY 50/200 DMA trend matches |
+| **Sector aligned** | +5 / -5 | LEADING/IMPROVING vs LAGGING/WEAKENING |
+| **Fundamental** | -10 + ±5 | red flag (ROE<10%, D/E>2, EPS<0) + PE vs sector |
+
+Total capped at 100. Score 80+ = "EXCELLENT", 90+ = "EXCEPTIONAL".
+
+### Execution flow (`order_manager.py:execute` line 591)
+
+1. Margin check — reduce qty if needed
+2. Place LIMIT order (3 retries, 2s/4s backoff)
+3. Poll fill status (3 checks, 1s apart)
+4. If filled: place broker-side STOPLOSS-LIMIT order (exchange-level safety net)
+5. If unfilled after 3s: leaves order pending → `_check_pending_timeouts` either adopts late fill or cancels at 30s
+
+### Position monitoring (`order_manager.py:monitor_positions` line 755)
+
+Runs every second in trading loop. Priority order:
+
+1. Effective SL hit → exit
+2. Trailing SL hit → exit
+3. After 15:00, position in profit → exit (TIME_PROFIT_EXIT)
+4. Partial exit at 1.0R → sell 50%, move SL to breakeven, activate trailing
+5. Full target hit (1.5R) → exit
+6. Profit management: at +0.5% → SL to breakeven; at +1.5R → activate trailing at 1.5× ATR from peak
+7. After 13:00, tighten SL to 1× ATR from current price
+
+---
+
+## SYSTEM B: Index Options (F&O)
+
+Lives in `core/options_manager.py`. Trigger pipe is in `main.py:_on_price_update` lines 880-902 (only fires for NIFTY/BANKNIFTY ticks, not stocks, not VIX).
+
+```
+9:15-9:30: track ORB high/low for NIFTY index AND BANKNIFTY (independent state machines)
+9:30-10:15: every NIFTY/BANKNIFTY tick →
+   ├─ already 2 trades today (1 NIFTY + 1 BANKNIFTY max)? → skip
+   ├─ VIX > 18? → skip
+   ├─ ORB range too tight (<0.2%) or too wide (>1.5% NIFTY / >3.0% BANK)? → skip
+   │
+   ├─ State machine on the index itself:
+   │    NONE → BREAKOUT (LTP past ORB ± 0.1%)
+   │         → RETESTING (LTP back to range edge)
+   │         → CONFIRM (next candle bounces away)
+   │         → fire signal
+   │
+   ├─ Build option symbol: NIFTY27MAR2625500CE (next Thursday weekly expiry)
+   ├─ Look up token from instrument master
+   ├─ Get current premium via LTP API
+   ├─ Skip if premium > Rs.500 (config.options_max_premium)
+   ├─ Place LIMIT BUY for 1 lot (NIFTY=25, BANKNIFTY=15)
+   │
+   └─ SL = entry × 0.7 (30% loss), Target = entry × 1.5 (50% gain)
+
+monitoring (every second):
+   ├─ premium hit SL → market SELL
+   ├─ premium hit target → market SELL
+   └─ time ≥ 14:00 → SELL (theta decay protection)
+```
+
+### Differences from equity
+
+| | Equity | Options |
+|---|---|---|
+| Watchlist | NIFTY 200 | NIFTY + BANKNIFTY only |
+| Strategies | 4 (ORB, VWAP, EMA, SR) | 1 (ORB retest on index) |
+| Direction | LONG/SHORT | CE (CALL) / PE (PUT) |
+| Stop-loss | ATR-based, 1.0%-1.5% bound | 30% premium loss |
+| Target | 1.5R | 50% premium gain |
+| Force exit | 3:15 PM | 2:00 PM (theta) |
+| Max trades/day | 5 | 2 (1 NIFTY + 1 BANK) |
+| Capital cap per trade | Full ₹15K (with leverage) | min(Rs.5000, 30% of capital) = Rs.4500 |
+| Signal entry window | 9:30-13:00 | 9:30-10:15 only |
+| Filters | 10+ sniper filters, score ≥ 80 | VIX gate + range size only |
+| Pre-flight checks | 17 | None |
+| Risk manager gate | Yes | No (uses own counter) |
+| Score required | 80 | N/A |
+
+### How to run only one of the two systems
+
+**Run only equity (disable F&O):** Edit `config.py` line 324:
+```python
+options_enabled: bool = False   # was: True
+```
+Effect: `main.py:131` sets `self.options_manager = None`. All options checks become no-ops.
+
+**Run only options (disable equity):** Easiest — set `min_score_to_trade = 200` in `config.py` line 78. Scanner still runs but no signal can score 200, so all rejected at score gate. Options run untouched.
+
+---
+
+## Active Configuration (matches code at 2026-05-01)
+
+| Setting | Value | Notes |
+|---|---|---|
+| `initial_capital` | Rs.15,000 | from .env |
+| `max_risk_per_trade_pct` | 1.5% | Rs.225 max risk per trade |
+| `max_trades_per_day` | 5 (HARD ceiling, stance can lower) |  |
+| `max_losses_per_day` | 3 |  |
+| `daily_loss_limit_pct` | 3.0% | Rs.450 max loss/day |
+| `max_capital_deployed_pct` | 80% | of broker margin |
+| `risk_reward_ratio` | 1.5R | (was 2.5R, lowered — 2.5R rarely hit) |
+| `min_score_to_trade` | 80 | (was 70 then 85) |
+| `min_confluence_count` | 1 | confluence requirement REMOVED (Option C) |
+| `vix_normal_threshold` | 18.0 | VIX < 18 = NORMAL, full size |
+| `vix_caution_threshold` | 18.0 | **VIX ≥ 18 = NO TRADES, period** |
+| `chop_threshold` | 70.0 | (was 61.8 — too strict for 5-min) |
+| `chop_period` | 14 |  |
+| `trend_15m_enabled` | False | tick-level data not reliable for 15m |
+| `atr_sl_multiplier_normal` | 1.5 | × ATR |
+| `atr_sl_floor_pct` | 1.0% | SL never tighter than 1% |
+| `atr_sl_ceiling_pct` | 1.5% | SL never wider than 1.5% (very tight!) |
+| `partial_exit_enabled` | True |  |
+| `partial_exit_rr` | 1.0 | sell 50% at 1.0R |
+| `final_exit_rr` | 1.5 | exit rest at 1.5R |
+| `breakeven_profit_pct` | 0.5% | move SL to breakeven |
+| `trailing_activation_r` | 1.5 | start trailing at 1.5R |
+| `trailing_sl_atr_multiplier` | 1.5 | trail at 1.5× ATR from peak |
+| `lunch_block_start/end` | 11:30/13:00 | **flag only — NOT a hard block** |
+| `no_new_trades_after` | 13:00 | hard cutoff for new entries |
+| `force_exit_time` | 15:15 |  |
+| `profit_exit_time` | 15:00 | exit any in-profit position |
+| `min_entry_spacing_minutes` | 10 | between any two entries |
+| `reentry_cooldown_minutes` | 15 | per stock after exit |
+| `consecutive_loss_limit` | 2 | trigger 15-min cooldown |
+| `consecutive_loss_cooldown_minutes` | 15 |  |
+| `intraday_leverage_multiplier` | 4.0 | conservative MIS estimate |
+| `min_expected_net_profit` | Rs.15 |  |
+| `min_adv_shares` | 500,000 | 5 lakh 20-day avg daily volume |
+| `min_candle_traded_value` | Rs.5,00,000 | (informational) |
+| `options_enabled` | True |  |
+| `options_sl_pct` | 30% | premium loss exit |
+| `options_target_pct` | 50% | premium gain exit |
+| `options_exit_time` | 14:00 |  |
+| `options_max_premium` | Rs.500 | per lot |
+| `nifty_lot_size` | 25 |  |
+| `banknifty_lot_size` | 15 |  |
+
+### Market stance (from macro analysis)
+
+Set on startup based on NIFTY 50/200 DMA + VIX:
+
+| Stance | Conditions | Max trades | Size % |
+|---|---|---|---|
+| AGGRESSIVE | VIX < 18 + above both DMAs | 5 | 100% |
+| MODERATE | VIX < 18 + above 200 DMA only | 3 | 100% |
+| DEFENSIVE | VIX 18-25 OR below 200 DMA | 2 | 50% |
+| CASH | VIX ≥ 18 | 0 | 0% |
+
+`max_trades_per_day` is dynamically set to `min(config.max_trades_per_day, stance_max_trades)`.
+
+---
+
+## Trading Day Schedule
+
+```
+09:00  Bot starts → auth → getRMS → adopt positions → load watchlist
+09:00-09:15  Pre-market: holiday/margin/news/macro/sector/fundamental analysis,
+             prev-day OHLC fetch, intraday candle pre-seed
+09:15  Market opens → WebSocket streaming begins
+09:15-09:30  ORB observation period (track high/low for stocks + indices)
+09:30  ACTIVE TRADING starts. Scanner runs on every tick.
+09:30-10:15  ORB strategy time-window AND options ORB-retest active
+09:30-11:30  VWAP_BOUNCE strategy time-window
+10:30  Market regime locked in (TRENDING / VOLATILE / RANGE_BOUND / GAP_DAY)
+       → adjusts size_multiplier and SL_multiplier in risk manager
+12:00  Momentum exhaustion check activates (NIFTY giveback penalty)
+13:00  no_new_trades_after — risk manager rejects all new entries
+14:00  Late-afternoon score penalty (-5)
+14:00  Options time exit
+14:30  (window 2 end — but no new trades anyway)
+15:00  profit_exit_time — any open position in profit gets force-closed
+15:15  force_exit_time — ALL positions force-closed regardless of P&L
+15:30  Market closes. Daily report → Firebase. Volume profiles saved.
+```
+
+---
+
+## Architecture Components
+
+### Backend file structure (real, as of 2026-05-01)
 
 ```
 nse-trading-bot/
-│
-├── CLAUDE.md                    ← YOU ARE HERE (project context)
-├── README.md                    ← Setup instructions for the user
-├── .gitignore                   ← Ignores .env, __pycache__, node_modules
-│
+├── CLAUDE.md                    ← this file
+├── README.md
 ├── backend/
-│   ├── main.py                  ← Entry point — startup sequence, trading loop
-│   ├── config.py                ← All configuration (reads from .env)
-│   ├── .env.example             ← Template for API keys
-│   │
+│   ├── main.py                  ← TradingBot orchestrator (1547 lines)
+│   ├── config.py                ← all settings (370 lines)
+│   ├── backtest.py              ← yfinance-based backtester (uses ORB + VWAP_REVERSION)
+│   ├── backtest_all_months.py
 │   ├── core/
-│   │   ├── __init__.py
-│   │   ├── broker.py            ← Angel One SmartAPI (auth, orders, SL orders, positions, LTP)
-│   │   ├── data_stream.py       ← WebSocket real-time data handler
-│   │   ├── scanner.py           ← Scans watchlist, detects patterns across 4 strategies
-│   │   ├── signal_scorer.py     ← 0-100 signal scoring (11 factors)
-│   │   ├── risk_manager.py      ← Position sizing, capital limits, re-entry cooldown
-│   │   ├── order_manager.py     ← Places/monitors orders, broker SL, position adoption
-│   │   └── portfolio.py         ← Tracks capital, gross/net P&L, per-strategy stats
-│   │
+│   │   ├── broker.py            ← Angel One SmartAPI wrapper
+│   │   ├── data_stream.py       ← WebSocket handler with reconnect
+│   │   ├── scanner.py           ← Pattern scanner + filter pipeline (1226 lines)
+│   │   ├── signal_scorer.py     ← 0-100 scoring (14 factors)
+│   │   ├── risk_manager.py      ← All gates (542 lines)
+│   │   ├── order_manager.py     ← Place/monitor/exit + adoption (1408 lines)
+│   │   ├── options_manager.py   ← F&O system (415 lines)
+│   │   └── portfolio.py         ← P&L tracking
 │   ├── strategies/
-│   │   ├── __init__.py
-│   │   ├── base_strategy.py     ← Abstract base class + Signal dataclass
-│   │   ├── orb_strategy.py      ← Opening Range Breakout (7 confirmations)
-│   │   ├── vwap_strategy.py     ← VWAP Bounce (60+ ticks, green candle)
-│   │   ├── ema_strategy.py      ← EMA Crossover (0.05% separation, volume)
-│   │   └── sr_breakout_strategy.py ← S/R Breakout (prev day levels, 3x volume)
-│   │
+│   │   ├── base_strategy.py     ← Signal dataclass + BaseStrategy
+│   │   ├── orb_strategy.py      ← ACTIVE
+│   │   ├── vwap_strategy.py     ← ACTIVE (VWAPBounceStrategy)
+│   │   ├── ema_strategy.py      ← ACTIVE
+│   │   ├── sr_breakout_strategy.py ← ACTIVE
+│   │   ├── vwap_reversion_strategy.py ← INACTIVE in live, used by backtest only
+│   │   └── options_strategy.py  ← INACTIVE in live (options_manager.py reimplements)
 │   ├── utils/
-│   │   ├── __init__.py
-│   │   ├── firebase_sync.py     ← Push updates to Firebase (all paths)
-│   │   ├── watchlist.py         ← 200 stocks, dynamic token lookup
-│   │   ├── indicators.py        ← Technical indicator calculations
-│   │   ├── logger.py            ← Logging configuration
-│   │   ├── brokerage.py         ← Full NSE charge calculator
-│   │   ├── news_sentiment.py    ← Marketaux API news sentiment
-│   │   ├── market_regime.py     ← TRENDING/RANGE_BOUND/VOLATILE/GAP_DAY
-│   │   ├── trade_analytics.py   ← CSV logging + strategy breakdown
-│   │   ├── rate_limiter.py      ← Token bucket rate limiter
-│   │   ├── ohlc_cache.py        ← Date-stamped local OHLC cache
-│   │   └── capital_filter.py    ← LTP-based pre-filter by capital
-│   │
-│   └── requirements.txt         ← Python dependencies
-│
-├── dashboard/
-│   ├── package.json
-│   ├── vite.config.js
-│   ├── index.html
-│   ├── tailwind.config.js
-│   │
-│   └── src/
-│       ├── App.jsx              ← Main app with routing, 5 session windows
-│       ├── main.jsx             ← Entry point
-│       ├── firebase.js          ← Firebase config
-│       │
-│       ├── components/
-│       │   ├── CapitalInput.jsx     ← Enter starting capital
-│       │   ├── LiveSignals.jsx      ← Current signals with score badges
-│       │   ├── OpenPositions.jsx    ← Active trades with trailing SL, hold time
-│       │   ├── TradeHistory.jsx     ← Past trades with net P&L and score
-│       │   ├── PerformanceCard.jsx  ← Gross P&L / Charges / Net P&L
-│       │   ├── MarketContext.jsx    ← NIFTY direction + regime + VIX bar
-│       │   ├── StrategyBreakdown.jsx← Per-strategy win/loss from analytics
-│       │   ├── NewsAlert.jsx        ← Global risk day + stock sentiment
-│       │   └── KillSwitch.jsx       ← Emergency stop button
-│       │
-│       ├── hooks/
-│       │   ├── useFirebase.js       ← Real-time Firebase listener
-│       │   └── useTradeData.js      ← Trade data state management
-│       │
-│       └── utils/
-│           ├── calculations.js      ← P&L, position size helpers
-│           └── formatters.js        ← Currency, time formatting
-│
-└── logs/
-    ├── trades.csv               ← Persistent trade log (all-time)
-    ├── ohlc_cache.json          ← Cached OHLC data (date-stamped)
-    └── trading_bot.log          ← Runtime log file
+│   │   ├── indicators.py        ← ATR, Choppiness, EMA, RSI helpers
+│   │   ├── volume_profile.py    ← TOD averages + ADV cache
+│   │   ├── market_regime.py     ← TRENDING/VOLATILE/RANGE_BOUND/GAP_DAY
+│   │   ├── macro_analysis.py    ← NIFTY 50/200 DMA + stance
+│   │   ├── sector_analysis.py   ← 9 sector indices, RS scoring
+│   │   ├── fundamental_filter.py ← yfinance + screener.in
+│   │   ├── news_sentiment.py    ← Marketaux API
+│   │   ├── firebase_sync.py     ← all Firebase writes/reads
+│   │   ├── watchlist.py         ← 200-stock dynamic loader
+│   │   ├── brokerage.py         ← NSE charge calculator
+│   │   ├── trade_analytics.py   ← CSV trade log
+│   │   ├── rate_limiter.py      ← Token bucket
+│   │   ├── ohlc_cache.py        ← Local prev-day cache
+│   │   ├── capital_filter.py    ← LTP-based affordability filter
+│   │   └── logger.py
+│   └── logs/
+│       ├── trades.csv
+│       ├── volume_profiles.json
+│       ├── ohlc_cache.json
+│       └── trading_bot_YYYY-MM-DD.log
+└── dashboard/  (React/Vite, GitHub Pages)
 ```
 
-## Watchlist
-
-200 stocks loaded dynamically from Angel One instrument master at startup.
-Capital filter then narrows to ~50 affordable stocks based on current capital.
-Default fallback: NIFTY 50 liquid stocks (RELIANCE, TCS, HDFCBANK, INFY, etc.).
-
-## Startup Sequence (exact order)
-
-1. **Authenticate** with Angel One (TOTP + retry 3x)
-2. **getRMS()** — check available margin, cache in risk manager
-3. **getPosition()** — find orphaned positions, adopt all with SL/target
-4. **Place SL orders** for adopted positions (broker-side, exchange-level)
-5. **Load watchlist** (200 stocks + NIFTY/BANKNIFTY/VIX tokens)
-6. **Validate startup** (env vars, Firebase credentials, watchlist size)
-7. **Pre-market checks** (holiday, margin, news sentiment, prev-day OHLC with cache)
-8. **Start WebSocket** streaming for all instruments
-9. **Begin scanning** — log "Bot is live. Monitoring X existing + ready for new trades"
-
-## Trading Hours & Bot Schedule
-
-- **9:00 AM** — Bot starts, authenticates, adopts positions, loads watchlist
-- **9:15 AM** — Market opens, WebSocket stream begins
-- **9:15–9:30** — Opening Range period (watch only, no trades)
-- **9:30–11:30** — **ACTIVE WINDOW 1**: Morning momentum (100% position size). Best setups happen here.
-- **10:30 AM** — Market regime determined (TRENDING/VOLATILE/RANGE_BOUND/GAP_DAY)
-- **11:30–1:00 PM** — **LUNCH BLOCK**: No new trades. Fully blocked (0% position size). Existing positions continue to be monitored with normal SL/target logic.
-- **1:00–2:30 PM** — **ACTIVE WINDOW 2**: Afternoon momentum (100% position size). Second chance for setups.
-- **2:30 PM** — No new trades. Tighten all SLs to 1× ATR from current price (or 1% if ATR unavailable).
-- **3:00 PM** — Exit any position that is in profit (don't wait for target).
-- **3:15 PM** — Force-exit ALL open positions (regardless of P&L).
-- **3:30 PM** — Market closes, bot generates daily report, pushes to Firebase.
-
-## Safety Rules (HARDCODED — never override)
-
-1. Every trade MUST have a stop-loss. No exceptions.
-2. Max risk per trade: 1.5% of current capital.
-3. Max 3 trades per day (hard cap — sniper mode).
-4. Max 80% of broker margin deployed at once.
-5. Max 2 losing trades per day — bot stops if hit.
-6. 2 consecutive losses = 60-minute trading cooldown.
-7. Daily loss limit: 3% of starting capital. Bot stops if hit.
-8. No trading in first 15 minutes (opening range observation).
-9. No new trades after 2:30 PM.
-10. All positions closed by 3:15 PM.
-11. 30-minute re-entry cooldown per stock after exit (prevents whipsaw).
-12. Kill switch on dashboard immediately cancels all orders and exits positions.
-13. Broker-side SL order placed for every position (exchange-level crash protection).
-14. Signal score >= 80 with 2+ strategy confluence required (OR score >= 90 for single-strategy exception).
-15. VIX > 20 = no new trades (DANGER mode). VIX = 0 treated as "no data" (NORMAL).
-16. VIX 18-20 = CAUTION mode (50% position size, 2× ATR stop-loss).
-17. Lunch block: 11:30-13:00 fully blocked for new entries.
-18. ATR-based stops (1.5× ATR normal, 2× ATR caution, bounded 0.5%-3% of entry).
-19. Choppiness Index > 61.8 = reject signal (both stock and NIFTY checked independently).
-20. 15-minute trend must align with signal direction (9/21 EMA on 15-min candles).
-21. Volume must be >= 3× average (hard gate — no exceptions, no score adjustment).
-22. 17-point pre-flight checklist before every trade (all checks must pass).
-
-## Profit Management Rules
-
-1. **Target: 2.5R from entry.** Stop-loss is ATR-based (see ATR section below). Target = entry ± (SL distance × 2.5). This is the planned exit — actual exit may differ due to trailing or time rules.
-2. **Breakeven at 1% profit**: SL moves to entry price. No risk left on the table.
-3. **Trailing at 1.5R profit**: SL trails at 1× ATR below peak (longs) / above trough (shorts). Activates when unrealised profit reaches 1.5× the initial risk (R). Falls back to 1% distance if ATR is unavailable.
-4. **Partial exit at 1x RR**: Exit 50% of position at 1× risk-reward, move SL to breakeven on remainder. Locks in guaranteed profit while letting the rest run.
-5. **Win zone at 70% of target**: If price reaches 70% of the 2.5R target and then reverses 0.5% from peak, exit immediately. Protects runners from giving back gains.
-6. **Late session tightening**: After 2:30 PM, SL tightened to 1× ATR from current price (falls back to 1% if ATR unavailable). No new trades allowed.
-7. **Time profit exit**: After 3:00 PM, exit any position that is in profit (take what you have — don't wait for full target).
-8. **R-multiple tracking**: Every closed trade logs `r_multiple` (actual P&L per share ÷ initial risk per share) and `planned_r_target` (2.5) to CSV and Firebase. Use this to evaluate: "Am I capturing the full move, or exiting too early?"
-
-## Sniper Mode — Signal Filter Pipeline
-
-Every signal must pass through these 5 layers before execution. Each layer is independent — failing ANY layer rejects the signal.
-
-**Layer 1: Strategy Confluence (scanner.py)**
-- All 4 strategies run on every stock every tick
-- Signals grouped by stock + direction
-- At least 2 strategies must agree (e.g., ORB + SR_BREAKOUT both say LONG on RELIANCE)
-- **Exception**: If only 1 strategy fires but pre-scored signal is >= 90 (EXCEPTIONAL), it passes through
-- The best signal (highest base score) represents the group; others are listed in `confluence_strategies`
-
-**Layer 2: Market Environment Gates (scanner.py + risk_manager.py)**
-- **VIX gate**: VIX > 20 → reject all signals (DANGER). VIX 18-20 → allow but reduce size 50% and use 2× ATR SL (CAUTION). VIX < 18 → normal. VIX = 0 → treated as "no data" (NORMAL, skips gate).
-- **Lunch block**: 11:30-13:00 → reject all new signals (0% position size)
-- **NIFTY Choppiness**: Choppiness Index of NIFTY > 61.8 → reject (market is ranging, breakouts will fail)
-
-**Layer 3: Stock-Level Filters (scanner.py)**
-- **Stock Choppiness**: Choppiness Index of the stock itself > 61.8 → reject
-- **15-min trend alignment**: 9/21 EMA on resampled 15-min candles must match signal direction (LONG needs bullish, SHORT needs bearish; flat = reject)
-- **Volume hard gate**: Current volume must be >= 3× average. No exceptions — this is a binary pass/fail, not a score modifier.
-- **ATR expansion check** (breakout strategies only): Current ATR must be > ATR from 5 candles ago. If compressing, -10 score penalty.
-
-**Layer 4: Candle Close Confirmation (scanner.py)**
-- For breakout strategies (ORB, SR_BREAKOUT): the previous completed candle must close above (LONG) or below (SHORT) the breakout level
-- Prevents fakeouts where price spikes through a level but doesn't hold
-- Momentum strategies (VWAP_BOUNCE, EMA_CROSSOVER) skip this check
-
-**Layer 5: Score Threshold + Pre-flight Checklist (scanner.py + order_manager.py)**
-- After all filters, the final score must be >= 80 (out of 100)
-- If multiple signals qualify in the same scan cycle, they are ranked by score — only the top 1 is executed
-- Before placing the order, `pre_flight_check()` runs 17 sequential safety checks (capital, margin, daily limits, cooldowns, kill switch, etc.)
-- All signals (including rejected ones) are logged with status tags (EXECUTED, SKIPPED-LUNCH, SKIPPED-VIX, SKIPPED-CHOPPY, etc.) for review
-
-## ATR-Based Risk Management
-
-Stop-loss and target are calculated dynamically using Average True Range (ATR), not fixed percentages. This means SL adapts to each stock's actual volatility.
-
-**Stop-Loss Calculation:**
-- ATR(14) is computed for the stock at signal time
-- **Normal mode** (VIX < 18): SL distance = ATR × 1.5
-- **Caution mode** (VIX 18-20): SL distance = ATR × 2.0 (wider SL because volatility is elevated)
-- **Floor**: SL distance is never less than 0.5% of entry price (prevents too-tight SL on low-ATR stocks)
-- **Ceiling**: SL distance is never more than 3.0% of entry price (prevents unreasonable risk on high-ATR stocks)
-- For LONG: SL = entry_price - sl_distance. For SHORT: SL = entry_price + sl_distance.
-
-**Target Calculation:**
-- Target = 2.5 × SL distance (2.5R risk-reward ratio)
-- For LONG: target = entry_price + (sl_distance × 2.5). For SHORT: target = entry_price - (sl_distance × 2.5).
-
-**Position Sizing with VIX:**
-- VIX < 18 (NORMAL): Full position size, 1.5% capital risk per trade
-- VIX 18-20 (CAUTION): 50% of normal size, 0.75% capital risk per trade
-- VIX > 20 (DANGER): No new trades allowed
-- Quantity = (capital × risk_pct) / sl_distance — ensures you never risk more than the allowed % per trade
-
-**Trailing SL (ATR-based):**
-- Activates when unrealised profit reaches 1.5R (1.5× the initial risk distance)
-- Trail distance = 1× ATR from the peak price (longs) or trough price (shorts)
-- Falls back to 1% fixed distance if ATR value is not available
-- Broker-side SL order is modified on each trail update (stays on exchange)
-
-**R-Multiple Tracking:**
-- On every closed trade: `r_multiple = actual_pnl_per_share / initial_risk_per_share`
-- `planned_r_target = 2.5` (what we aimed for)
-- Both values logged to CSV (`logs/trades.csv`) and pushed to Firebase (`/trades/{id}`)
-- Use R-multiple to evaluate strategy quality: avg R > 1.0 means the strategy is profitable over time
-
-**Adopted Positions (crash recovery):**
-- Orphaned positions found via `getPosition()` API get a fallback SL of 2.5% from entry (since ATR is not available at adoption time)
-- As soon as the WebSocket delivers enough 5-min candles to compute ATR(14), the monitoring loop should automatically replace the 2.5% fallback SL with a proper ATR-based SL during the next trailing SL update cycle.
-
-## Firebase DB Structure
+### Firebase paths used
 
 ```
-/signals/{id}         — Signals with score, strategy, direction, entry/SL/target, confluence_count, atr_value, status
-/trades/{id}          — Closed trades with gross_pnl, net_pnl, charges, score, slippage, r_multiple, planned_r_target, confluence_strategies
-/portfolio            — current_capital, day_pnl (net), day_gross_pnl, brokerage_paid_today
-/positions/{stock}    — Open positions with trailing_sl, broker SL status, win zone status, atr_value
-/status               — Bot state (running/stopped)
-/kill_switch          — Emergency stop (dashboard writes, bot reads)
-/trading_enabled      — Global ON/OFF toggle (dashboard writes, bot reads)
-/market_context       — NIFTY direction + VIX + nifty_choppiness + vix_regime (NORMAL/CAUTION/DANGER)
-/regime               — Market regime (TRENDING/VOLATILE/RANGE_BOUND/GAP_DAY)
-/news_sentiment       — Per-stock sentiment + global_risk_day flag
-/analytics            — Strategy breakdown + score distribution (from CSV)
-/premarket_status     — Margin check, holiday check, capital filter stats
-/reports/{date}       — End-of-day summary reports
-/signal_queue         — All signals from current scan cycle with status tags (EXECUTED/SKIPPED-*)
+/signals/{id}         all signals (executed + skipped) with status tags
+/trades/{id}          completed trades + r_multiple
+/portfolio            current_capital, day_pnl, brokerage_paid_today
+/positions/{stock}    open positions with trailing_sl, broker SL status
+/status               running/stopped
+/kill_switch          dashboard writes, bot reads
+/trading_enabled      pause toggle
+/market_context       NIFTY direction + VIX + nifty_choppiness + vix_regime
+/regime               TRENDING/VOLATILE/RANGE_BOUND/GAP_DAY
+/news_sentiment       per-stock + global_risk_day flag
+/analytics            per-strategy breakdown + score distribution
+/premarket_status     margin check, holiday check, capital filter stats
+/reports/{date}       end-of-day reports
+/signal_queue         all signals from current cycle with status tags
 ```
 
 ---
 
-## SNIPER MODE V2 CHANGES (March 4, 2026)
+## Safety Rules (HARDCODED — never override without testing)
 
-### Philosophy Change
-Shifted from "take every decent trade" to "sniper mode: take only the 2-3 best trades per day."
-At 15K capital, 3 trades × Rs.40 brokerage = Rs.120 = 0.8% of capital (vs 10.8% at 1K with 9 trades).
-
-### All Changes Summary
-| Setting | Old | New |
-|---------|-----|-----|
-| min_signal_score | 70 | 80 (was 85, relaxed Mar 5) |
-| max_trades_per_day | 15 | 3 |
-| max_losing_trades | 3 | 2 |
-| Risk per trade | 2% | 1.5% |
-| Stop-loss method | Fixed 2.5% | 1.5× ATR (0.5%-3% bounds) |
-| SL at VIX 18-20 | Same as normal | 2.0× ATR + 50% size |
-| VIX > 20 | Score penalty | NO new trades |
-| Volume minimum | 2× avg | 3× avg hard gate |
-| Strategy confluence | Not required | 2+ must agree (OR score >= 90 single exception) |
-| Signal execution | First past threshold | Queue, rank, pick best |
-| Lunch hours 11:30-1:00 | 50% position size | Fully blocked (narrowed from 11:00-1:30) |
-| Target (R:R) | Fixed 2:1 | 2.5R (ATR-based) |
-| Trailing SL distance | Fixed 1% | 1× ATR |
-| Trail activation | 2% profit | 1.5R profit |
-| Capital | 1,000 | 15,000 |
-| **NEW: Choppiness Index** | N/A | Hard gate > 61.8 |
-| **NEW: 15-min trend filter** | N/A | Must align with signal |
-| **NEW: Candle close confirm** | N/A | Required for breakouts |
-| **NEW: ATR expansion check** | N/A | -10 penalty if compressing |
-| **NEW: R-multiple tracking** | N/A | Logged in CSV + Firebase |
-| **NEW: Pre-flight checklist** | N/A | 17 checks before every trade |
-
-### New Indicator Functions (utils/indicators.py)
-- `choppiness_index()` — measures market trendiness (0-100 scale)
-- `resample_to_15min()` — converts 5-min candles to 15-min
-- `get_15min_trend()` — 9/21 EMA trend on 15-min timeframe
-- `is_atr_expanding()` — checks if ATR is expanding or compressing
-- `get_current_atr()` / `get_current_choppiness()` — current values
-
-### New Signal Fields (strategies/base_strategy.py)
-- `score`, `score_breakdown` — signal scoring
-- `confluence_count`, `confluence_strategies` — multi-strategy agreement
-- `atr_value`, `choppiness`, `trend_15m` — sniper mode indicators
-- `status`, `skip_reason` — signal queue tracking
-
-### Scanner Rewrite (core/scanner.py)
-- Runs ALL 4 strategies per stock per tick
-- Groups signals by direction, requires 2+ strategies to agree
-- Applies sniper filters in sequence: lunch block → VIX → choppiness → NIFTY chop → 15-min trend → volume → candle close
-- ATR expansion penalty for breakout strategies
-- ATR-based SL/target recalculation
-- All signals tracked (including skipped) for dashboard
-
-### Order Manager Updates (core/order_manager.py)
-- `pre_flight_check()`: 17-point checklist before every trade
-- R-multiple tracking on every closed trade
-- ATR-based trailing SL (1× ATR from peak)
-- Trail activation at 1.5R instead of fixed 2%
-
-### Risk Manager Updates (core/risk_manager.py)
-- VIX graduated response: NORMAL/CAUTION/DANGER
-- Lunch block: 0% position size during 11:30-13:00
-- 1.5% risk per trade (down from 2%)
-
-### New CSV Fields (utils/trade_analytics.py)
-- `r_multiple`, `planned_r_target`, `confluence_count`, `confluence_strategies`, `atr_value`
-
-### New Config Fields (config.py)
-- **ATR SL**: `atr_sl_multiplier_normal` (1.5), `atr_sl_multiplier_caution` (2.0), `atr_sl_floor_pct` (0.5), `atr_sl_ceiling_pct` (3.0)
-- **Trailing**: `trailing_activation_r` (1.5), `trailing_sl_atr_multiplier` (1.0)
-- **Confluence**: `min_confluence_count` (2), `single_strategy_exception_score` (90)
-- **VIX**: `vix_normal_threshold` (18.0), `vix_caution_threshold` (20.0), `vix_caution_size_pct` (50.0), `vix_caution_risk_pct` (0.75)
-- **Choppiness**: `chop_threshold` (61.8), `chop_period` (14)
-- **15-min trend**: `trend_15m_enabled` (True), `trend_15m_flat_threshold_pct` (0.05)
-- **ATR expansion**: `atr_expansion_lookback` (5), `atr_compression_penalty` (10)
-- **Lunch block**: `lunch_block_start` (11:30), `lunch_block_end` (13:00)
-- **Target**: `final_exit_rr` (2.5), `adopted_sl_fallback_pct` (2.5)
+1. Every trade MUST have a stop-loss
+2. Max risk per trade: 1.5% of capital (Rs.225 at 15K capital)
+3. Max 5 trades per day (or stance-imposed lower limit: 0 / 2 / 3 / 5)
+4. Max 3 losing trades per day
+5. Max 80% of broker margin deployed at once
+6. Daily loss limit: 3% of starting capital (Rs.450 at 15K)
+7. 2 consecutive losses = 15-min trading cooldown
+8. 10-min minimum spacing between any two entries
+9. 15-min re-entry cooldown per stock after exiting
+10. No new trades after 13:00
+11. All positions force-closed at 15:15
+12. **VIX ≥ 18 = NO TRADES (binary, both equity and F&O)**
+13. Choppiness Index > 70 = reject signal (both stock AND NIFTY checked)
+14. ATR-based SL bounded 1.0%-1.5% of entry price
+15. Score ≥ 80 required (Sniper Mode)
+16. Broker-side STOPLOSS-LIMIT order placed for every position (exchange-level safety)
+17. Kill switch on dashboard immediately exits all positions
 
 ---
 
-## PREVIOUS CHANGES (March 4, 2026)
+## Key Design Decisions
 
-### New Files Added
-- `utils/rate_limiter.py` — Token bucket rate limiter (Historical 1/sec, LTP 5/sec)
-- `utils/ohlc_cache.py` — Date-stamped local OHLC cache at `logs/ohlc_cache.json` (zero API calls on mid-day restart)
-- `utils/capital_filter.py` — LTP-based pre-filter narrows 200 stocks → ~50 affordable at current capital
-
-### Bugs Fixed
-- **AB1019 stale token**: `broker.py` now appends `-EQ` suffix to tradingsymbol for NSE equity orders
-- **AB1004 rate limit**: Token bucket rate limiter replaces `sleep(2)` throttle; proper exponential backoff on rate limit errors
-- **`'str' has no attribute 'get'`**: `broker.place_order()` now handles Angel One returning a plain string order ID (not always a dict)
-- **`TypeError: float += dict`**: `portfolio.py` `record_trade()` now handles `charges` as either dict (from `calculate_charges()`) or float; extracts `total_charges` key when dict
-- **Double-exit on shutdown**: `exit_all_positions()` tracks exited symbols to skip duplicates; `shutdown()` checks if positions already closed before calling exit again
-- **MIN_NET_PROFIT too high for small capital**: Scaled by capital — <₹2K → ₹8, <₹5K → ₹12, else ₹15
-- **Stale instrument cache**: Force refresh if cache is from a previous calendar day (not just >12 hours)
-
-### New Features
-- **Position adoption on startup** — `getPosition()` API finds orphaned positions, adopts them with 2.5% SL and 2:1 target, places broker-side SL orders, pushes to Firebase
-- **Broker-side SL orders** — `place_sl_order()`, `modify_sl_order()`, `cancel_sl_order()` in `broker.py`. STOPLOSS-LIMIT orders live on the exchange; if bot crashes, SL still triggers. Modified when trailing, cancelled before manual exit.
-- **Capital-based trade limits** — Replaces hard `MAX_TRADES=3`. Now 15 ceiling with real limit being 80% of margin deployed. `getRMS()` called on startup to cache available margin.
-- **Improved trailing SL** — Breakeven at 1% profit. Trail activates at 2% profit with 1% distance from peak/trough. Replaces old "trail after partial exit" logic.
-- **Win zone exit** — When price reaches 70% of target, if it then reverses 0.5% from peak, exit immediately (protects runners from giving back gains)
-- **Time-based exits** — After 2:30 PM: tighten SL to 1%. After 3:00 PM: exit any position in profit (don't wait for full target)
-- **30-min re-entry cooldown** — After exiting a stock, cannot re-enter for 30 minutes (prevents whipsaw losses)
-- **OHLC cache** — Pre-market OHLC data cached to `logs/ohlc_cache.json` with date stamp; mid-day restart needs zero API calls
-- **Capital filter** — Uses fast LTP API (5 req/sec) to check which stocks are affordable before fetching full OHLC (1 req/sec); reduces API calls by ~70%
-
-### Startup Sequence (new order)
-1. Auth → 2. getRMS() → 3. getPosition() + adopt → 4. Place SL orders → 5. Load watchlist → 6. Validate → 7. Pre-market checks → 8. WebSocket → 9. Scan
-
-### Config Changes
-- `max_trades_per_day`: 3 → 15 (capital deployment is the real limiter now) — NOTE: subsequently reverted to 3 in Sniper Mode V2
-- New fields: `breakeven_profit_pct` (1.0), `trailing_activation_pct` (2.0), `trailing_distance_pct` (1.0), `win_zone_target_pct` (0.70), `win_zone_reversal_pct` (0.5), `late_session_sl_pct` (1.0), `profit_exit_time` (15:00), `late_session_start` (14:30), `reentry_cooldown_minutes` (30), `sl_order_price_buffer` (0.50)
-
-### First Live Trading Day Results
-- 9 positions opened (3 intentional + 6 orphaned from previous crash)
-- All 9 adopted on restart with broker-side SL orders
-- COALINDIA double-exited due to shutdown bug (now fixed)
-- Market: NIFTY neutral/bullish, mostly SHORT signals from SR_BREAKOUT
-
-### Known Issues Still Open
-- Dashboard may show stale data briefly if bot crashes during shutdown (Firebase update is best-effort)
-- WebSocket `_on_close` argument mismatch warning (cosmetic, not breaking — the callback receives unexpected args)
-- Instrument token cache: currently refreshes if from previous day; may still go stale during very long sessions (>12h unlikely for intraday bot)
-
-### Design Decisions (not bugs — do not "fix" these)
-- **Confirmation window disabled**: `USE_CONFIRMATION` is off. Signals execute immediately when score >= 80 and all filters pass — no 30-second countdown. This is intentional. The 10+ filter layers and 17-point pre-flight checklist provide far more rigorous gating than a human-in-the-loop delay ever could.
-- **Price monitoring uses WebSocket cache, not API**: `monitor_positions()` reads prices from `data_stream.price_cache` (populated on every WebSocket tick). The broker `get_ltp()` API is only called as a fallback if a token has no cached tick yet (rare — only at startup before first tick). This was changed after "Access denied because of exceeding access rate" errors from polling the API for 9 positions every second. API calls are now restricted to: placing orders, modifying/cancelling SL orders, startup position fetch, and margin checks.
-- **Lunch block is a full block, not reduced sizing**: 11:30-13:00 returns 0% position size (not 50%). Lunch-hour signals have historically lower win rates due to low volume and whipsaw. The sniper approach says: don't try to trade bad conditions at reduced size — just don't trade at all. Block was narrowed from 11:00-13:30 to 11:30-13:00 to recover 60 minutes of usable trading time.
-- **Volume is a hard gate, not a score modifier**: Volume < 3× average = signal rejected outright. Previous approach added/subtracted score points for volume. Sniper mode treats insufficient volume as a dealbreaker — you cannot enter a breakout in thin volume, period.
-- **Choppiness is checked for both stock AND NIFTY independently**: A trending stock in a choppy market will still fail. A clean-trending market doesn't save a choppy stock. Both must show directional conviction (Choppiness Index < 61.8).
-- **All rejected signals are logged with status tags**: Every signal the scanner evaluates gets tagged (EXECUTED, SKIPPED-LUNCH, SKIPPED-VIX, SKIPPED-CHOPPY, SKIPPED-TREND, SKIPPED-VOLUME, etc.). This is for post-session review to answer: "What did the bot see today? What did it reject and why?"
-- **First-win-stop is NOT implemented**: Stopping after the first winning trade wastes 2/3 of the 3-trade daily capacity. The 2-loss-stop rule and 60-min cooldown after consecutive losses provide sufficient downside protection without capping upside. If the bot finds 3 great setups, it should take all 3.
+1. **Rule-based, not ML.** Strategies are explicit if/else logic.
+2. **Broker-side SL orders for crash safety.** STOPLOSS-LIMIT lives on exchange. Modified on trail. Cancelled before manual exit.
+3. **Confluence requirement REMOVED.** Earlier versions required 2+ strategies to agree. Now: highest-confidence single signal goes through. The 10+ filters and 14-factor score gate handle quality.
+4. **VIX binary, not graduated.** Earlier `vix_caution_threshold=20`, `vix_caution_size_pct=50` allowed reduced trading at VIX 18-20. Now all set to 18 — VIX 18 = full stop. Reason: VIX > 18 in 2025-2026 only happened during wars/tariffs/crises; bot makes money in VIX 10-18 (90% of days), trading in VIX 18+ adds risk without proportional reward.
+5. **Tight SL bounds (1.0%-1.5%).** Previously 0.5%-3%. With 1.5R target, 3% SL = 4.5% target = unreachable intraday. Tightened to favor higher win rate.
+6. **Lunch block is FLAG ONLY.** Not a hard block. Reason: choppiness + RVOL + VIX filters already handle low-quality lunch conditions.
+7. **WebSocket cache for monitoring.** `monitor_positions()` reads prices from `data_stream.price_cache`, never polls broker LTP API except as fallback. Prevents rate-limit errors.
+8. **VIX REST polling fallback.** Angel One WebSocket doesn't reliably stream VIX → bot polls Yahoo Finance every 5 min if WebSocket VIX hasn't arrived.
+9. **Pre-seed candles on startup.** Historical API fills today's completed 5-min candles → all strategies ready immediately on late starts.
+10. **Position adoption on startup.** `getPosition()` finds orphans → adopts with 2.5% fallback SL → places broker SL.
 
 ---
 
-## POST-AUDIT FIXES (March 4, 2026 — Evening)
+## Known Active Mismatches
 
-### Full code audit performed before ₹15K live launch. All issues fixed:
+These are real divergences in the code worth knowing:
 
-### CRITICAL Fixes
-- **Portfolio capital tracking fixed**: `order_manager._close_remaining()` was passing net P&L under key `"pnl"` but `portfolio.record_trade()` expected `"net_pnl"`. Capital was never deducting charges — now it does.
-- **EMA scorer direction-aware**: Signal scorer was giving +10 to SHORT signals when EMAs were BULLISH (wrong). Now correctly checks: LONG needs EMA9>EMA21, SHORT needs EMA9<EMA21.
-
-### HIGH Fixes
-- **Strategy stats key fixed**: `record_trade()` received `"strategy"` but read `"strategy_name"`. All strategy breakdown stats showed "UNKNOWN" — now shows actual strategy names (ORB, VWAP_BOUNCE, etc.).
-- **Late session SL uses ATR**: After 2:30 PM, SL tightening now uses 1× ATR (matching sniper mode trailing SL) instead of always using fixed 1%. Falls back to 1% only if ATR is unavailable.
-- **15-min trend filter DISABLED**: `trend_15m_enabled` set to False. The filter operated on tick-level data (3 ticks ≠ 15 minutes), making it unreliable. Also blocked ALL morning signals because it returns NEUTRAL when insufficient data exists (<66 ticks). Will re-enable after implementing proper time-based 5-min candle resampling.
-
-### MEDIUM Fixes
-- **Partial exit charge calculation fixed**: `_close_remaining()` was calculating charges on `pos.signal.quantity` (full original qty) instead of `pos.remaining_quantity`. This double-counted charges for the already-exited half.
-- **Pre-flight checklist honesty**: Log messages now say "14 active + 3 pre-verified" instead of claiming all 17 are independently checked.
-
-### LOW Fixes
-- **NSE holidays 2026 updated**: Synced with official NSE calendar. Added missing dates (Holi Mar 3, Shivaji Jayanti Feb 17, Muharram Jun 26, Parsi New Year Aug 19). Removed incorrect dates.
-
-### Config Changes
-- `trend_15m_enabled`: True → False (disabled until proper resampling)
-
-### Known Issues Still Open (not blocking launch)
-- Tick-level candle building makes ATR and Choppiness Index noisier than they would be with proper time-based 5-min candles. Works acceptably but could be improved.
-- NIFTY choppiness defaults to 50.0 until enough ticks accumulate (~first few minutes). Early signals bypass this gate silently.
-- Pre-flight checks 3, 11, 13 are verified in scanner, not re-verified in pre-flight. Functionally safe but redundant.
-
-### Audit Confidence After Fixes: 8/10 — Safe for ₹15K live trading
+1. **Live vs backtest strategies differ.** Live: ORB + VWAP_BOUNCE + EMA_CROSS + SR_BREAKOUT. Backtest: ORB + VWAP_REVERSION (the opposite logic). The backtest comment explicitly states: "Old VWAP Bounce: DISABLED (-Rs.1,298 loss)". So the backtest is testing a hypothesis that hasn't been moved to live yet, OR live was never updated to match the proven backtest config. Worth resolving.
+2. **Pre-flight check #2 says "confluence is informational"** — comment matches code. No gate.
+3. **Pre-flight check #10 (15-min trend) is short-circuited** — `trend_15m_enabled=False`, so always passes.
+4. **Trading windows in config are weird:** `trading_window_2_start=13:00`, `trading_window_2_end=13:00` (zero minutes). The risk manager uses `window_1_start (9:30) ≤ now ≤ window_2_end (13:00)` so it works as a continuous 9:30-13:00 window despite the odd config. Could be cleaned up.
+5. **Adopted positions get fixed 2.5% SL.** Not ATR-based until next monitoring cycle replaces it. Documented as intentional (no ATR data at adoption time).
+6. **Comments reference 2.5R target** in some places (signal_scorer docstring, options_manager comment) but actual config is 1.5R. Inconsistency, not a bug.
 
 ---
 
-## FILTER RELAXATION (March 5, 2026)
+## Running the Bot
 
-### Problem: Zero trades on 2026-03-05
-- Morning: 13,396 single-strategy signals rejected (confluence needed 2+)
-- Lunch: 38 good 2+ confluence signals blocked by 11:00-13:30 block
-- Afternoon: WebSocket died at 13:00, only 10 retries, never recovered
+```powershell
+cd C:\Users\rshiv\nse-trading-bot\backend
+python main.py              # mode from .env
+python main.py --paper      # force paper mode
+python main.py --live       # force live mode (REAL money!)
+```
 
-### 5 Changes Made
+Run **before 9:00 AM IST** so the bot has time to authenticate, fetch instrument cache, fetch prev-day OHLC, and pre-seed candles before market opens.
 
-#### Change 1: VIX 0.0 Bug Fix
-- **signal_scorer.py**: VIX=0 (no data) now gets 3 partial points instead of 0 for `vix_low` bonus
-- **scanner.py**: VIX DANGER gate now requires `vix > 0` before checking threshold (matches pre-flight behavior)
-- **main.py**: Warning log when VIX tick arrives with LTP=0
+To run the backtest:
+```powershell
+python backtest.py --start 2026-04-17 --end 2026-04-30
+python backtest.py --start 2026-04-17 --end 2026-04-30 --stocks RELIANCE,TCS,INFY
+```
 
-#### Change 2: WebSocket Exponential Backoff
-- **data_stream.py**: Reconnection now uses exponential backoff (5s → 10s → 20s → 40s → 60s cap)
-- Max retries: 10 → 50
-- Added 60-minute total timeout (not just attempt count)
-- Resets disconnect timer on successful reconnect
-
-#### Change 3: Shorter Lunch Block (2.5h → 1.5h)
-- **config.py**: Lunch block narrowed from 11:00-13:30 to 11:30-13:00
-- Trading window 1 extended: 9:30-11:00 → 9:30-11:30
-- Trading window 2 starts earlier: 13:30 → 13:00
-- Recovers 60 minutes of trading time (30 min each side)
-
-#### Change 4: Score Threshold Lowered (85 → 80)
-- **config.py**: `min_score_to_trade` 85 → 80
-- Score 80 = ~8/11 factors confirmed = "EXCELLENT" quality
-- All other filters (volume 3×, choppiness, VIX) still apply
-
-#### Change 5: Single-Strategy Exception (Score ≥ 90)
-- **config.py**: New `single_strategy_exception_score = 90`
-- **scanner.py**: If only 1 strategy fires, pre-scores it. If score ≥ 90 (EXCEPTIONAL), allows through with `confluence_count = 1`
-- **order_manager.py**: Pre-flight check #2 updated: pass if `confluence >= 2 OR score >= 90`
-- Pre-flight check #1 now uses dynamic config value instead of hardcoded "85"
-
-### Updated Sniper Mode Config Summary
-| Setting | Old | New |
-|---------|-----|-----|
-| min_signal_score | 85 | 80 |
-| Lunch block | 11:00-13:30 | 11:30-13:00 |
-| Confluence | 2+ required | 2+ OR score >= 90 |
-| WebSocket retries | 10 (fixed 5s) | 50 (exponential backoff 5-60s) |
-| VIX=0 handling | Silent pass + 0 score pts | Warning log + 3 partial pts |
-
-### Safety Rules Unchanged
-- Max 3 trades/day, max 2 losses/day, 1.5% risk/trade
-- Volume ≥ 3× hard gate, Choppiness < 61.8, ATR-based SL (0.5%-3%)
-- Broker-side SL orders, force exit 3:15 PM, daily loss limit 3%
-- Kill switch, 30-min re-entry cooldown, 17-point pre-flight checklist
-
-### Design Decisions
-- **Single-strategy exception at 90, not 85**: Score 90+ means ~10/11 factors confirmed — more stringent than old 70+ with 2 strategies. A 90-score single signal is higher quality than an 80-score two-strategy signal.
-- **Lunch block shortened, not removed**: 11:30-13:00 is still the worst period. Extended morning (11:00-11:30) still has residual momentum; early afternoon (13:00-13:30) is when momentum rebuilds.
-- **Score 80 not 70**: All other sniper filters still apply. Combined with volume 3×, choppiness, VIX gates, and pre-flight — 80 is still very selective.
+Backtest uses **yfinance** (free, no broker auth needed). Note: yfinance only provides 5-min data for the last 60 days.
 
 ---
 
-## STABILITY FIXES (March 10, 2026)
+## Coding Conventions
 
-### Problem: Zero trades on 2026-03-09 + multiple infrastructure issues
-- 57,205 single-strategy signals generated, zero 2-strategy confluence achieved
-- 124 afternoon signals that DID achieve confluence were all SKIPPED-CHOPPY (NIFTY choppiness 67-91)
-- VIX stuck at 0.0 all day (WebSocket never delivered VIX ticks)
-- WebSocket subscriptions doubled on every reconnect (196 → 392 → 784 → 1568)
-- Zombie WebSocket thread reconnected after bot shutdown
-- Marketaux API 402 quota exhaustion wasted 50+ failed API calls
-- "Market opens in 1436 min" when market was already open
+- **Python**: type hints, dataclasses, `logging` (not print), config via `.env` + `config.py`
+- **Error handling**: every API call wrapped in try/except, graceful degradation
+- **Security**: keys in `.env` (gitignored), Firebase creds gitignored
+- **Angel One specifics**: `-EQ` suffix for tradingsymbol; producttype="INTRADAY" for MIS, "DELIVERY" for CNC
+- **WebSocket prices in paise** (divide by 100)
+- **Instrument cache** must refresh daily
 
-### 7 Fixes Applied
+## User Profile
 
-#### Fix 1: VIX REST API Polling Fallback (CRITICAL)
-- **broker.py**: New `get_vix()` method fetches India VIX via REST LTP API
-- **main.py**: `_poll_vix()` calls broker every 5 minutes in trading loop
-- **main.py**: `_apply_vix()` helper distributes VIX to all components (regime, scanner, risk_manager, order_manager)
-- **Behavior**: If WebSocket delivers VIX ticks (`_vix_ws_received=True`), REST polling is skipped. Otherwise, polls every 5 min.
-- **Root cause**: Angel One WebSocket doesn't reliably stream India VIX (token 99919000). NIFTY/BANKNIFTY work fine.
-
-#### Fix 2: Single-Strategy Exception Lowered (90 → 85)
-- **config.py**: `single_strategy_exception_score` changed from 90 to 85
-- **Why**: On 2026-03-09, 57,205 signals fired but ZERO achieved 2-strategy confluence. Best pre-score was 72. Score 90 was unreachable.
-- Score 85 means ~9/11 scoring factors confirmed. Combined with volume 3×, choppiness, VIX gates, and 17-point pre-flight — still very selective.
-- Pre-flight check #2 reads from config (not hardcoded), so change flows automatically.
-
-#### Fix 3: WebSocket Subscription Doubling Fixed
-- **data_stream.py**: Correlation ID now uses `uuid.uuid4()` instead of static `"trading_bot_stream"`
-- **Why**: Angel One tracks subscriptions per correlation ID. Reusing the same ID across reconnects caused subscriptions to accumulate (196 → 392 → 784 → 1568).
-- Each new connection gets a fresh correlation ID, preventing doubling.
-
-#### Fix 4: Zombie WebSocket Thread After Shutdown
-- **data_stream.py**: `disconnect()` now calls `self._thread.join(timeout=10)` to wait for thread exit
-- **Why**: Previous code set `is_streaming=False` and closed connection, but didn't wait for the thread. The daemon thread could still be mid-reconnect, creating zombie WebSocket connections after bot shutdown.
-
-#### Fix 5: Market-Open Time Calculation Bug
-- **main.py**: Fixed "Market opens in 1436 min" when market is already open
-- **Root cause**: `timedelta.seconds` wraps negative values (Python quirk). Now shows "Market already open" when past 9:15 AM.
-
-#### Fix 6: Log Spam Reduction (57K → ~0 INFO lines)
-- **scanner.py**: "No confluence" messages changed from INFO to DEBUG level
-- **Why**: 57,205 "No confluence" messages (one per single-strategy signal per tick) generated 6.5MB log. These are expected behavior, not actionable.
-
-#### Fix 7: Marketaux API Quota Early Bail-out
-- **news_sentiment.py**: On 402 (Payment Required) or 429 (Rate Limited), stops fetching immediately
-- **news_sentiment.py**: `_fetch_stock_news()` propagates 402/429 errors instead of silently swallowing them
-- **Why**: After quota exhaustion, the old code made 50+ failed API calls (one per stock). Now it stops after the first 402.
-
-#### Fix 8: Intraday Candle Pre-seeding
-- **broker.py**: New `fetch_intraday_candles()` and `fetch_all_intraday_candles()` fetch today's completed 5-min candles from Angel One Historical API
-- **scanner.py**: New `seed_candles()`, `seed_nifty_candles()`, `reconstruct_orb_ranges()` pre-populate candle stores at startup
-- **main.py**: `_fetch_intraday_candles()` called in Step 7a after watchlist is wired
-- **Why**: Without pre-seeding, strategies waited 60-110 minutes for enough ticks to accumulate (EMA needs 22 candles = 110 min). With pre-seeding, all strategies are ready on first tick.
-- **ORB reconstruction**: If bot starts after 9:30 AM, ORB ranges are reconstructed from the first 3 historical candles (9:15-9:30 window)
-- **Rate limiting**: Uses HISTORICAL_LIMITER (1 req/sec), ~55 seconds for 50 stocks + 2 indices
-
-### Updated Sniper Mode Config
-| Setting | Old | New |
-|---------|-----|-----|
-| single_strategy_exception_score | 90 | 85 |
-| VIX data source | WebSocket only | WebSocket + REST API fallback (5 min poll) |
-
-### Safety Rules Unchanged
-- Max 3 trades/day, max 2 losses/day, 1.5% risk/trade
-- Volume >= 3× hard gate, Choppiness < 61.8, ATR-based SL (0.5%-3%)
-- Broker-side SL orders, force exit 3:15 PM, daily loss limit 3%
-- Kill switch, 30-min re-entry cooldown, 17-point pre-flight checklist
-
-### Design Decisions
-- **VIX poll interval is 5 minutes, not per-tick**: VIX changes slowly. Polling every 5 min uses 1 API call and provides sufficient resolution for the NORMAL/CAUTION/DANGER gates.
-- **Single-strategy exception at 85, not 80 or lower**: Score 85 means ~9/11 factors confirmed — more stringent than the 2-strategy confluence at score 80 (where ~8/11 factors confirm). A high-scoring single signal is better quality than a mediocre confluence signal.
-- **"No confluence" is DEBUG, not removed**: The data is still logged for post-session analysis if DEBUG logging is enabled. Just not cluttering the INFO-level production log.
+- **Experience**: Beginner in Python and trading
+- **Capital**: Rs.15,000
+- **Broker**: Angel One SmartAPI (free)
+- **Goal**: Learn algorithmic trading with real but minimal risk
+- **Philosophy**: Sniper Mode — fewer, higher-quality trades. Wait for confluence of context (macro/sector/fundamental) + technical signal. Protect capital above all.

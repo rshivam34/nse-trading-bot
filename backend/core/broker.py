@@ -400,15 +400,50 @@ class BrokerConnection:
         return results
 
     def _lookup_option_token(self, option_symbol: str) -> Optional[str]:
-        """Look up instrument token for an option from the cached instrument master."""
+        """Look up instrument token for an option from the cached instrument master.
+
+        BUG FIX 2026-05-01: Previously imported non-existent `get_instrument_master`
+        from utils.watchlist — every call raised ImportError silently swallowed by
+        the try/except. This meant ALL options trades failed token lookup → no F&O
+        orders ever fired despite options_enabled=True. Now reads the master JSON
+        directly from the cache file or downloads if missing.
+        """
         try:
-            from utils.watchlist import get_instrument_master
-            master = get_instrument_master()
+            import json
+            from pathlib import Path
+            from utils.watchlist import INSTRUMENT_MASTER_URL
+
+            # Try cached master first (downloaded daily by watchlist.build_watchlist)
+            cache_path = Path("logs/scrip_master.json")
+            master = None
+            if cache_path.exists():
+                try:
+                    with open(cache_path) as f:
+                        master = json.load(f)
+                except Exception:
+                    master = None
+
+            # Fallback: download (rare path — should already be cached)
+            if not master:
+                logger.info("Options token cache missing, downloading instrument master (slow, one-time)...")
+                resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
+                if resp.status_code == 200:
+                    master = resp.json()
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(cache_path, "w") as f:
+                        json.dump(master, f)
+                else:
+                    logger.error(f"Could not download instrument master: HTTP {resp.status_code}")
+                    return None
+
+            # Search NFO segment for exact symbol match
             for entry in master:
                 if entry.get("symbol") == option_symbol and entry.get("exch_seg") == "NFO":
                     return str(entry.get("token", ""))
+
+            logger.warning(f"Option {option_symbol} not found in instrument master ({len(master)} entries)")
         except Exception as e:
-            logger.debug(f"Option token lookup failed for {option_symbol}: {e}")
+            logger.error(f"Option token lookup failed for {option_symbol}: {e}", exc_info=True)
         return None
 
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> bool:

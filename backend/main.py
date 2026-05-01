@@ -928,6 +928,12 @@ class TradingBot:
             return
 
         # ── ACTIVE TRADING (9:30 AM - 2:30 PM) ─────────────────────────
+        # REWORK 2026-05-01: Equity-disabled gate (options-primary mode).
+        # When equity_enabled=False, all stock ticks are dropped here. F&O
+        # system above (NIFTY/BANKNIFTY index ticks) continues to function.
+        if not config.trading.equity_enabled:
+            return
+
         self._scan_count += 1
         try:
             signals = self.scanner.scan(tick)

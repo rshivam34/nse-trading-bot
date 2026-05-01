@@ -43,7 +43,7 @@ class TradingConfig:
     """Core trading parameters."""
 
     # ── Capital ──────────────────────────────────────────────────────
-    initial_capital: float = float(os.getenv("INITIAL_CAPITAL", "15000"))
+    initial_capital: float = float(os.getenv("INITIAL_CAPITAL", "30000"))
 
     # ── Risk management (SAFETY — do not loosen these) ───────────────
     max_risk_per_trade_pct: float = 1.5      # Max 1.5% of capital at risk per trade (sniper mode)
@@ -320,12 +320,22 @@ class TradingConfig:
     fair_value_undervalued_bonus: int = 5    # +5 if PE < 0.7x sector average
     earnings_skip_enabled: bool = True       # Hard skip stocks with earnings this week
 
+    # ── Options-primary mode (REWORK 2026-05-01) ─────────────────────
+    # User's strategy: F&O has proven asymmetric edge (+Rs.633 single trade
+    # in backtest), equity has been net negative. Reallocate capital toward F&O.
+    # Set equity_enabled=False to run in pure options mode.
+    equity_enabled: bool = True              # set False to disable equity scanner entirely
+    options_capital_allocation: float = 21000.0  # Rs. allocated to F&O (default 70% of 30K)
+    equity_capital_allocation: float = 9000.0    # Rs. allocated to equity (default 30% of 30K)
+
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
     options_enabled: bool = True
+    options_max_trades_per_day: int = 4      # raised from hardcoded 2 — was the daily cap
     options_sl_pct: float = 30.0            # SL at 30% premium loss
     options_target_pct: float = 50.0        # Target at 50% premium gain
     options_exit_time: time = time(14, 0)   # Exit by 2 PM (theta decay)
-    options_max_premium: float = 500.0      # Max premium per lot (Rs.)
+    options_max_premium: float = 700.0      # Max premium per lot (Rs.) — raised from 500 to allow BANKNIFTY
+    options_lots_per_trade: int = 1          # explicit — was implicit 1
     nifty_lot_size: int = 25
     banknifty_lot_size: int = 15
 
