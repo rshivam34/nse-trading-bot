@@ -60,6 +60,35 @@ python main.py --live        # LIVE — REAL money
 Unregister-ScheduledTask -TaskName "NSE-IntradayBot-Paper" -Confirm:$false
 ```
 
+### Going-live checklist (DO NOT SKIP)
+
+The Windows Task Scheduler runs **paper mode only** (`--paper` flag in `start_bot_paper.bat`). It will never place real orders, even if `.env: PAPER_TRADING=True` is flipped.
+
+Before going live with real money:
+
+1. **Run paper mode for at least 2 full trading weeks (10 trading days minimum).**
+2. Validate during paper period:
+   - F&O signals are actually firing (most critical — bug was just fixed today, never tested live)
+   - Equity scoring rejects most signals (expected — sniper mode)
+   - Daily loss limit gates work (3% = Rs.900 at Rs.30K)
+   - Force-exit at 3:15 PM closes all positions
+3. **Review every paper trade in `backend/logs/trades.csv`** — confirm signal logic matches what you expect
+4. Only after 2 weeks of clean paper data:
+   - Edit `start_bot_paper.bat` → change `--paper` to `--live`
+   - **OR** edit `.env: PAPER_TRADING=False`
+   - **Start with Rs.10,000, NOT the full Rs.30K** — scale up only after 4 profitable weeks
+
+### Controls available (ask Claude or run yourself)
+
+| Action | Command |
+|---|---|
+| Pause auto-run | `Disable-ScheduledTask -TaskName "NSE-IntradayBot-Paper"` |
+| Resume auto-run | `Enable-ScheduledTask -TaskName "NSE-IntradayBot-Paper"` |
+| Remove auto-run | `Unregister-ScheduledTask -TaskName "NSE-IntradayBot-Paper" -Confirm:$false` |
+| Run once manually | Double-click `start_bot_paper.bat` |
+| Switch to live mode | Edit `.env: PAPER_TRADING=False` (after 2-week paper test) |
+| Stop running bot | Close terminal window, or Ctrl+C in it, or kill the python process |
+
 ---
 
 ---
