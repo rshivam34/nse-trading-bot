@@ -4,7 +4,27 @@
 
 ---
 
-## REWORK 2026-05-01 (most recent)
+## REWORK 2026-05-02 (F&O-ONLY MODE)
+
+After backtesting both systems and the delivery bot at Rs.30K/Rs.50K/Rs.1L, decided to:
+1. **Disable equity scanner entirely** (`equity_enabled = False`)
+2. **Allocate full Rs.50K to F&O** (was Rs.21K with 70/30 split)
+3. **Pause the delivery bot** (it's profitable but at +2-4%/year vs intraday F&O's higher upside)
+4. **Run intraday in F&O-only paper mode** until proven profitable, then go live
+
+Comparison data that drove the decision:
+
+| Strategy | Rs.50K capital | Period | Result |
+|---|---|---|---|
+| Delivery bot (with bug fix) | Rs.50K | 14 months | **+3.77%** (+Rs.1,886) |
+| Delivery bot (with bug fix) | Rs.50K | 6 months war | **+2.62%** (+Rs.1,312) |
+| Intraday equity | Rs.50K | 60-day war | -0.11% (1 trade -Rs.53) |
+| Intraday F&O | Rs.50K | 60-day war | 0% (0 trades, VIX too high) |
+| Intraday F&O (relaxed VIX test) | Rs.30K | 2 weeks Apr | +Rs.629 (1 NIFTY trade +Rs.633) |
+
+12-month true intraday backtest is NOT possible via yfinance (60-day 5-min limit). The 60-day window happens to be all war/crisis. Real edge will only show in normal-VIX months (Nov 2025 - Feb 2026 was VIX 9-15 — bot would have been very active, but no backtest data).
+
+## Previous: REWORK 2026-05-01
 
 Session goals: rework toward options-primary at Rs.30K capital, fix F&O execution bug, set up Windows Task Scheduler for daily auto-paper-trading.
 

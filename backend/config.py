@@ -320,13 +320,15 @@ class TradingConfig:
     fair_value_undervalued_bonus: int = 5    # +5 if PE < 0.7x sector average
     earnings_skip_enabled: bool = True       # Hard skip stocks with earnings this week
 
-    # ── Options-primary mode (REWORK 2026-05-01) ─────────────────────
-    # User's strategy: F&O has proven asymmetric edge (+Rs.633 single trade
-    # in backtest), equity has been net negative. Reallocate capital toward F&O.
-    # Set equity_enabled=False to run in pure options mode.
-    equity_enabled: bool = True              # set False to disable equity scanner entirely
-    options_capital_allocation: float = 21000.0  # Rs. allocated to F&O (default 70% of 30K)
-    equity_capital_allocation: float = 9000.0    # Rs. allocated to equity (default 30% of 30K)
+    # ── F&O-ONLY MODE (FINAL DECISION 2026-05-02) ─────────────────────
+    # Decision based on backtest comparison:
+    #   - Equity intraday over 60-day war window: 1 trade, all -Rs.35 to -Rs.58 loss (consistent small drag)
+    #   - F&O has asymmetric edge (+Rs.633 in 1 NIFTY trade in earlier test)
+    #   - Decision: disable equity entirely, allocate full capital to F&O
+    # To re-enable equity: set equity_enabled = True
+    equity_enabled: bool = False             # F&O-ONLY MODE — equity scanner disabled
+    options_capital_allocation: float = 50000.0  # Full Rs.50K to F&O (user moved from delivery to all-intraday)
+    equity_capital_allocation: float = 0.0       # Equity disabled
 
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
     options_enabled: bool = True
