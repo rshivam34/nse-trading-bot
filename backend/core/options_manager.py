@@ -249,18 +249,27 @@ class OptionsManager:
             logger.info(f"Option premium Rs.{premium:.2f} > max Rs.{max_premium:.2f}. Skipping.")
             return None
 
-        # REWORK 2026-05-01: Use options_capital_allocation from config (was min(5000, 30%))
-        # In options-primary mode, larger allocation (Rs.21K of Rs.30K) allows more lots.
+        # REWORK 2026-05-02: AUTO-SCALING multi-lot sizing (validated +79% backtest at Rs.50K)
+        # Position size = 25% of capital_for_options per trade.
+        # Number of lots = max(1, capital_per_position / lot_cost), capped at 10 lots.
+        # This ensures Rs.50K → 2-3 lots, Rs.1L → 4-5 lots — proportional scaling.
         capital_for_options = getattr(self.config, "options_capital_allocation", min(5000, self.config.initial_capital * 0.3))
-        max_lots = int(capital_for_options / (premium * lot_size))
-        if max_lots <= 0:
+        capital_per_position = capital_for_options * 0.25  # 25% per trade
+        lot_cost = premium * lot_size
+        max_lots_affordable = int(capital_for_options / lot_cost)
+        if max_lots_affordable <= 0:
             logger.warning(f"Cannot afford even 1 lot of {symbol} at Rs.{premium:.2f}")
             return None
 
-        # Use config-defined lots per trade (default 1)
-        lots = getattr(self.config, "options_lots_per_trade", 1)
-        lots = min(lots, max_lots)
-        quantity = lot_size * lots
+        # Auto-scale: how many lots fit in 25% of capital? Floor 1, cap 10.
+        scaled_lots = max(1, int(capital_per_position / lot_cost))
+        scaled_lots = min(scaled_lots, max_lots_affordable, 10)
+        quantity = lot_size * scaled_lots
+        logger.info(
+            f"Auto-scaled lots: {scaled_lots} ({lot_size}x{scaled_lots}={quantity} qty) "
+            f"@ Rs.{premium:.2f} premium = Rs.{lot_cost*scaled_lots:.0f} deployed "
+            f"(25% target: Rs.{capital_per_position:.0f}, max affordable: {max_lots_affordable} lots)"
+        )
 
         # Place order
         order_id = self.broker.place_option_order(

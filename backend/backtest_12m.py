@@ -443,6 +443,71 @@ def backtest_equity_orb(stocks_data: dict[str, dict], nifty_data: dict, vix_dail
                         except Exception:
                             pass
 
+                    # SCORE GATE — port of live bot's SignalScorer (simplified, 8 factors)
+                    # Live uses 14 factors with threshold 80. Backtest uses 8 with threshold 70.
+                    score = 15  # ORB strategy bonus (always +15)
+
+                    # VWAP alignment
+                    closes_so_far = day_candles.iloc[:bar_idx+1]
+                    vols_so_far = closes_so_far["Volume"]
+                    typical = (closes_so_far["High"] + closes_so_far["Low"] + closes_so_far["Close"]) / 3
+                    vwap_calc = (typical * vols_so_far).sum() / vols_so_far.sum() if vols_so_far.sum() > 0 else entry_price
+                    if (direction == "LONG" and entry_price > vwap_calc) or (direction == "SHORT" and entry_price < vwap_calc):
+                        score += 15
+
+                    # Volume spike
+                    vol_ratio = prev_vol / avg_vol if avg_vol > 0 else 1
+                    if vol_ratio >= 5.0:
+                        score += 20
+                    elif vol_ratio >= 2.0:
+                        score += 10
+
+                    # RSI 30-70 (not extreme)
+                    if len(history) >= 15:
+                        try:
+                            delta = history["Close"].diff()
+                            gain = delta.clip(lower=0).rolling(14).mean()
+                            loss = (-delta.clip(upper=0)).rolling(14).mean()
+                            rs = gain / loss.replace(0, np.nan)
+                            rsi_val = 100 - (100 / (1 + rs))
+                            rsi_now = float(rsi_val.iloc[-1]) if pd.notna(rsi_val.iloc[-1]) else 50
+                            if 30 <= rsi_now <= 70:
+                                score += 10
+                            elif (direction == "LONG" and rsi_now < 30) or (direction == "SHORT" and rsi_now > 70):
+                                score += 5  # contrarian
+                        except Exception:
+                            score += 5  # no data, partial credit
+
+                    # NIFTY direction (already filtered above, give credit if aligned)
+                    if (direction == "LONG" and nifty_dir == "BULLISH") or (direction == "SHORT" and nifty_dir == "BEARISH"):
+                        score += 15
+                    elif nifty_dir == "NEUTRAL":
+                        score += 8
+
+                    # EMA alignment (9 vs 21)
+                    if len(history) >= 22:
+                        try:
+                            ema9 = float(history["Close"].ewm(span=9, adjust=False).mean().iloc[-1])
+                            ema21 = float(history["Close"].ewm(span=21, adjust=False).mean().iloc[-1])
+                            if (direction == "LONG" and ema9 > ema21) or (direction == "SHORT" and ema9 < ema21):
+                                score += 10
+                        except Exception:
+                            pass
+
+                    # Time-of-day bonus (9:30-11:30 = best window)
+                    if dt_time(9, 30) <= bar_time <= dt_time(11, 30):
+                        score += 5
+
+                    # Low VIX bonus
+                    if vix > 0 and vix < 15.0:
+                        score += 5
+                    elif vix == 0:
+                        score += 3  # no data
+
+                    # Score gate — equivalent to live bot's 80 threshold (8 factors → 70)
+                    if score < 70:
+                        continue
+
                     # ATR-based SL (compute on bars seen so far)
                     history = day_candles.iloc[:bar_idx + 1]
                     atr = get_current_atr(history, period=14) if len(history) >= 14 else 0
