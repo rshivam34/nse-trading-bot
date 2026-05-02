@@ -31,12 +31,16 @@ if exist "..\venv\Scripts\activate.bat" (
 echo.
 echo =====================================================================
 echo  NSE Intraday Trading Bot — LIVE MODE (REAL MONEY)
-echo  Capital: Rs.50,000 (F^&O only)
+echo  Capital: Rs.30,000 (F^&O only)
 echo  Started: %date% %time%
 echo =====================================================================
 echo.
+echo  Pre-flight:
+echo    - WireGuard VPN must be ACTIVE (IP should be 80.225.252.67)
+echo    - Check https://whatismyipaddress.com to verify before continuing
+echo.
 echo  WARNING: This places REAL orders with REAL money.
-echo  Maximum daily loss: ~3%% of capital (Rs.1,500) per risk manager.
+echo  Maximum daily loss: ~3%% of capital (Rs.900) per risk manager.
 echo  Maximum 4 F^&O trades per day, 30%% premium SL per trade.
 echo.
 

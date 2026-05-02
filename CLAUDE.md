@@ -16,11 +16,21 @@ User decided to launch live with manual control rather than auto-scheduling.
 - **Desktop launcher: `C:\Users\rshiv\OneDrive\Desktop\NSE-Bot-Launch.bat`**
 - **First live trading day: Monday May 4, 2026** (when user double-clicks the launcher)
 
-**Important — IP whitelist gotcha:**
-Angel One whitelists by IP for ALL endpoints (auth, orders, market data, WebSocket).
-Current Primary IP: `49.32.238.63` (Jio mobile, dynamic — will change).
-When AG8004 errors appear in future logs, update Primary IP at https://smartapi.angelone.in/.
-For office/home dual-use, add Secondary Static IP.
+**IP whitelist — SOLVED via Oracle Cloud VPN (2026-05-02):**
+Angel One whitelists by IP. To handle dynamic Jio IPs, set up Oracle Cloud Always Free VM
+running WireGuard. All laptop traffic now exits through Oracle's STATIC IP `80.225.252.67`.
+
+- VM: instance-20260502-0615, Mumbai, Ubuntu 22.04, VM.Standard.E2.1.Micro (Always Free)
+- WireGuard installed via angristan/wireguard-install
+- Client config: `secrets/wg0-client-laptop.conf` (gitignored)
+- SSH key: `secrets/oracle-vm-private.key` (gitignored)
+- See ORACLE_VPN_SETUP.md for full setup walkthrough
+
+**Daily check:** before starting bot, verify WireGuard is active and
+https://whatismyipaddress.com shows `80.225.252.67`.
+
+**If AG8004 errors appear:** first check WireGuard status. If active,
+the Oracle VM may be down — SSH in or recreate per ORACLE_VPN_SETUP.md.
 
 **12-month validated backtest results (Apr 2025 - Apr 2026 with real Angel One 5-min data):**
 

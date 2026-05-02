@@ -360,8 +360,9 @@ class ControlPanel(tk.Tk):
         rem = ttk.LabelFrame(f, text="Pre-flight Reminders", padding=15)
         rem.pack(fill="x", padx=10, pady=10)
         reminders = (
-            "• Verify your IP is whitelisted at https://smartapi.angelone.in/\n"
-            "  (Recommend dedicated-IP VPN to avoid daily IP changes)\n"
+            "• WireGuard VPN must be ACTIVE — your IP should show 80.225.252.67\n"
+            "  Check at https://whatismyipaddress.com before starting bot\n"
+            "  (Oracle Cloud VPN — fixed IP, works from any network)\n"
             "• Verify ≥ Rs.30K cash in Angel One account\n"
             "• Verify F&O segment is active\n"
             "• Bot self-skips weekends + NSE holidays\n"
