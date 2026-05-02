@@ -35,6 +35,11 @@ CONFIG_PATH = PROJECT_ROOT / "backend" / "config.py"
 TRADES_CSV = PROJECT_ROOT / "backend" / "logs" / "trades.csv"
 LIVE_BAT = PROJECT_ROOT / "start_bot_live.bat"
 
+# CLEAN-SLATE START — stats only count trades from this date onwards.
+# Pre-existing trades.csv has 12 March 2026 trades from the old config (=-Rs.700 total).
+# We're starting fresh F&O-live mode 2026-05-02; historical equity trades are noise.
+STATS_START_DATE = "2026-05-02"
+
 
 # ===================== Config Read/Write Helpers =====================
 def read_env_value(key: str, default: str = "") -> str:
@@ -94,14 +99,16 @@ def write_config_value(field: str, new_value: str):
 
 
 # ===================== Trade Data =====================
-def read_trades() -> list[dict]:
-    """Read all trades from logs/trades.csv. Returns list of dicts."""
+def read_trades(since: str = STATS_START_DATE) -> list[dict]:
+    """Read trades from logs/trades.csv, filtered to >= since date. Returns list of dicts."""
     if not TRADES_CSV.exists():
         return []
     try:
         with open(TRADES_CSV, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            return list(reader)
+            rows = list(reader)
+        # Apply clean-slate date filter (treats blank dates as old/skipped)
+        return [r for r in rows if r.get("date", "") >= since]
     except Exception:
         return []
 
@@ -354,10 +361,11 @@ class ControlPanel(tk.Tk):
         rem.pack(fill="x", padx=10, pady=10)
         reminders = (
             "• Verify your IP is whitelisted at https://smartapi.angelone.in/\n"
+            "  (Recommend dedicated-IP VPN to avoid daily IP changes)\n"
             "• Verify ≥ Rs.30K cash in Angel One account\n"
             "• Verify F&O segment is active\n"
             "• Bot self-skips weekends + NSE holidays\n"
-            "• Best to start before 9:00 AM IST for full pre-market routine"
+            f"• Stats track trades from {STATS_START_DATE} (clean-slate start)"
         )
         ttk.Label(rem, text=reminders, justify="left", font=("Segoe UI", 9)).pack(anchor="w")
 
