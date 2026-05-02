@@ -1,7 +1,10 @@
 # Environment & Secrets
 .env
 *.pem
+*.key
+*.key.pub
 firebase-credentials.json
+secrets/
 
 # Claude Code per-machine session data (user-local, not for shared repo)
 backend/.claude/
