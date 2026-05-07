@@ -14,7 +14,7 @@
       "contributor": null,
       "kind": "trading",
       "id": "p_nse_trading_bot",
-      "community": 2,
+      "community": 0,
       "norm_label": "nse-trading-bot (intraday)"
     },
     {
@@ -28,7 +28,7 @@
       "contributor": null,
       "kind": "trading",
       "id": "p_nse_delivery_bot",
-      "community": 1,
+      "community": 0,
       "norm_label": "nse-delivery-bot (swing)"
     },
     {
@@ -42,7 +42,7 @@
       "contributor": null,
       "kind": "study",
       "id": "p_study_timer",
-      "community": 3,
+      "community": 4,
       "norm_label": "study-timer (pomodoro / flutter)"
     },
     {
@@ -56,7 +56,7 @@
       "contributor": null,
       "kind": "study",
       "id": "p_studygrit_app",
-      "community": 4,
+      "community": 5,
       "norm_label": "studygrit-app"
     },
     {
@@ -70,7 +70,7 @@
       "contributor": null,
       "kind": "study",
       "id": "p_studygrit_flutter",
-      "community": 5,
+      "community": 6,
       "norm_label": "studygrit-flutter"
     },
     {
@@ -84,7 +84,7 @@
       "contributor": null,
       "kind": "study",
       "id": "p_seatkaro_app",
-      "community": 6,
+      "community": 7,
       "norm_label": "seatkaro_app"
     },
     {
@@ -98,7 +98,7 @@
       "contributor": null,
       "kind": "personal",
       "id": "p_for_my_butterfly",
-      "community": 7,
+      "community": 8,
       "norm_label": "for-my-butterfly"
     },
     {
@@ -112,7 +112,7 @@
       "contributor": null,
       "kind": "personal",
       "id": "p_for_my_queen",
-      "community": 8,
+      "community": 9,
       "norm_label": "for-my-queen"
     },
     {
@@ -126,8 +126,36 @@
       "contributor": null,
       "kind": "utility",
       "id": "p_voice_to_text",
-      "community": 9,
+      "community": 10,
       "norm_label": "voice-to-text (utility)"
+    },
+    {
+      "label": "yt-learnings (YouTube transcript library)",
+      "file_type": "code",
+      "source_file": "yt-learnings/",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "knowledge",
+      "id": "p_yt_learnings",
+      "community": 3,
+      "norm_label": "yt-learnings (youtube transcript library)"
+    },
+    {
+      "label": "personal-yt (YouTube comment-mgmt for 2 personal channels)",
+      "file_type": "code",
+      "source_file": "personal-yt/",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "personal",
+      "id": "p_personal_yt",
+      "community": 1,
+      "norm_label": "personal-yt (youtube comment-mgmt for 2 personal channels)"
     },
     {
       "label": "notion-mcp-server",
@@ -140,7 +168,7 @@
       "contributor": null,
       "kind": "mcp_personal",
       "id": "p_mcp_notion",
-      "community": 0,
+      "community": 2,
       "norm_label": "notion-mcp-server"
     },
     {
@@ -154,7 +182,7 @@
       "contributor": null,
       "kind": "external",
       "id": "ext_angel_one",
-      "community": 1,
+      "community": 0,
       "norm_label": "angel one (nse broker api)"
     },
     {
@@ -168,7 +196,7 @@
       "contributor": null,
       "kind": "external",
       "id": "ext_firebase",
-      "community": 2,
+      "community": 0,
       "norm_label": "firebase"
     },
     {
@@ -182,8 +210,64 @@
       "contributor": null,
       "kind": "external",
       "id": "ext_notion",
-      "community": 0,
+      "community": 2,
       "norm_label": "notion api"
+    },
+    {
+      "label": "youtube-transcript.io API",
+      "file_type": "code",
+      "source_file": "(external)",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "external",
+      "id": "ext_youtube_transcript_io",
+      "community": 3,
+      "norm_label": "youtube-transcript.io api"
+    },
+    {
+      "label": "YouTube Data API v3",
+      "file_type": "code",
+      "source_file": "(external)",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "external",
+      "id": "ext_youtube_data_api",
+      "community": 1,
+      "norm_label": "youtube data api v3"
+    },
+    {
+      "label": "Cloudflare account (PERSONAL \u2014 not Heavenly Secrets)",
+      "file_type": "code",
+      "source_file": "(external)",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "external",
+      "id": "ext_personal_cf_account",
+      "community": 1,
+      "norm_label": "cloudflare account (personal \u2014 not heavenly secrets)"
+    },
+    {
+      "label": "youtube-mcp-worker (CF Worker, personal account)",
+      "file_type": "code",
+      "source_file": "(external)",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "kind": "external",
+      "id": "ext_youtube_mcp_worker",
+      "community": 1,
+      "norm_label": "youtube-mcp-worker (cf worker, personal account)"
     }
   ],
   "links": [
@@ -230,10 +314,58 @@
       "source_file": "",
       "source_location": null,
       "weight": 1.0,
+      "_src": "p_yt_learnings",
+      "_tgt": "ext_youtube_transcript_io",
+      "source": "p_yt_learnings",
+      "target": "ext_youtube_transcript_io"
+    },
+    {
+      "relation": "deploys_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "",
+      "source_location": null,
+      "weight": 1.0,
+      "_src": "p_personal_yt",
+      "_tgt": "ext_youtube_mcp_worker",
+      "source": "p_personal_yt",
+      "target": "ext_youtube_mcp_worker"
+    },
+    {
+      "relation": "calls_api",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "",
+      "source_location": null,
+      "weight": 1.0,
+      "_src": "p_personal_yt",
+      "_tgt": "ext_youtube_data_api",
+      "source": "p_personal_yt",
+      "target": "ext_youtube_data_api"
+    },
+    {
+      "relation": "uses_api",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "",
+      "source_location": null,
+      "weight": 1.0,
       "_src": "p_mcp_notion",
       "_tgt": "ext_notion",
       "source": "p_mcp_notion",
       "target": "ext_notion"
+    },
+    {
+      "relation": "billed_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "",
+      "source_location": null,
+      "weight": 1.0,
+      "_src": "ext_youtube_mcp_worker",
+      "_tgt": "ext_personal_cf_account",
+      "source": "ext_personal_cf_account",
+      "target": "ext_youtube_mcp_worker"
     }
   ],
   "hyperedges": []
