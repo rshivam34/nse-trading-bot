@@ -1,0 +1,12 @@
+[Unit]
+Description=Start NSE Trading Bot daily at 8:55 AM IST
+
+[Timer]
+# Mon-Fri at 8:55 AM (system timezone is set to Asia/Kolkata in deploy script)
+OnCalendar=Mon..Fri 08:55:00
+# If laptop/VM was off when scheduled, run as soon as it boots up before 13:00
+Persistent=true
+Unit=nse-bot.service
+
+[Install]
+WantedBy=timers.target

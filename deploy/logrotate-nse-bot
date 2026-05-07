@@ -1,0 +1,9 @@
+/home/ubuntu/nse-trading-bot/backend/logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

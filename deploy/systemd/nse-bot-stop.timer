@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop NSE bot daily at 3:35 PM IST (safety net after force-exit)
+
+[Timer]
+OnCalendar=Mon..Fri 15:35:00
+Unit=nse-bot-stop.service
+
+[Install]
+WantedBy=timers.target

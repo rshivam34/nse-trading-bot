@@ -1,0 +1,9 @@
+[Unit]
+Description=Telegram alert when nse-bot.service fails
+# Triggered by OnFailure= on nse-bot.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nse-trading-bot/backend
+ExecStart=/home/ubuntu/nse-trading-bot/.venv/bin/python notify.py failed

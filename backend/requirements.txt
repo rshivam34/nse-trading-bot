@@ -6,7 +6,8 @@ numpy>=1.24.0
 smartapi-python>=1.3.0
 
 # Technical Indicators
-pandas-ta>=0.3.14
+# pandas-ta is mentioned in indicators.py docstring but never imported.
+# Pure pandas/numpy is used instead. Skipping (also requires Python 3.11+).
 
 # Real-time Data (WebSocket)
 websocket-client>=1.6.0

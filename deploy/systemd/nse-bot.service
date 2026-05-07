@@ -1,0 +1,24 @@
+[Unit]
+Description=NSE Trading Bot (intraday)
+After=network-online.target
+Wants=network-online.target
+# Fire Telegram alert if the service goes into failed state
+OnFailure=nse-bot-alert.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nse-trading-bot/backend
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/nse-trading-bot/.venv/bin/python main.py
+# Send "Bot started OK" Telegram each launch (the leading dash means
+# don't fail the service if the notify call itself errors)
+ExecStartPost=-/home/ubuntu/nse-trading-bot/.venv/bin/python notify.py started
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=60s
+StandardOutput=append:/home/ubuntu/nse-trading-bot/backend/logs/systemd-bot.log
+StandardError=append:/home/ubuntu/nse-trading-bot/backend/logs/systemd-bot.log
+
+[Install]
+WantedBy=multi-user.target

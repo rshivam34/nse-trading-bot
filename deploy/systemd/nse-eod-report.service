@@ -1,0 +1,12 @@
+[Unit]
+Description=NSE Bot End-of-Day Telegram Report
+# Run after the bot's 3:30 PM force-exit so trades are flushed to Firebase
+After=nse-bot.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nse-trading-bot/backend
+ExecStart=/home/ubuntu/nse-trading-bot/.venv/bin/python eod_report.py
+StandardOutput=append:/home/ubuntu/nse-trading-bot/backend/logs/systemd-eod.log
+StandardError=append:/home/ubuntu/nse-trading-bot/backend/logs/systemd-eod.log

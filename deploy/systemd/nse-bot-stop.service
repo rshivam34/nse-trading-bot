@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop NSE Trading Bot at 3:35 PM IST (after market close)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop nse-bot.service

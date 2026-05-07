@@ -1,6 +1,59 @@
 # NSE Intraday Trading Bot — Project Context
 
-> Last updated: 2026-05-01 (rework session). This file is rewritten directly from the live code (`config.py`, `scanner.py`, `risk_manager.py`, `order_manager.py`, `options_manager.py`, all 4 active strategy files) to replace stale Sniper Mode V1/V2 sections that no longer matched the codebase.
+> Last updated: 2026-05-07 (Oracle migration session). This file is rewritten directly from the live code (`config.py`, `scanner.py`, `risk_manager.py`, `order_manager.py`, `options_manager.py`, all 4 active strategy files) to replace stale Sniper Mode V1/V2 sections that no longer matched the codebase.
+
+---
+
+## ORACLE DEPLOYMENT 2026-05-06/07 — Bot Now Fully Autonomous
+
+**Bot moved from laptop to Oracle Cloud VM.** Laptop is no longer needed for trading.
+
+- **VM:** `instance-20260502-0615` at `80.225.252.67` (E2.1.Micro Always Free, x86_64, Ubuntu 22.04, Mumbai)
+- **RAM:** 956 MB total + 4 GB swap. Bot uses ~130 MB. Comfortable.
+- **Repo path on VM:** `/home/ubuntu/nse-trading-bot/`. Venv at `.venv/` (Python 3.10.12).
+- **systemd timers (Mon-Fri, IST):**
+  - `nse-bot.timer` → 08:55 IST → starts bot
+  - `nse-eod-report.timer` → 15:30 IST → sends Telegram EOD report
+  - `nse-bot-stop.timer` → 15:35 IST → stops bot (safety net)
+  - `nse-bot-alert.service` → triggered by `OnFailure=` on the bot service → sends Telegram crash alert
+- **Idle reclamation guard:** `deploy/keep_alive.sh` runs hourly via cron. Brief CPU + network burst keeps VM above Oracle's "idle" thresholds.
+- **Telegram bot:** `@daily_trading_updates_bot`, chat_id `1188199552`. Sends startup heartbeat (08:55), EOD report (15:30), and crash alerts.
+- **Reporter:** `backend/eod_report.py` (`--discover`, `--test`, no-arg = full report). Notifier: `backend/notify.py` (`started`, `failed`).
+- **Free-forever constraint:** All Oracle infra must stay strictly within Always Free tier. User will never upgrade. See `memory/free_forever.md` for the audit + entitlement table.
+
+**HARD RULE — Do NOT run the bot on laptop anymore.** Angel One single-session limit means any laptop run kicks the VM bot out, leaving positions orphaned with broker SL but no management. The desktop launcher (`NSE-Bot-Launch.bat`) should be deleted or renamed.
+
+**Quick commands** (run from laptop):
+```powershell
+# Live logs
+ssh -i secrets/oracle-vm-private.key ubuntu@80.225.252.67 "journalctl -u nse-bot.service -f"
+
+# Pause auto-runs (timers stay disabled until re-enabled)
+ssh -i secrets/oracle-vm-private.key ubuntu@80.225.252.67 "sudo systemctl disable --now nse-bot.timer nse-eod-report.timer nse-bot-stop.timer"
+
+# Resume auto-runs
+ssh -i secrets/oracle-vm-private.key ubuntu@80.225.252.67 "sudo systemctl enable --now nse-bot.timer nse-eod-report.timer nse-bot-stop.timer"
+
+# Manual one-shot Telegram test
+ssh -i secrets/oracle-vm-private.key ubuntu@80.225.252.67 "/home/ubuntu/nse-trading-bot/.venv/bin/python /home/ubuntu/nse-trading-bot/backend/eod_report.py --test"
+
+# Switch to PAPER mode (requires bot restart to take effect)
+ssh -i secrets/oracle-vm-private.key ubuntu@80.225.252.67 "sed -i 's/PAPER_TRADING=False/PAPER_TRADING=True/' /home/ubuntu/nse-trading-bot/backend/.env"
+```
+
+**Re-deploy after code changes** (no git on VM, repo is private):
+```powershell
+# From C:\Users\rshiv\
+tar -czf nse-trading-bot.tgz --exclude='nse-trading-bot/.git' --exclude='nse-trading-bot/secrets' --exclude='nse-trading-bot/dashboard' --exclude='nse-trading-bot/graphify-out' --exclude='nse-trading-bot/backend/logs' --exclude='nse-trading-bot/backend/__pycache__' --exclude='nse-trading-bot/backend/*/__pycache__' --exclude='nse-trading-bot/.claude' --exclude='nse-trading-bot/CLAUDE.md' --exclude='nse-trading-bot/*.tgz' nse-trading-bot
+scp -i nse-trading-bot/secrets/oracle-vm-private.key nse-trading-bot.tgz ubuntu@80.225.252.67:~/
+ssh -i nse-trading-bot/secrets/oracle-vm-private.key ubuntu@80.225.252.67 "cd ~ && tar -xzf nse-trading-bot.tgz && sudo systemctl restart nse-bot.service"
+```
+
+**Why we DIDN'T migrate to Ampere A1 (4 OCPU + 24 GB):**
+- Mumbai Ampere capacity chronically full at every shape size (verified 2026-05-06 across 4/2/1 OCPU)
+- Singapore region requires upgrade to PAYG (account is free trial = 1-region max)
+- E2.1.Micro + 4 GB swap is more than enough for current workload (~130 MB bot RSS)
+- Migration path preserved: `secrets/provision_ampere.ps1` retry loop can be restarted if Mumbai capacity opens
 
 ---
 

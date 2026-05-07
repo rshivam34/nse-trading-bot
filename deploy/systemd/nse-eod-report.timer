@@ -1,0 +1,9 @@
+[Unit]
+Description=Send NSE bot EOD Telegram report at 3:30 PM IST
+
+[Timer]
+OnCalendar=Mon..Fri 15:30:00
+Unit=nse-eod-report.service
+
+[Install]
+WantedBy=timers.target
