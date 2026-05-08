@@ -336,6 +336,7 @@ class TradingConfig:
     options_sl_pct: float = 30.0            # SL at 30% premium loss
     options_target_pct: float = 50.0        # Target at 50% premium gain
     options_exit_time: time = time(14, 0)   # Exit by 2 PM (theta decay)
+    options_entry_cutoff: time = time(12, 0)  # ORB-retest entry window cutoff (raised from hardcoded 10:15 on 2026-05-08)
     options_max_premium: float = 700.0      # Max premium per lot (Rs.) — raised from 500 to allow BANKNIFTY
     options_lots_per_trade: int = 1          # explicit — was implicit 1
     nifty_lot_size: int = 25

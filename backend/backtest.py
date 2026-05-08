@@ -271,8 +271,8 @@ class Backtester:
 
                     # Check for signal (only if no position yet)
                     if option_pos is None:
-                        # Only during ORB window
-                        if ist_time > time(10, 15):
+                        # Only during ORB entry window (configurable — was hardcoded 10:15)
+                        if ist_time > self.trading_config.options_entry_cutoff:
                             continue
 
                         signal = opt_strategy.check_signal(day_candles.iloc[:i+1], vix=vix)

@@ -68,6 +68,11 @@ class OptionsManager:
         # Allows up to 4 F&O trades/day in options-primary mode.
         self.max_options_per_day = getattr(trading_config, "options_max_trades_per_day", 2)
 
+        # Diagnostic logging state — one-shot per index per day, plus 5-min heartbeat
+        self._orb_logged = {"NIFTY": False, "BANKNIFTY": False}
+        self._range_filter_logged = {"NIFTY": False, "BANKNIFTY": False}
+        self._last_heartbeat: dict[str, Optional[datetime]] = {"NIFTY": None, "BANKNIFTY": None}
+
     def update_orb_range(self, index: str, ltp: float, high: float, low: float):
         """Called during 9:15-9:30 to track index ORB range."""
         orb = self._nifty_orb if index == "NIFTY" else self._banknifty_orb
@@ -103,20 +108,52 @@ class OptionsManager:
 
         range_pct = (orb_range / mid) * 100
 
+        # One-shot log: ORB locked at first signal-check call after 9:30 — confirms range computation
+        if not self._orb_logged.get(index, False):
+            logger.info(
+                f"OPTIONS {index} ORB locked: high={orb_high:.2f} low={orb_low:.2f} "
+                f"range={orb_range:.2f} ({range_pct:.2f}%)"
+            )
+            self._orb_logged[index] = True
+
         # Range filter (index-specific)
         min_range = 0.2
         max_range = 1.5 if index == "NIFTY" else 3.0
         if range_pct < min_range or range_pct > max_range:
+            if not self._range_filter_logged.get(index, False):
+                logger.info(
+                    f"OPTIONS {index}: ORB range {range_pct:.2f}% outside "
+                    f"[{min_range}%, {max_range}%] — F&O signals disabled today for this index"
+                )
+                self._range_filter_logged[index] = True
             return None
 
         buffer = mid * 0.001  # 0.1% buffer
 
         # Get state for this index
         signal_fired = self._nifty_signal_fired if index == "NIFTY" else self._banknifty_signal_fired
+        state = self._nifty_state if index == "NIFTY" else self._banknifty_state
+
+        # 5-min heartbeat for observability on quiet days — fires regardless of state
+        now_dt = datetime.now()
+        last_hb = self._last_heartbeat.get(index)
+        if last_hb is None or (now_dt - last_hb).total_seconds() >= 300:
+            if signal_fired:
+                state_str = "SIGNAL_FIRED"
+            elif state is None:
+                state_str = "WAITING_BREAKOUT"
+            elif state.get("retesting"):
+                state_str = f"RETESTING_{state['direction']}"
+            else:
+                state_str = f"BREAKOUT_{state['direction']}"
+            logger.info(
+                f"OPTIONS {index} heartbeat: LTP={ltp:.2f} "
+                f"ORB=[{orb_low:.2f}-{orb_high:.2f}] state={state_str}"
+            )
+            self._last_heartbeat[index] = now_dt
+
         if signal_fired:
             return None
-
-        state = self._nifty_state if index == "NIFTY" else self._banknifty_state
 
         # Breakout detection
         if state is None:
@@ -428,3 +465,6 @@ class OptionsManager:
         self._banknifty_signal_fired = False
         self.open_positions.clear()
         self.trades_today = 0
+        self._orb_logged = {"NIFTY": False, "BANKNIFTY": False}
+        self._range_filter_logged = {"NIFTY": False, "BANKNIFTY": False}
+        self._last_heartbeat = {"NIFTY": None, "BANKNIFTY": None}
