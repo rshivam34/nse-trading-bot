@@ -164,7 +164,7 @@ The bot self-skips weekends and NSE holidays. Logs go to `backend/logs/trading_b
 
 **Manual run:**
 ```powershell
-cd C:\Users\rshiv\nse-trading-bot\backend
+cd C:\Users\rshiv\shivam-future-plans\trading\nse-trading-bot\backend
 python main.py --paper       # paper mode (default in .env)
 python main.py --live        # LIVE — REAL money
 ```
@@ -670,7 +670,7 @@ These are real divergences in the code worth knowing:
 ## Running the Bot
 
 ```powershell
-cd C:\Users\rshiv\nse-trading-bot\backend
+cd C:\Users\rshiv\shivam-future-plans\trading\nse-trading-bot\backend
 python main.py              # mode from .env
 python main.py --paper      # force paper mode
 python main.py --live       # force live mode (REAL money!)
