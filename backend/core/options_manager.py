@@ -257,22 +257,28 @@ class OptionsManager:
         strike = signal["strike"]
         lot_size = signal["lot_size"]
 
-        # Build option symbol for Angel One
-        # Format: NIFTY27MAR2625500CE
-        expiry_str = self._get_next_weekly_expiry()
-        symbol = f"{index}{expiry_str}{int(strike)}{opt_type}"
-
-        logger.info(f"Looking up option: {symbol}")
-
         if not self.broker:
             logger.warning("No broker connected — options signal logged but not executed")
             return None
 
-        # Look up token from instrument master
-        token = self.broker._lookup_option_token(symbol)
-        if not token:
-            logger.warning(f"Option token not found for {symbol}. Cannot place order.")
+        # Resolve the REAL tradeable option from the instrument master:
+        # nearest valid expiry + strike, with the broker's actual symbol / token /
+        # lot size. Do NOT construct the symbol — NSE's Tuesday expiry, BANKNIFTY
+        # monthly-only cadence, and the 2-digit-year tradingsymbol format make
+        # string-building silently wrong (this was the live zero-trades bug).
+        opt = self.broker.find_option(index, opt_type, strike)
+        if not opt or not opt.get("token"):
+            logger.warning(
+                f"No tradeable {index} {int(strike)}{opt_type} option in master (nearest expiry). Skipping."
+            )
             return None
+        symbol = opt["symbol"]
+        token = opt["token"]
+        if opt.get("lot_size"):
+            lot_size = opt["lot_size"]  # broker's real lot size (NSE revises these periodically)
+        logger.info(
+            f"Resolved option: {symbol} | expiry {opt['expiry']} | lot {lot_size} | token {token}"
+        )
 
         # Get current premium (LTP)
         premium = self.broker.get_option_ltp(symbol, token)
@@ -444,9 +450,13 @@ class OptionsManager:
         self.open_positions.remove(pos)
 
     def _get_next_weekly_expiry(self) -> str:
-        """
-        Get next Thursday expiry in Angel One format: DDMMMYYYY.
-        Example: "27MAR2026"
+        """DEPRECATED (2026-05-27) — no longer used. Kept only for reference.
+
+        This produced a "next Thursday" date with a 4-digit year
+        (e.g. "28MAY2026"), which is wrong on both counts: NSE expiries moved
+        to Tuesday / BANKNIFTY is monthly-only, and tradingsymbols use a 2-digit
+        year. Symbol resolution now goes through broker.find_option() /
+        resolve_option() against the live instrument master instead.
         """
         today = datetime.now()
         days_until_thursday = (3 - today.weekday()) % 7

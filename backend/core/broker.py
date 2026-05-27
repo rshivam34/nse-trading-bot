@@ -28,6 +28,98 @@ from utils.watchlist import lookup_token_for_symbol
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────────────────
+# Option instrument resolver (master-driven)
+# ──────────────────────────────────────────────────────────
+# WHY this exists: Angel One option trading symbols must NOT be built by
+# string concatenation. Two things drift and silently break exact-match lookup:
+#   1. Year format — the master's `expiry` field is 4-digit ("26MAY2026") but
+#      the tradingsymbol is 2-digit ("BANKNIFTY26MAY26..."). They disagree.
+#   2. Expiry day/cadence — NSE moved weekly expiry to TUESDAY and made
+#      BANKNIFTY monthly-only (no weeklies). Any hardcoded "next Thursday"
+#      assumption builds a symbol that does not exist -> token lookup fails ->
+#      no order ever placed (this was the live zero-trades bug).
+# Fix: never build the symbol. SELECT it from the instrument master by
+# (name, nearest expiry >= today, strike, option type) and read the real
+# tradingsymbol + token + lot size straight from the source of truth.
+
+_OPT_MONTHS = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def _parse_expiry_date(expiry: str):
+    """Parse Angel One expiry field 'DDMMMYYYY' (e.g. '26MAY2026') -> date.
+
+    Returns None on a malformed string (defensive — the master occasionally
+    carries odd rows we just want to skip).
+    """
+    try:
+        day = int(expiry[0:2])
+        month = _OPT_MONTHS[expiry[2:5].upper()]
+        year = int(expiry[5:])
+        return datetime(year, month, day).date()
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def resolve_option(master, index, option_type, strike, today=None):
+    """Select the real tradeable option from the instrument master.
+
+    Picks the NEAREST expiry on/after `today` for the given index, then the
+    closest available strike to the one requested. Reads the tradingsymbol,
+    token and lot size directly from the master — no symbol construction.
+
+    Args:
+        master: list of instrument-master dicts (Angel One OpenAPIScripMaster).
+        index: "NIFTY" or "BANKNIFTY".
+        option_type: "CE" or "PE".
+        strike: desired strike (e.g. 55200).
+        today: date to measure "nearest expiry" from (defaults to now()).
+
+    Returns:
+        dict {symbol, token, expiry, strike, lot_size} or None if nothing matches.
+    """
+    if not master:
+        return None
+    today = today or datetime.now().date()
+    candidates = []
+    for entry in master:
+        if entry.get("name") != index or entry.get("exch_seg") != "NFO":
+            continue
+        symbol = entry.get("symbol", "")
+        if not symbol.endswith(option_type):
+            continue
+        exp_date = _parse_expiry_date(entry.get("expiry", ""))
+        if exp_date is None or exp_date < today:
+            continue
+        # Master stores strike in paise (×100): "5520000.000000" -> 55200
+        try:
+            entry_strike = round(float(entry.get("strike", 0)) / 100.0)
+        except (ValueError, TypeError):
+            continue
+        candidates.append((exp_date, abs(entry_strike - strike), entry_strike, entry))
+
+    if not candidates:
+        return None
+
+    # Sort: nearest expiry first, then closest strike to the requested one.
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    _, _, entry_strike, entry = candidates[0]
+    try:
+        lot_size = int(float(entry.get("lotsize", 0)))
+    except (ValueError, TypeError):
+        lot_size = 0
+    return {
+        "symbol": entry.get("symbol", ""),
+        "token": str(entry.get("token", "")),
+        "expiry": entry.get("expiry", ""),
+        "strike": entry_strike,
+        "lot_size": lot_size,
+    }
+
+
 class BrokerConnection:
     """
     Wrapper around Angel One SmartAPI.
@@ -399,48 +491,76 @@ class BrokerConnection:
 
         return results
 
-    def _lookup_option_token(self, option_symbol: str) -> Optional[str]:
-        """Look up instrument token for an option from the cached instrument master.
+    def _load_master(self):
+        """Load the cached Angel One instrument master (downloads once if missing).
 
-        BUG FIX 2026-05-01: Previously imported non-existent `get_instrument_master`
-        from utils.watchlist — every call raised ImportError silently swallowed by
-        the try/except. This meant ALL options trades failed token lookup → no F&O
-        orders ever fired despite options_enabled=True. Now reads the master JSON
-        directly from the cache file or downloads if missing.
+        Shared by _lookup_option_token() and find_option(). The cache file
+        (logs/scrip_master.json) is refreshed daily by watchlist.build_watchlist().
+        Returns the parsed list, or None if it can't be loaded/downloaded.
+        """
+        import json
+        from pathlib import Path
+        from utils.watchlist import INSTRUMENT_MASTER_URL
+
+        cache_path = Path("logs/scrip_master.json")
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Instrument master cache unreadable ({e}); will re-download")
+
+        # Fallback: download (rare path — should already be cached)
+        logger.info("Instrument master cache missing, downloading (slow, one-time)...")
+        try:
+            resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
+            if resp.status_code == 200:
+                master = resp.json()
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump(master, f)
+                return master
+            logger.error(f"Could not download instrument master: HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"Instrument master download failed: {e}")
+        return None
+
+    def find_option(self, index: str, option_type: str, strike: float) -> Optional[dict]:
+        """Resolve a real tradeable option from the master (nearest expiry + strike).
+
+        Returns dict {symbol, token, expiry, strike, lot_size} or None.
+        Prefer this over building a symbol string — see resolve_option() for why.
         """
         try:
-            import json
-            from pathlib import Path
-            from utils.watchlist import INSTRUMENT_MASTER_URL
+            master = self._load_master()
+            result = resolve_option(master, index, option_type, round(strike))
+            if not result:
+                logger.warning(
+                    f"find_option: no {index} {int(strike)}{option_type} in master (nearest expiry)"
+                )
+            return result
+        except Exception as e:
+            logger.error(f"find_option failed for {index} {strike}{option_type}: {e}", exc_info=True)
+            return None
 
-            # Try cached master first (downloaded daily by watchlist.build_watchlist)
-            cache_path = Path("logs/scrip_master.json")
-            master = None
-            if cache_path.exists():
-                try:
-                    with open(cache_path) as f:
-                        master = json.load(f)
-                except Exception:
-                    master = None
+    def _lookup_option_token(self, option_symbol: str) -> Optional[str]:
+        """Look up a token for an EXACT, already-validated option tradingsymbol.
 
-            # Fallback: download (rare path — should already be cached)
+        NOTE: prefer find_option() which SELECTS the instrument from the master
+        instead of requiring a pre-built exact symbol. Kept for callers that
+        already hold a verified tradingsymbol (e.g. option-chain premium scans).
+
+        BUG FIX 2026-05-01: previously imported a non-existent helper, so every
+        call raised ImportError (silently swallowed) → no F&O order ever fired.
+        Now reads the cached master via _load_master().
+        """
+        try:
+            master = self._load_master()
             if not master:
-                logger.info("Options token cache missing, downloading instrument master (slow, one-time)...")
-                resp = requests.get(INSTRUMENT_MASTER_URL, timeout=30)
-                if resp.status_code == 200:
-                    master = resp.json()
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(cache_path, "w") as f:
-                        json.dump(master, f)
-                else:
-                    logger.error(f"Could not download instrument master: HTTP {resp.status_code}")
-                    return None
-
-            # Search NFO segment for exact symbol match
+                return None
             for entry in master:
                 if entry.get("symbol") == option_symbol and entry.get("exch_seg") == "NFO":
                     return str(entry.get("token", ""))
-
             logger.warning(f"Option {option_symbol} not found in instrument master ({len(master)} entries)")
         except Exception as e:
             logger.error(f"Option token lookup failed for {option_symbol}: {e}", exc_info=True)
