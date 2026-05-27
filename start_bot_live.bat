@@ -22,7 +22,7 @@ REM   1. Edit .env: PAPER_TRADING=True
 REM   2. Edit this file: change --live to --paper
 REM ====================================================================
 
-cd /d "C:\Users\rshiv\nse-trading-bot\backend"
+cd /d "C:\Users\rshiv\shivam-future-plans\trading\nse-trading-bot\backend"
 
 if exist "..\venv\Scripts\activate.bat" (
     call "..\venv\Scripts\activate.bat"

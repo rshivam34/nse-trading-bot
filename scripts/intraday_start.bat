@@ -5,7 +5,7 @@ REM Runs at 8:45 AM on market days (Mon-Fri)
 REM Bot runs continuously until 3:30 PM then auto-shuts down
 REM ============================================
 
-cd /d C:\Users\rshiv\nse-trading-bot\backend
+cd /d C:\Users\rshiv\shivam-future-plans\trading\nse-trading-bot\backend
 
 REM Skip weekends
 for /f %%a in ('powershell -command "(Get-Date).DayOfWeek"') do set DOW=%%a

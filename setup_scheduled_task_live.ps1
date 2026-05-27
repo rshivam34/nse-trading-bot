@@ -12,7 +12,7 @@
 
 $LiveTaskName  = "NSE-IntradayBot-Live"
 $PaperTaskName = "NSE-IntradayBot-Paper"
-$BatPath       = "C:\Users\rshiv\nse-trading-bot\start_bot_live.bat"
+$BatPath       = "C:\Users\rshiv\shivam-future-plans\trading\nse-trading-bot\start_bot_live.bat"
 $WorkDir       = "C:\Users\rshiv\nse-trading-bot"
 
 # Step 1: Remove prior PAPER task if exists
