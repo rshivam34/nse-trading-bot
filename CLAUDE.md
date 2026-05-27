@@ -397,7 +397,7 @@ Lives in `core/options_manager.py`. Trigger pipe is in `main.py:_on_price_update
 
 ```
 9:15-9:30: track ORB high/low for NIFTY index AND BANKNIFTY (independent state machines)
-9:30-10:15: every NIFTY/BANKNIFTY tick →
+9:30-12:00: every NIFTY/BANKNIFTY tick →   (cutoff = config.options_entry_cutoff, raised 10:15 -> 12:00 on 2026-05-08)
    ├─ already 2 trades today (1 NIFTY + 1 BANKNIFTY max)? → skip
    ├─ VIX > 18? → skip
    ├─ ORB range too tight (<0.2%) or too wide (>1.5% NIFTY / >3.0% BANK)? → skip
@@ -408,11 +408,14 @@ Lives in `core/options_manager.py`. Trigger pipe is in `main.py:_on_price_update
    │         → CONFIRM (next candle bounces away)
    │         → fire signal
    │
-   ├─ Build option symbol: NIFTY27MAR2625500CE (next Thursday weekly expiry)
-   ├─ Look up token from instrument master
+   ├─ Resolve REAL option from instrument master (broker.find_option / resolve_option):
+   │    nearest expiry >= today (NIFTY = TUESDAY weekly, BANKNIFTY = MONTHLY-only since
+   │    NSE discontinued BANKNIFTY weeklies), exact strike, real tradingsymbol + token +
+   │    lot size read straight from the master. NO symbol string-building. [fixed 2026-05-27]
    ├─ Get current premium via LTP API
-   ├─ Skip if premium > Rs.500 (config.options_max_premium)
-   ├─ Place LIMIT BUY for 1 lot (NIFTY=25, BANKNIFTY=15)
+   ├─ Skip if premium > Rs.700 (config.options_max_premium)
+   ├─ Place LIMIT BUY, auto-scaled lots (25% of options capital, floor 1, cap 10)
+   │    Lot size from master (currently NIFTY=65, BANKNIFTY=30 — NSE revises these)
    │
    └─ SL = entry × 0.7 (30% loss), Target = entry × 1.5 (50% gain)
 
@@ -434,7 +437,7 @@ monitoring (every second):
 | Force exit | 3:15 PM | 2:00 PM (theta) |
 | Max trades/day | 5 | 2 (1 NIFTY + 1 BANK) |
 | Capital cap per trade | Full ₹15K (with leverage) | min(Rs.5000, 30% of capital) = Rs.4500 |
-| Signal entry window | 9:30-13:00 | 9:30-10:15 only |
+| Signal entry window | 9:30-13:00 | 9:30-12:00 (cutoff raised from 10:15 on 2026-05-08) |
 | Filters | 10+ sniper filters, score ≥ 80 | VIX gate + range size only |
 | Pre-flight checks | 17 | None |
 | Risk manager gate | Yes | No (uses own counter) |
@@ -496,8 +499,8 @@ Effect: `main.py:131` sets `self.options_manager = None`. All options checks bec
 | `options_target_pct` | 50% | premium gain exit |
 | `options_exit_time` | 14:00 |  |
 | `options_max_premium` | Rs.500 | per lot |
-| `nifty_lot_size` | 25 |  |
-| `banknifty_lot_size` | 15 |  |
+| `nifty_lot_size` | 25 | STALE — F&O now reads real lot size from master (NIFTY 65 as of 2026-05). This config value is no longer used by options. |
+| `banknifty_lot_size` | 15 | STALE — master lot size used instead (BANKNIFTY 30 as of 2026-05). |
 
 ### Market stance (from macro analysis)
 
@@ -523,7 +526,7 @@ Set on startup based on NIFTY 50/200 DMA + VIX:
 09:15  Market opens → WebSocket streaming begins
 09:15-09:30  ORB observation period (track high/low for stocks + indices)
 09:30  ACTIVE TRADING starts. Scanner runs on every tick.
-09:30-10:15  ORB strategy time-window AND options ORB-retest active
+09:30-10:15  Equity ORB strategy window (F&O options ORB-retest runs 09:30-12:00)
 09:30-11:30  VWAP_BOUNCE strategy time-window
 10:30  Market regime locked in (TRENDING / VOLATILE / RANGE_BOUND / GAP_DAY)
        → adjusts size_multiplier and SL_multiplier in risk manager
