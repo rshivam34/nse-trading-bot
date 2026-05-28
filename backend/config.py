@@ -327,7 +327,7 @@ class TradingConfig:
     #   - Decision: disable equity entirely, allocate full capital to F&O
     # To re-enable equity: set equity_enabled = True
     equity_enabled: bool = False             # F&O-ONLY MODE — equity scanner disabled
-    options_capital_allocation: float = 30000.0  # Starting at Rs.30K initially (will scale up after live validation)
+    options_capital_allocation: float = 70000.0  # Rs.70K F&O bucket (scaled up from Rs.30K on 2026-05-28 after NSE lot-size increase made Rs.30K too tight; matches original design's ~7.5%/trade risk envelope at typical premiums)
     equity_capital_allocation: float = 0.0       # Equity disabled
 
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
