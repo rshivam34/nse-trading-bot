@@ -333,6 +333,11 @@ class TradingConfig:
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
     options_enabled: bool = True
     options_max_trades_per_day: int = 4      # raised from hardcoded 2 — was the daily cap
+    # F&O daily-loss circuit breaker (added 2026-05-30). Stops NEW F&O entries
+    # for the rest of the day once EITHER cap is hit. options_manager reads these
+    # via getattr, so deleting them just reverts to the same built-in defaults.
+    options_max_losses_per_day: int = 2        # stop after N losing F&O trades in a day
+    options_daily_loss_limit_pct: float = 8.0  # stop after losing this pct of options_capital_allocation (8% of Rs.70K = Rs.5,600)
     options_sl_pct: float = 30.0            # SL at 30% premium loss
     options_target_pct: float = 50.0        # Target at 50% premium gain
     options_exit_time: time = time(14, 0)   # Exit by 2 PM (theta decay)

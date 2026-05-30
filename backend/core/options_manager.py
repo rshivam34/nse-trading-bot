@@ -68,6 +68,17 @@ class OptionsManager:
         # Allows up to 4 F&O trades/day in options-primary mode.
         self.max_options_per_day = getattr(trading_config, "options_max_trades_per_day", 2)
 
+        # F&O daily-loss circuit breaker (added 2026-05-30). Before this,
+        # options_manager had NO loss limit of any kind — the only thing
+        # capping the day was the per-index signal_fired latch. These read
+        # from config if the fields exist, else use safe defaults, so the
+        # gate works with or without a config.py change.
+        self.losses_today = 0
+        self.realized_pnl_today = 0.0
+        self.max_options_losses_per_day = getattr(trading_config, "options_max_losses_per_day", 2)
+        self.options_daily_loss_limit_pct = getattr(trading_config, "options_daily_loss_limit_pct", 8.0)
+        self._loss_gate_logged = False
+
         # Diagnostic logging state — one-shot per index per day, plus 5-min heartbeat
         self._orb_logged = {"NIFTY": False, "BANKNIFTY": False}
         self._range_filter_logged = {"NIFTY": False, "BANKNIFTY": False}
@@ -93,6 +104,23 @@ class OptionsManager:
 
         if vix > self.config.vix_caution_threshold:
             return None  # DANGER zone
+
+        # F&O daily-loss circuit breaker (added 2026-05-30): once the day's
+        # realized F&O losses hit either the count cap or the rupee cap, take
+        # no new F&O entries for the rest of the session. Checked here (before
+        # the state machine) so a tripped gate also freezes breakout tracking.
+        opt_capital = getattr(self.config, "options_capital_allocation", 30000.0)
+        loss_cap = opt_capital * (self.options_daily_loss_limit_pct / 100.0)
+        if (self.losses_today >= self.max_options_losses_per_day
+                or self.realized_pnl_today <= -loss_cap):
+            if not self._loss_gate_logged:
+                logger.warning(
+                    f"OPTIONS loss gate TRIPPED — no new F&O entries today "
+                    f"(losses={self.losses_today}/{self.max_options_losses_per_day}, "
+                    f"realized=Rs.{self.realized_pnl_today:.0f}, cap=Rs.{-loss_cap:.0f})"
+                )
+                self._loss_gate_logged = True
+            return None
 
         orb = self._nifty_orb if index == "NIFTY" else self._banknifty_orb
         if not orb["set"]:
@@ -173,26 +201,46 @@ class OptionsManager:
                 logger.info(f"OPTIONS {index}: PUT breakout detected at {ltp:.0f}")
             return None
 
-        # Retest detection
+        # Retest detection — price must pull back toward the broken edge but
+        # STAY on the breakout side of the range midpoint. A pullback that
+        # retraces THROUGH the midpoint means the breakout failed: reset this
+        # index so it can re-arm and take the OPPOSITE direction later in the
+        # session.
+        #
+        # Bug history (fixed 2026-05-30): the retest test used to be unbounded
+        # (`ltp <= orb_high * 1.001` for CALL) — ANY price below the high counted
+        # as a "retest", so a failed breakout that reversed all the way through
+        # the range was mislabeled as retesting. The two "failed breakout"
+        # elif-branches below were therefore unreachable (the retest test always
+        # matched first), and one of them reset the wrong index's state. Net
+        # effect: each index latched to its FIRST breakout direction for the
+        # whole day and could never flip. Characterization test:
+        # backend/tests/test_options_state_machine.py
         direction = state.get("direction")
         if "retesting" not in state:
-            if direction == "CALL" and ltp <= orb_high * 1.001:
-                state["retesting"] = True
-                logger.info(f"OPTIONS {index}: CALL retesting at {ltp:.0f}")
-            elif direction == "PUT" and ltp >= orb_low * 0.999:
-                state["retesting"] = True
-                logger.info(f"OPTIONS {index}: PUT retesting at {ltp:.0f}")
-            elif direction == "CALL" and ltp < orb_low:
-                # Failed breakout
-                if index == "NIFTY":
-                    self._nifty_state = None
-                else:
-                    self._banknifty_state = None
-            elif direction == "PUT" and ltp > orb_high:
-                if index == "NIFTY":
-                    self._banknifty_state = None
-                else:
-                    self._banknifty_state = None
+            if direction == "CALL":
+                if mid < ltp <= orb_high * 1.001:
+                    state["retesting"] = True
+                    logger.info(f"OPTIONS {index}: CALL retesting at {ltp:.0f}")
+                elif ltp <= mid:
+                    # Retraced through the midpoint → breakout failed → re-arm
+                    self._reset_index_state(index)
+                    logger.info(
+                        f"OPTIONS {index}: CALL breakout failed "
+                        f"(retraced past mid {mid:.0f}) — re-armed"
+                    )
+                # else (ltp still extended above high+buffer): keep waiting
+            elif direction == "PUT":
+                if orb_low * 0.999 <= ltp < mid:
+                    state["retesting"] = True
+                    logger.info(f"OPTIONS {index}: PUT retesting at {ltp:.0f}")
+                elif ltp >= mid:
+                    self._reset_index_state(index)
+                    logger.info(
+                        f"OPTIONS {index}: PUT breakout failed "
+                        f"(retraced past mid {mid:.0f}) — re-armed"
+                    )
+                # else (ltp still extended below low-buffer): keep waiting
             return None
 
         # Bounce confirmation
@@ -425,6 +473,12 @@ class OptionsManager:
 
         gross_pnl = (exit_premium - pos.entry_premium) * pos.quantity
         charges = pos.quantity * pos.entry_premium * 0.001  # ~0.1% option charges
+        net_pnl = gross_pnl - charges
+
+        # Feed the daily-loss circuit breaker (added 2026-05-30).
+        self.realized_pnl_today += net_pnl
+        if net_pnl < 0:
+            self.losses_today += 1
 
         self.closed_trades.append({
             "index": pos.index,
@@ -436,7 +490,7 @@ class OptionsManager:
             "quantity": pos.quantity,
             "gross_pnl": round(gross_pnl, 2),
             "charges": round(charges, 2),
-            "net_pnl": round(gross_pnl - charges, 2),
+            "net_pnl": round(net_pnl, 2),
             "exit_reason": reason,
             "time": datetime.now().strftime("%H:%M"),
         })
@@ -444,7 +498,8 @@ class OptionsManager:
         logger.info(
             f"OPTION CLOSED: {pos.symbol} | {reason} | "
             f"Entry: Rs.{pos.entry_premium:.2f} → Exit: Rs.{exit_premium:.2f} | "
-            f"Gross: Rs.{gross_pnl:+.2f} | Net: Rs.{gross_pnl - charges:+.2f}"
+            f"Gross: Rs.{gross_pnl:+.2f} | Net: Rs.{net_pnl:+.2f} | "
+            f"day F&O P&L: Rs.{self.realized_pnl_today:+.0f}, losses: {self.losses_today}"
         )
 
         self.open_positions.remove(pos)
@@ -465,6 +520,17 @@ class OptionsManager:
         next_thursday = today + timedelta(days=days_until_thursday)
         return next_thursday.strftime("%d%b%Y").upper()  # "27MAR2026"
 
+    def _reset_index_state(self, index: str):
+        """Clear one index's breakout state machine so it can re-arm.
+
+        Resets the CORRECT index (the pre-2026-05-30 inline reset had a typo
+        that cleared BANKNIFTY's state from inside the NIFTY branch).
+        """
+        if index == "NIFTY":
+            self._nifty_state = None
+        else:
+            self._banknifty_state = None
+
     def reset_daily(self):
         """Reset for new trading day."""
         self._nifty_orb = {"high": 0.0, "low": 0.0, "set": False}
@@ -475,6 +541,9 @@ class OptionsManager:
         self._banknifty_signal_fired = False
         self.open_positions.clear()
         self.trades_today = 0
+        self.losses_today = 0
+        self.realized_pnl_today = 0.0
+        self._loss_gate_logged = False
         self._orb_logged = {"NIFTY": False, "BANKNIFTY": False}
         self._range_filter_logged = {"NIFTY": False, "BANKNIFTY": False}
         self._last_heartbeat = {"NIFTY": None, "BANKNIFTY": None}
