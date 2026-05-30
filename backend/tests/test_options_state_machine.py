@@ -175,6 +175,62 @@ def test_close_option_updates_loss_counters():
     assert pos not in mgr.open_positions
 
 
+# --- Per-trade deployment cap (added 2026-05-30, replaces premium cap) -------
+
+def test_deploy_cap_allows_normal_nifty():
+    """A normal NIFTY lot (Rs.150 x 65 = Rs.9,750, 14% of 70K) is sized 1 lot."""
+    mgr = OptionsManager(config.trading, broker=None)
+    sized = mgr._size_position(premium=150.0, lot_size=65)
+    assert sized is not None, "normal NIFTY trade should NOT be blocked"
+    lots, qty, deploy = sized
+    assert lots >= 1 and qty == lots * 65
+    assert deploy <= mgr._max_deploy() + 1e-6, "deploy must stay under the cap"
+
+
+def test_deploy_cap_blocks_real_banknifty():
+    """Real BANKNIFTY (Rs.2000 x 30 = Rs.60,000 = 86% of 70K) is SKIPPED.
+
+    This is the whole point of the change: never force an oversized 1-lot trade.
+    """
+    mgr = OptionsManager(config.trading, broker=None)
+    assert mgr._size_position(premium=2000.0, lot_size=30) is None
+
+
+def test_deploy_cap_blocks_high_premium_nifty():
+    """High-premium NIFTY (Rs.700 x 65 = Rs.45,500 = 65% of 70K) is SKIPPED too.
+
+    The old premium cap (Rs.700) would have ALLOWED this 65%-of-bucket trade;
+    the deploy cap correctly blocks it.
+    """
+    mgr = OptionsManager(config.trading, broker=None)
+    assert mgr._size_position(premium=700.0, lot_size=65) is None
+
+
+def test_deploy_cap_scales_down_cheap_options():
+    """A cheap option scales to multiple lots but never exceeds the cap or 10."""
+    mgr = OptionsManager(config.trading, broker=None)
+    lots, qty, deploy = mgr._size_position(premium=50.0, lot_size=65)
+    assert deploy <= mgr._max_deploy() + 1e-6
+    assert 1 <= lots <= 10
+
+
+def test_deploy_cap_worst_loss_under_daily_gate():
+    """Invariant: max single-trade deploy x SL% must stay <= the daily loss gate.
+
+    This is WHY the cap is 25% (not 30%): 25% x 30% SL = 7.5% < 8% gate.
+    Guards against someone bumping options_max_deploy_pct above the safe value.
+    """
+    mgr = OptionsManager(config.trading, broker=None)
+    sl_pct = config.trading.options_sl_pct / 100.0           # 0.30
+    bucket = config.trading.options_capital_allocation
+    gate = bucket * (mgr.options_daily_loss_limit_pct / 100.0)
+    worst_single_trade_loss = mgr._max_deploy() * sl_pct
+    assert worst_single_trade_loss <= gate, (
+        f"one trade can lose Rs.{worst_single_trade_loss:.0f} which EXCEEDS the "
+        f"daily gate Rs.{gate:.0f} — lower options_max_deploy_pct"
+    )
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

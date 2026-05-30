@@ -342,7 +342,15 @@ class TradingConfig:
     options_target_pct: float = 50.0        # Target at 50% premium gain
     options_exit_time: time = time(14, 0)   # Exit by 2 PM (theta decay)
     options_entry_cutoff: time = time(12, 0)  # ORB-retest entry window cutoff (raised from hardcoded 10:15 on 2026-05-08)
-    options_max_premium: float = 700.0      # Max premium per lot (Rs.) — raised from 500 to allow BANKNIFTY
+    options_max_premium: float = 700.0      # DEPRECATED 2026-05-30 (no longer read; superseded by options_max_deploy_pct). Kept to avoid breaking any external reference.
+    # Per-trade DEPLOYMENT cap (added 2026-05-30, replaces the crude premium cap).
+    # Max % of options_capital_allocation deployable in ONE option trade. If even
+    # one lot exceeds this, the trade is SKIPPED (never force an oversized 1-lot
+    # position). 25% chosen so one trade's worst-case SL (25% x 30% = 7.5% of
+    # bucket = Rs.5,250) stays under options_daily_loss_limit_pct (8% = Rs.5,600).
+    # This also auto-blocks real BANKNIFTY (~Rs.2000 prem x 30 = Rs.60K = 86%)
+    # until the bucket grows to ~Rs.2.4L, where one lot fits under 25%.
+    options_max_deploy_pct: float = 25.0
     options_lots_per_trade: int = 1          # explicit — was implicit 1
     nifty_lot_size: int = 25
     banknifty_lot_size: int = 15

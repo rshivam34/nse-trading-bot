@@ -294,6 +294,40 @@ class OptionsManager:
 
         return None
 
+    def _max_deploy(self) -> float:
+        """Rupee deployment cap per option trade (% of the options bucket)."""
+        capital_for_options = getattr(
+            self.config, "options_capital_allocation",
+            min(5000, self.config.initial_capital * 0.3),
+        )
+        max_deploy_pct = getattr(self.config, "options_max_deploy_pct", 25.0) / 100.0
+        return capital_for_options * max_deploy_pct
+
+    def _size_position(self, premium: float, lot_size: int):
+        """Decide lots for an option trade under the per-trade DEPLOYMENT cap.
+
+        Returns (scaled_lots, quantity, deploy_rs), or None if even ONE lot
+        exceeds the cap (-> caller skips the trade). Added 2026-05-30 to replace
+        the crude per-lot premium cap. The cap is a % of the options bucket, so
+        it protects both indices uniformly and auto-enables BANKNIFTY only once
+        the bucket is big enough for one lot to fit under it.
+
+        Key difference from the old logic: the old code had `max(1, ...)` which
+        FORCED a 1-lot trade even when one lot blew the risk budget (that's how
+        a real BANKNIFTY lot = 86% of a Rs.70K bucket got through). Here, one
+        lot over the cap returns None instead.
+        """
+        if premium <= 0 or lot_size <= 0:
+            return None
+        max_deploy = self._max_deploy()
+        lot_cost = premium * lot_size
+        if lot_cost > max_deploy:
+            return None  # one lot too big for this bucket -> skip
+        scaled_lots = max(1, int(max_deploy / lot_cost))   # safe: 1 lot proven to fit
+        scaled_lots = min(scaled_lots, 10)                 # hard cap 10 lots
+        quantity = lot_size * scaled_lots
+        return scaled_lots, quantity, premium * quantity
+
     def execute_option_signal(self, signal: dict, vix: float = 15.0) -> Optional[OptionPosition]:
         """
         Execute an option signal: build symbol, look up token, place order.
@@ -334,32 +368,23 @@ class OptionsManager:
             logger.warning(f"Option premium is 0 for {symbol}. Skipping.")
             return None
 
-        # Check if premium is within budget
-        max_premium = self.config.options_max_premium
-        if premium > max_premium:
-            logger.info(f"Option premium Rs.{premium:.2f} > max Rs.{max_premium:.2f}. Skipping.")
+        # Size the position under the per-trade DEPLOYMENT cap (replaces the old
+        # crude premium cap on 2026-05-30). Returns None if even one lot exceeds
+        # the cap — i.e. the trade is too big for this bucket and is skipped.
+        sized = self._size_position(premium, lot_size)
+        if sized is None:
+            max_deploy = self._max_deploy()
+            logger.info(
+                f"Option {symbol}: 1 lot (Rs.{premium * lot_size:.0f}) exceeds per-trade "
+                f"deploy cap Rs.{max_deploy:.0f} ({getattr(self.config, 'options_max_deploy_pct', 25.0):.0f}% "
+                f"of bucket) — too big for this capital. Skipping."
+            )
             return None
-
-        # REWORK 2026-05-02: AUTO-SCALING multi-lot sizing (validated +79% backtest at Rs.50K)
-        # Position size = 25% of capital_for_options per trade.
-        # Number of lots = max(1, capital_per_position / lot_cost), capped at 10 lots.
-        # This ensures Rs.50K → 2-3 lots, Rs.1L → 4-5 lots — proportional scaling.
-        capital_for_options = getattr(self.config, "options_capital_allocation", min(5000, self.config.initial_capital * 0.3))
-        capital_per_position = capital_for_options * 0.25  # 25% per trade
-        lot_cost = premium * lot_size
-        max_lots_affordable = int(capital_for_options / lot_cost)
-        if max_lots_affordable <= 0:
-            logger.warning(f"Cannot afford even 1 lot of {symbol} at Rs.{premium:.2f}")
-            return None
-
-        # Auto-scale: how many lots fit in 25% of capital? Floor 1, cap 10.
-        scaled_lots = max(1, int(capital_per_position / lot_cost))
-        scaled_lots = min(scaled_lots, max_lots_affordable, 10)
-        quantity = lot_size * scaled_lots
+        scaled_lots, quantity, deployed = sized
         logger.info(
             f"Auto-scaled lots: {scaled_lots} ({lot_size}x{scaled_lots}={quantity} qty) "
-            f"@ Rs.{premium:.2f} premium = Rs.{lot_cost*scaled_lots:.0f} deployed "
-            f"(25% target: Rs.{capital_per_position:.0f}, max affordable: {max_lots_affordable} lots)"
+            f"@ Rs.{premium:.2f} premium = Rs.{deployed:.0f} deployed "
+            f"(cap {getattr(self.config, 'options_max_deploy_pct', 25.0):.0f}% = Rs.{self._max_deploy():.0f})"
         )
 
         # Place order
