@@ -327,7 +327,11 @@ class TradingConfig:
     #   - Decision: disable equity entirely, allocate full capital to F&O
     # To re-enable equity: set equity_enabled = True
     equity_enabled: bool = False             # F&O-ONLY MODE — equity scanner disabled
-    options_capital_allocation: float = 70000.0  # Rs.70K F&O bucket (scaled up from Rs.30K on 2026-05-28 after NSE lot-size increase made Rs.30K too tight; matches original design's ~7.5%/trade risk envelope at typical premiums)
+    # F&O bucket. ENV-DRIVEN (2026-05-30) so the aggressive paper-test size (1.5L)
+    # lives ONLY in the VM's gitignored .env next to PAPER_TRADING=True — NOT baked
+    # into the committed default. If anything resets to defaults, it falls back to
+    # the SAFE Rs.70K, never the 1.5L paper size. Set OPTIONS_CAPITAL in .env to change.
+    options_capital_allocation: float = float(os.getenv("OPTIONS_CAPITAL", "70000"))
     equity_capital_allocation: float = 0.0       # Equity disabled
 
     # ── NIFTY/BANKNIFTY Options ─────────────────────────────────────
