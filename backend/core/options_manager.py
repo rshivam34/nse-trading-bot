@@ -504,8 +504,13 @@ class OptionsManager:
                     self._close_option(pos, pos.entry_premium * 0.5, "FORCE_EXIT_NO_LTP")
 
     def _close_option(self, pos: OptionPosition, exit_premium: float, reason: str):
-        """Close an option position — sell the option."""
-        if self.broker:
+        """Close an option position — sell the option (REAL live, SIMULATED in paper)."""
+        if self.paper:
+            logger.info(
+                f"[PAPER] Would SELL {pos.quantity}x {pos.symbol} @ Rs.{exit_premium:.2f} "
+                f"({reason}, no real order placed)"
+            )
+        elif self.broker:
             sell_id = self.broker.place_option_order(
                 option_symbol=pos.symbol,
                 token=pos.token,
@@ -526,7 +531,7 @@ class OptionsManager:
         if net_pnl < 0:
             self.losses_today += 1
 
-        self.closed_trades.append({
+        trade_row = {
             "index": pos.index,
             "type": pos.option_type,
             "strike": pos.strike,
@@ -539,16 +544,42 @@ class OptionsManager:
             "net_pnl": round(net_pnl, 2),
             "exit_reason": reason,
             "time": datetime.now().strftime("%H:%M"),
-        })
+        }
+        self.closed_trades.append(trade_row)
+
+        # Persist PAPER trades to CSV so a month-long eval survives the bot's
+        # daily restart (in-memory closed_trades resets every morning).
+        if self.paper:
+            self._append_paper_csv(trade_row)
 
         logger.info(
-            f"OPTION CLOSED: {pos.symbol} | {reason} | "
-            f"Entry: Rs.{pos.entry_premium:.2f} → Exit: Rs.{exit_premium:.2f} | "
+            f"{'[PAPER] ' if self.paper else ''}OPTION CLOSED: {pos.symbol} | {reason} | "
+            f"Entry: Rs.{pos.entry_premium:.2f} -> Exit: Rs.{exit_premium:.2f} | "
             f"Gross: Rs.{gross_pnl:+.2f} | Net: Rs.{net_pnl:+.2f} | "
             f"day F&O P&L: Rs.{self.realized_pnl_today:+.0f}, losses: {self.losses_today}"
         )
 
         self.open_positions.remove(pos)
+
+    def _append_paper_csv(self, row: dict):
+        """Append one closed PAPER trade to the paper CSV (survives restarts)."""
+        import csv
+        import os
+        try:
+            os.makedirs(os.path.dirname(self._paper_csv), exist_ok=True)
+            new_file = not os.path.exists(self._paper_csv)
+            out = dict(row)
+            out["date"] = datetime.now().strftime("%Y-%m-%d")
+            fields = ["date", "time", "index", "type", "strike", "symbol",
+                      "entry_premium", "exit_premium", "quantity",
+                      "gross_pnl", "charges", "net_pnl", "exit_reason"]
+            with open(self._paper_csv, "a", newline="", encoding="ascii") as fh:
+                w = csv.DictWriter(fh, fieldnames=fields)
+                if new_file:
+                    w.writeheader()
+                w.writerow({k: out.get(k, "") for k in fields})
+        except Exception as e:  # never let logging break trade flow
+            logger.warning(f"Could not append paper CSV: {e}")
 
     def _get_next_weekly_expiry(self) -> str:
         """DEPRECATED (2026-05-27) — no longer used. Kept only for reference.
