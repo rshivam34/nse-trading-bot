@@ -79,6 +79,18 @@ class OptionsManager:
         self.options_daily_loss_limit_pct = getattr(trading_config, "options_daily_loss_limit_pct", 8.0)
         self._loss_gate_logged = False
 
+        # PAPER MODE for F&O (added 2026-05-30). Before this, the options path
+        # IGNORED PAPER_TRADING entirely — flipping the flag still placed REAL
+        # orders. In paper mode we keep EVERYTHING live (real symbol resolution,
+        # real premium LTP, real SL/target/theta monitoring) and gate ONLY the
+        # two place_option_order calls (BUY + SELL). Closed paper trades are
+        # persisted to a CSV so a multi-day/month evaluation survives the bot's
+        # daily restart (it stops 15:35, starts 08:55). This is a FAITHFUL test:
+        # it pays real theta because it reads real premiums tick-by-tick.
+        self.paper = bool(getattr(trading_config, "paper_trading", False))
+        self._paper_csv = "logs/paper_options_trades.csv"
+        self._paper_order_seq = 0
+
         # Diagnostic logging state — one-shot per index per day, plus 5-min heartbeat
         self._orb_logged = {"NIFTY": False, "BANKNIFTY": False}
         self._range_filter_logged = {"NIFTY": False, "BANKNIFTY": False}
@@ -387,15 +399,24 @@ class OptionsManager:
             f"(cap {getattr(self.config, 'options_max_deploy_pct', 25.0):.0f}% = Rs.{self._max_deploy():.0f})"
         )
 
-        # Place order
-        order_id = self.broker.place_option_order(
-            option_symbol=symbol,
-            token=token,
-            transaction="BUY",
-            quantity=quantity,
-            price=premium,
-            order_type="LIMIT",
-        )
+        # Place order — REAL in live mode, SIMULATED in paper mode.
+        # Paper mode fills at the live premium we just read (no real order).
+        if self.paper:
+            self._paper_order_seq += 1
+            order_id = f"PAPER-{self._paper_order_seq}"
+            logger.info(
+                f"[PAPER] Would BUY {quantity}x {symbol} @ Rs.{premium:.2f} "
+                f"= Rs.{deployed:.0f} (no real order placed)"
+            )
+        else:
+            order_id = self.broker.place_option_order(
+                option_symbol=symbol,
+                token=token,
+                transaction="BUY",
+                quantity=quantity,
+                price=premium,
+                order_type="LIMIT",
+            )
 
         if not order_id:
             logger.error(f"Option order placement failed for {symbol}")

@@ -231,6 +231,81 @@ def test_deploy_cap_worst_loss_under_daily_gate():
     )
 
 
+# --- Paper-mode F&O simulation (added 2026-05-30) ----------------------------
+
+class _FakeBroker:
+    """Minimal broker stub: returns a real-looking option + fixed premium.
+
+    Records whether any REAL order was placed (it must NOT be, in paper mode).
+    """
+    def __init__(self, premium=150.0):
+        self._premium = premium
+        self.real_orders = []
+
+    def find_option(self, index, opt_type, strike):
+        return {"symbol": f"{index}TEST{int(strike)}{opt_type}",
+                "token": "111", "expiry": "26JUN26", "lot_size": 65}
+
+    def get_option_ltp(self, symbol, token):
+        return self._premium
+
+    def place_option_order(self, **kwargs):
+        # If this is ever called in paper mode, the test must FAIL.
+        self.real_orders.append(kwargs)
+        return "REAL-ORDER-ID"
+
+
+def _paper_config():
+    """A config clone with paper_trading=True (without mutating the singleton)."""
+    import copy
+    cfg = copy.copy(config.trading)
+    cfg.paper_trading = True
+    return cfg
+
+
+def test_paper_mode_places_no_real_buy_order():
+    """In paper mode, a BUY signal produces a position but NO real order."""
+    broker = _FakeBroker(premium=150.0)
+    mgr = OptionsManager(_paper_config(), broker=broker)
+    assert mgr.paper is True
+    signal = {"index": "NIFTY", "option_type": "CE", "strike": 23900.0,
+              "lot_size": 65, "index_price": 23900.0,
+              "orb_high": 24000.0, "orb_low": 23800.0}
+    pos = mgr.execute_option_signal(signal)
+    assert pos is not None, "paper BUY should still create a simulated position"
+    assert pos.order_id.startswith("PAPER-"), "paper order id must be PAPER-*"
+    assert broker.real_orders == [], "NO real order may be placed in paper mode"
+
+
+def test_paper_mode_places_no_real_sell_order():
+    """In paper mode, closing a position places NO real sell order + logs P&L."""
+    broker = _FakeBroker(premium=150.0)
+    mgr = OptionsManager(_paper_config(), broker=broker)
+    signal = {"index": "NIFTY", "option_type": "CE", "strike": 23900.0,
+              "lot_size": 65, "index_price": 23900.0,
+              "orb_high": 24000.0, "orb_low": 23800.0}
+    pos = mgr.execute_option_signal(signal)
+    broker.real_orders.clear()                      # ignore anything from entry
+    mgr._close_option(pos, exit_premium=225.0, reason="TARGET")  # +50%
+    assert broker.real_orders == [], "NO real sell order may be placed in paper mode"
+    assert len(mgr.closed_trades) == 1
+    assert mgr.closed_trades[0]["net_pnl"] > 0, "a +50% close should be net positive"
+
+
+def test_live_mode_DOES_place_real_order():
+    """Guard: with paper=False the real broker path IS used (paper isn't sticky)."""
+    broker = _FakeBroker(premium=150.0)
+    mgr = OptionsManager(config.trading, broker=broker)   # singleton: paper_trading=True by default? force false
+    mgr.paper = False
+    signal = {"index": "NIFTY", "option_type": "CE", "strike": 23900.0,
+              "lot_size": 65, "index_price": 23900.0,
+              "orb_high": 24000.0, "orb_low": 23800.0}
+    pos = mgr.execute_option_signal(signal)
+    assert pos is not None
+    assert len(broker.real_orders) == 1, "live mode MUST place exactly one real order"
+    assert pos.order_id == "REAL-ORDER-ID"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
