@@ -30,11 +30,23 @@ import os
 import sys
 from datetime import datetime
 
+# Load .env FIRST, anchored to THIS file's directory, so the script works no
+# matter how it's invoked (manual SSH, systemd timer, any cwd). Without this,
+# a manual run found no TELEGRAM_BOT_TOKEN and silently skipped the send - the
+# exact silent-failure mode this reminder exists to avoid. (2026-06-01 fix)
+try:
+    from dotenv import load_dotenv
+    _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_ENV)
+except Exception:  # dotenv missing -> fall back to whatever's already in env
+    pass
+
 # --- tunable criteria (kept here so they're auditable in one place) ----------
 MIN_TRADES = 15
 SLIPPAGE_PER_UNIT_PER_LEG = 4.0   # Rs/unit/leg; entry+exit = 2 legs
 CASH_BENCHMARK_PCT = 6.5          # LIQUIDBEES-ish annualised
 MAX_DD_PCT = 25.0                 # max tolerable peak-to-trough, % of bucket
+# Resolved AFTER load_dotenv so OPTIONS_CAPITAL from .env is picked up.
 BUCKET = float(os.getenv("OPTIONS_CAPITAL", "150000"))
 WINDOW_DAYS = 30                  # approx paper window for annualisation
 
