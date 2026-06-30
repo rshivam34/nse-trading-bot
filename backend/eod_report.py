@@ -224,16 +224,18 @@ def format_report(trades: list[dict], portfolio: dict, ctx: dict) -> str:
             reason = t.get("exit_reason") or ""
             lines.append(f"  {sym} {direction} @ {entry:.1f} -> {exit_p:.1f} | <b>Rs.{net:+,.0f}</b> ({reason})")
 
-    # Portfolio
+    # Portfolio — label clearly as paper-sim in paper mode so the figure is never
+    # read as real/live capital.
     if portfolio:
         lines.append("")
         cap = portfolio.get("current_capital", 0)
-        day_pnl = portfolio.get("day_pnl", 0)
         starting = portfolio.get("starting_capital") or portfolio.get("initial_capital", 0)
-        lines.append(f"Capital: <b>Rs.{cap:,.2f}</b>")
+        cap_label = "Paper-sim equity" if paper else "Capital"
+        lines.append(f"{cap_label}: <b>Rs.{cap:,.2f}</b>")
         if starting:
             ret_pct = (cap - starting) / starting * 100
-            lines.append(f"Total return: {ret_pct:+.2f}% (from Rs.{starting:,.0f})")
+            ret_label = "Paper return" if paper else "Total return"
+            lines.append(f"{ret_label}: {ret_pct:+.2f}% (from Rs.{starting:,.0f})")
 
     # Bot status
     bot_status = ctx.get("status", {}) or {}
@@ -262,6 +264,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--discover", action="store_true", help="Discover and save your chat_id")
     parser.add_argument("--test", action="store_true", help="Send a test message")
+    parser.add_argument("--print", dest="print_only", action="store_true",
+                        help="Render the REAL report and PRINT it — do NOT send to Telegram")
     args = parser.parse_args()
 
     env_path = load_env()
@@ -288,6 +292,9 @@ def main():
     portfolio = fetch_portfolio()
     ctx = fetch_status()
     text = format_report(trades, portfolio, ctx)
+    if args.print_only:
+        print(text)
+        return
     log(f"Report ({len(text)} chars):\n{text}")
     send_message(token, chat_id, text)
 
