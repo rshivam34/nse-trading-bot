@@ -58,10 +58,13 @@ def main():
 
     action = sys.argv[1].lower()
     now = datetime.now(IST).strftime("%H:%M IST on %a %d %b")
+    load_dotenv(Path(__file__).parent / ".env")  # so PAPER_TRADING is readable here
 
     if action == "started":
+        paper = os.getenv("PAPER_TRADING", "False").strip().lower() == "true"
+        mode_note = " <i>(F&amp;O PAPER test — no real orders)</i>" if paper else ""
         msg = (
-            f"<b>NSE Bot started OK</b>\n"
+            f"<b>NSE Bot started OK</b>{mode_note}\n"
             f"Process launched at {now}.\n"
             f"EOD report will land at 15:30 IST."
         )

@@ -173,10 +173,21 @@ def format_report(trades: list[dict], portfolio: dict, ctx: dict) -> str:
     lines.append(f"<b>NSE Bot - {today}</b>")
     lines.append("")
 
-    # Mode
+    # Mode — be explicit that F&O is a SIMULATED paper test (no real money), so the
+    # report is never misread as live trading at the Rs.1.5L paper-bucket size.
     paper = os.getenv("PAPER_TRADING", "False").lower() == "true"
-    mode = "PAPER" if paper else "LIVE"
-    lines.append(f"Mode: <b>{mode}</b>")
+    if paper:
+        bucket = os.getenv("OPTIONS_CAPITAL", "").strip()
+        try:
+            bucket_str = f" — Rs.{float(bucket):,.0f} simulated" if bucket else ""
+        except ValueError:
+            bucket_str = ""
+        lines.append(
+            f"Mode: <b>🟡 PAPER TEST</b>{bucket_str} (no real money; "
+            f"real Rs.70K F&amp;O paused, verdict ~1 Jul)"
+        )
+    else:
+        lines.append("Mode: <b>🟢 LIVE</b> (real money)")
 
     # Market context
     market = ctx.get("market", {}) or {}

@@ -111,7 +111,8 @@ def format_message(verdict, checks, stats):
     head = "PASS" if verdict else "FAIL"
     lines = [
         f"F&O PAPER-MONTH VERDICT: {head}",
-        f"(bucket Rs.{BUCKET:,.0f}, {stats['n']} trades, ~{WINDOW_DAYS}d)",
+        f"SIMULATED bucket Rs.{BUCKET:,.0f} - no real money (real Rs.70K F&O paused).",
+        f"({stats['n']} trades, ~{WINDOW_DAYS}d paper window)",
         "",
     ]
     mark = {True: "OK ", False: "XX "}
@@ -153,7 +154,7 @@ def format_summary(rows, stats):
     last3 = rows[-3:]
     lines = [
         "F&O PAPER WEEKLY PROGRESS",
-        f"(bucket Rs.{BUCKET:,.0f}, mid-test snapshot)",
+        f"SIMULATED bucket Rs.{BUCKET:,.0f} - paper only, no real money.",
         "",
         f"  trades so far : {n}",
         f"  net (after slippage): Rs.{stats['net']:+,.0f}",
