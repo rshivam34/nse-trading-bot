@@ -122,7 +122,7 @@ def format_message(verdict, checks, stats):
         "",
         "This is a REPORT ONLY. Nothing was changed. Bot is still in PAPER mode.",
         "Come discuss with Claude before going live." if verdict
-        else "Criteria not met -> stay paper / revert to Rs.70K. Discuss with Claude.",
+        else "Criteria not met -> stay paper, or drop F&O. Discuss with Claude.",
     ]
     return "\n".join(lines)
 
