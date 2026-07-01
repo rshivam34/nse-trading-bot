@@ -183,8 +183,8 @@ def format_report(trades: list[dict], portfolio: dict, ctx: dict) -> str:
         except ValueError:
             bucket_str = ""
         lines.append(
-            f"Mode: <b>🟡 PAPER TEST</b>{bucket_str} (no real money; "
-            f"real Rs.70K F&amp;O paused, verdict ~1 Jul)"
+            f"Mode: <b>🟡 PAPER TEST</b>{bucket_str} — no real money "
+            f"(F&amp;O is simulated only; not funded in Angel)"
         )
     else:
         lines.append("Mode: <b>🟢 LIVE</b> (real money)")

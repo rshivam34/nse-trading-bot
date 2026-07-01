@@ -111,7 +111,7 @@ def format_message(verdict, checks, stats):
     head = "PASS" if verdict else "FAIL"
     lines = [
         f"F&O PAPER-MONTH VERDICT: {head}",
-        f"SIMULATED bucket Rs.{BUCKET:,.0f} - no real money (real Rs.70K F&O paused).",
+        f"SIMULATED bucket Rs.{BUCKET:,.0f} - no real money (F&O is NOT funded in Angel).",
         f"({stats['n']} trades, ~{WINDOW_DAYS}d paper window)",
         "",
     ]
